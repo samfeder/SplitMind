@@ -47,6 +47,22 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm test
 
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Bootstrap from a fresh checkout
+        run: scripts/bootstrap.sh
+      - name: Submodule is at the pinned commit
+        run: |
+          git submodule status vendor/open-connector
+          pinned="$(git ls-tree HEAD vendor/open-connector | awk '{print $3}')"
+          test "$(git -C vendor/open-connector rev-parse HEAD)" = "$pinned"
+
   gitleaks:
     runs-on: ubuntu-latest
     permissions:
