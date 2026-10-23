@@ -17,6 +17,6 @@ Rules:
 
 | Patch | What it does | Upstream | Issues |
 | --- | --- | --- | --- |
+| `0001-worker-secret-codec-hkdf-for-raw-keys.patch` | When `OOMOL_CONNECT_ENCRYPTION_KEY` is 32 random bytes in base64, derive the Worker's AES key with HKDF instead of 100k-iteration PBKDF2, writing `enc:worker:v2:` records. Existing v1 records still decode. Saves about 15 ms of CPU per cold isolate, needed for the Workers Free plan (ADR-0001). | Not filed yet; draft in [docs/upstream/hkdf-issue-draft.md](../docs/upstream/hkdf-issue-draft.md) | #8, #37 |
 | `0002-mcp-oauth-configurable-lifetimes-and-redirect-allowlist.patch` | Optional `OOMOL_CONNECT_MCP_OAUTH_*` settings for access-token and grant lifetimes and a redirect-URI allowlist. Unset, behaviour is unchanged. | Not filed yet; drafts in [docs/upstream/mcp-oauth-issue-drafts.md](../docs/upstream/mcp-oauth-issue-drafts.md) | #15, #17 |
 
-`0001` is reserved for the key-derivation patch planned under #8.

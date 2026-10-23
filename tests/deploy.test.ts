@@ -1,0 +1,195 @@
+import { spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+// Runs the real scripts/deploy.ts in a throwaway checkout. Cloudflare is replaced by a stand-in `wrangler` that
+// keeps a fake account in a JSON file, and the engine by a stand-in whose build steps write a tiny catalog.
+
+const repo = resolve(import.meta.dirname, "..");
+
+const FAKE_WRANGLER = `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const file = process.env.FAKE_CF_STATE;
+const state = JSON.parse(fs.readFileSync(file, "utf8"));
+const args = process.argv.slice(2);
+state.calls.push(args.join(" "));
+const save = () => fs.writeFileSync(file, JSON.stringify(state));
+const key = args.slice(0, 3).join(" ");
+if (args[0] === "whoami") {
+  console.log("You are logged in.");
+} else if (key === "d1 list --json") {
+  console.log(JSON.stringify(state.d1));
+} else if (args[0] === "d1" && args[1] === "create") {
+  state.d1.push({ name: args[2], uuid: "d1-id-" + state.d1.length });
+} else if (key === "kv namespace list") {
+  console.log("warning: some banner first");
+  console.log(JSON.stringify(state.kv));
+} else if (key === "kv namespace create") {
+  state.kv.push({ title: args[3], id: "kv-id-" + state.kv.length });
+} else if (args[0] === "d1" && args[1] === "migrations") {
+} else if (args[0] === "deploy") {
+  const config = fs.readFileSync(path.join(process.cwd(), "wrangler.local.jsonc"), "utf8");
+  state.deployedOrigins.push(JSON.parse(config.match(/"OOMOL_CONNECT_ORIGIN": ("[^"]*")/)[1]));
+  fs.mkdirSync(path.dirname(process.env.WRANGLER_OUTPUT_FILE_PATH), { recursive: true });
+  fs.writeFileSync(process.env.WRANGLER_OUTPUT_FILE_PATH, JSON.stringify({ type: "wrangler-session" }) + "\\n" +
+    JSON.stringify({ type: "deploy", targets: ["https://splitmind.fake-subdomain.workers.dev"], bundle_size: { raw_bytes: 2097152, gzip_bytes: 1048576 } }) + "\\n");
+} else if (key === "secret list --config") {
+  console.log(JSON.stringify(state.secrets.map((name) => ({ name, type: "secret_text" }))));
+} else {
+  console.error("fake wrangler: unexpected " + args.join(" "));
+  process.exit(9);
+}
+save();
+`;
+
+const FAKE_COPY_CATALOG = `import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+export async function copyCatalogAssets({ sourceDir, targetDir }) {
+  const files = (await readdir(sourceDir)).sort();
+  await mkdir(targetDir, { recursive: true });
+  await writeFile(join(targetDir, "index.json"), JSON.stringify({ files }));
+  return { providerCount: files.length, chunks: ["apps-0000.json"] };
+}
+`;
+
+const GENERATE = `node -e "const fs=require('fs');fs.mkdirSync('catalog/apps',{recursive:true});for(const s of ['github','notion','slack'])fs.writeFileSync('catalog/apps/'+s+'.json','{}')"`;
+
+interface FakeAccount {
+  calls: string[];
+  d1: { name: string; uuid: string }[];
+  kv: { title: string; id: string }[];
+  secrets: string[];
+  deployedOrigins: string[];
+}
+
+let dir: string;
+let checkout: string;
+let engine: string;
+let account: string;
+let wrangler: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "splitmind-deploy-"));
+  checkout = join(dir, "checkout");
+  engine = join(checkout, "vendor/open-connector");
+  mkdirSync(join(checkout, "scripts"), { recursive: true });
+  mkdirSync(join(engine, "scripts"), { recursive: true });
+  mkdirSync(join(engine, "node_modules"), { recursive: true });
+  for (const file of ["scripts/deploy.ts", "scripts/catalog-assets.ts", "wrangler.template.jsonc"]) {
+    copyFileSync(join(repo, file), join(checkout, file));
+  }
+  writeFileSync(join(engine, "scripts/copy-catalog-assets.ts"), FAKE_COPY_CATALOG);
+  writeFileSync(
+    join(engine, "package.json"),
+    JSON.stringify({ type: "module", scripts: { "generate:catalog": GENERATE, "build:web": "node -e \"\"" } }),
+  );
+
+  wrangler = join(dir, "wrangler");
+  writeFileSync(wrangler, FAKE_WRANGLER);
+  chmodSync(wrangler, 0o755);
+  account = join(dir, "account.json");
+  setAccount({ calls: [], d1: [], kv: [], secrets: [], deployedOrigins: [] });
+});
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function setAccount(value: FakeAccount): void {
+  writeFileSync(account, JSON.stringify(value));
+}
+
+function readAccount(): FakeAccount {
+  return JSON.parse(readFileSync(account, "utf8")) as FakeAccount;
+}
+
+function deploy(...args: string[]) {
+  return spawnSync(process.execPath, [join(checkout, "scripts/deploy.ts"), ...args], {
+    cwd: checkout,
+    encoding: "utf8",
+    env: { ...process.env, SPLITMIND_WRANGLER: wrangler, FAKE_CF_STATE: account },
+  });
+}
+
+describe("scripts/deploy.ts", () => {
+  it("creates the resources, learns the workers.dev origin, redeploys with it, then stops for secrets", () => {
+    const result = deploy();
+
+    expect(result.status).toBe(1);
+    const state = readAccount();
+    expect(state.d1).toEqual([{ name: "splitmind-db", uuid: "d1-id-0" }]);
+    expect(state.kv).toEqual([
+      { title: "splitmind-transit-files", id: "kv-id-0" },
+      { title: "splitmind-oauth", id: "kv-id-1" },
+    ]);
+    expect(state.calls).toContain("d1 migrations apply splitmind-db --remote --config wrangler.local.jsonc");
+    // First pass has no origin (the Worker answers 503 until it has one); the second pass has the printed URL.
+    expect(state.deployedOrigins).toEqual(["", "https://splitmind.fake-subdomain.workers.dev"]);
+    expect(result.stdout).toContain("bundle: 2.00 MiB (gzip 1.00 MiB)");
+    expect(result.stderr).toContain(
+      "secrets not set: OOMOL_CONNECT_ADMIN_TOKEN, OOMOL_CONNECT_ENCRYPTION_KEY",
+    );
+    expect(result.stderr).toContain(
+      "(cd vendor/open-connector && npx wrangler secret put OOMOL_CONNECT_ENCRYPTION_KEY --config wrangler.local.jsonc)",
+    );
+    expect(state.calls.some((call) => call.startsWith("secret put"))).toBe(false);
+
+    const rendered = readFileSync(join(engine, "wrangler.local.jsonc"), "utf8");
+    expect(rendered).toContain('"database_id": "d1-id-0"');
+    expect(rendered).toContain('{ "binding": "TRANSIT_FILES", "id": "kv-id-0" }');
+    expect(rendered).toContain('{ "binding": "OAUTH_KV", "id": "kv-id-1" }');
+    expect(rendered).toContain('"OOMOL_CONNECT_ORIGIN": "https://splitmind.fake-subdomain.workers.dev"');
+    expect(rendered).not.toMatch(/"<[a-z0-9-]+>"/);
+
+    // Only the allowlisted providers reach the Worker's catalog assets.
+    expect(JSON.parse(readFileSync(join(engine, "dist/web/catalog/index.json"), "utf8"))).toEqual({
+      files: ["notion.json", "slack.json"],
+    });
+  });
+
+  it("reuses everything on a re-run and deploys once", () => {
+    deploy();
+    const before = readAccount();
+    setAccount({ ...before, calls: [], deployedOrigins: [] });
+
+    const result = deploy();
+
+    const state = readAccount();
+    expect(result.stdout).toContain("D1 splitmind-db: exists");
+    expect(result.stdout).toContain("KV splitmind-oauth: exists");
+    expect(state.calls.filter((call) => call.includes("create"))).toEqual([]);
+    expect(state.d1).toHaveLength(1);
+    expect(state.kv).toHaveLength(2);
+    expect(state.deployedOrigins).toEqual(["https://splitmind.fake-subdomain.workers.dev"]);
+  });
+
+  it("keeps the saved state out of git", () => {
+    deploy();
+
+    const saved = JSON.parse(readFileSync(join(checkout, "splitmind.local.json"), "utf8")) as { origin: string };
+    expect(saved.origin).toBe("https://splitmind.fake-subdomain.workers.dev");
+    const ignored = spawnSync("git", ["check-ignore", "-q", "--no-index", "splitmind.local.json"], { cwd: repo });
+    expect(ignored.status).toBe(0);
+  });
+
+  it("refuses an origin with a path", () => {
+    const result = deploy("--origin", "https://connector.example.com/mcp");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("--origin must be https://host with no path or trailing slash");
+    expect(existsSync(join(checkout, "splitmind.local.json"))).toBe(false);
+    expect(readAccount().calls).toEqual([]);
+  });
+
+  it("will not reuse state saved for a different Worker name", () => {
+    deploy();
+
+    const result = deploy("--name", "splitmind-dry-run");
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('splitmind.local.json is for Worker "splitmind"');
+  });
+});
