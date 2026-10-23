@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { allowlistedProviders } from "./deploy.ts";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -103,6 +104,8 @@ function describe(result: { status: number; json: Envelope | undefined; text: st
 }
 
 export async function verify(origin: string, adminToken: string): Promise<Check[]> {
+  // The providers the deployment should offer are the ones its template allowlists.
+  const expected = allowlistedProviders(readFileSync(join(root, "wrangler.template.jsonc"), "utf8"));
   const checks: Check[] = [];
   const check = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
 
@@ -135,7 +138,7 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   }
 
   try {
-    for (const service of ["notion", "slack"]) {
+    for (const service of expected) {
       const proxy = await request(origin, "POST", `/v1/proxy/${service}`, token, { method: "GET", path: "/" });
       check(`raw ${service} proxy is blocked by deployment policy`, proxy.status === 403 && proxy.json?.errorCode === "proxy_blocked", describe(proxy));
     }
@@ -144,7 +147,7 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
     const services = Array.isArray(providers.json?.data)
       ? (providers.json.data as { service: string }[]).map((provider) => provider.service).sort()
       : [];
-    check("only notion and slack are offered", providers.status === 200 && services.join(",") === "notion,slack", `${providers.status} [${services.join(", ")}]`);
+    check(`only ${expected.join(" and ")} are offered`, providers.status === 200 && services.join(",") === expected.join(","), `${providers.status} [${services.join(", ")}]`);
 
     const outside = await request(origin, "POST", "/v1/actions/github.get_current_user", token, {});
     check(
