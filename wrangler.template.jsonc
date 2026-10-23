@@ -1,0 +1,76 @@
+// SplitMind wrangler config template (docs/adr/0001-deployment-shape.md).
+//
+// The deploy script (#8) renders this into vendor/open-connector/wrangler.local.jsonc, which upstream
+// already gitignores. Paths below are relative to that location (the submodule root), not to this file.
+// Never commit a rendered copy: it holds account-specific resource ids and the Worker origin.
+//
+// Placeholders in <angle brackets> are filled at render time from `wrangler d1 create` /
+// `wrangler kv namespace create` output and the operator's answers. Secrets are NOT set here:
+// OOMOL_CONNECT_ADMIN_TOKEN and OOMOL_CONNECT_ENCRYPTION_KEY go in with `wrangler secret put`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "<worker-name>",
+  "main": "src/server/cloudflare.ts",
+  // Keep in step with the pinned upstream tag's wrangler.example.jsonc.
+  "compatibility_date": "2026-07-02",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "cache": { "enabled": true },
+  "assets": {
+    "directory": "dist/web",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/.well-known/*",
+      "/api/*",
+      "/v1/*",
+      "/mcp*",
+      "/oauth/*",
+      "/docs",
+      "/docs/*",
+      "/openapi.json",
+      "/health",
+    ],
+  },
+  // Starts on Workers Free (ADR-0001), where Cloudflare documents `limits` only for the Standard
+  // usage model. If the account moves to Workers Paid, uncomment this to cap runaway CPU well below
+  // the 30 s default.
+  // "limits": { "cpu_ms": 5000 },
+  // Upstream's once-per-minute maintenance (SaaS cleanup, trigger cleanup). Uses 1 of the
+  // account's cron trigger slots.
+  "triggers": { "crons": ["* * * * *"] },
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": true, "persist": true },
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "<d1-database-name>",
+      "database_id": "<d1-database-id>",
+      "migrations_dir": "migrations",
+    },
+  ],
+  // ONE kv_namespaces array holding both bindings. Upstream's example shows them as two separate
+  // commented "kv_namespaces" blocks; uncommenting both gives a duplicate JSON key, and only the
+  // last one survives, silently dropping a binding (OAuth then stays off, or transit files break).
+  "kv_namespaces": [
+    // Transit files (pinned decision 2: KV, since no file over 25 MiB is expected).
+    { "binding": "TRANSIT_FILES", "id": "<transit-kv-namespace-id>" },
+    // MCP OAuth for claude.ai (pinned decision 3). OAuth is on only while this binding exists.
+    { "binding": "OAUTH_KV", "id": "<oauth-kv-namespace-id>" },
+  ],
+  "vars": {
+    "TRANSIT_FILES_BACKEND": "kv",
+    // Canonical public origin, no trailing slash, e.g. https://<worker-name>.<subdomain>.workers.dev
+    "OOMOL_CONNECT_ORIGIN": "<public-origin>",
+    // Pinned decision 7: no raw provider proxy; only Notion and Slack actions.
+    // Provider ids verified in upstream v1.9.2: src/providers/notion/definition.ts (service = "notion"),
+    // src/providers/slack/definition.ts (service = "slack").
+    "OOMOL_CONNECT_BLOCKED_PROXIES": "*",
+    "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*",
+    // Pinned decision 4: one internal Slack app per workspace, supplied per connection.
+    "OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH": "slack",
+    // Proposed, not pinned: tokens already default to no trigger access; this makes it explicit.
+    // "OOMOL_CONNECT_BLOCKED_TRIGGERS": "*",
+  },
+}
