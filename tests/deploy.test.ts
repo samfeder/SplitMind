@@ -114,7 +114,8 @@ function deploy(...args: string[]) {
   });
 }
 
-describe("scripts/deploy.ts", () => {
+// Each test runs the script and its npm build steps as real processes, which is slow on a loaded machine.
+describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
   it("creates the resources, learns the workers.dev origin, redeploys with it, then stops for secrets", () => {
     const result = deploy();
 
