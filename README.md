@@ -11,8 +11,9 @@
 Claude's connectors hold one account per service. claude.ai keys custom
 connectors by URL and rejects a second connector whose URL it already has
 ([anthropics/claude-ai-mcp#178](https://github.com/anthropics/claude-ai-mcp/issues/178)),
-and its connector form cannot send custom headers. So if you have two Notion
-workspaces, or two Slack workspaces, you can only connect one of each.
+and its connector form offers custom request headers only as a beta for some
+organizations. So if you have two Notion workspaces, or two Slack workspaces,
+you can only connect one of each.
 
 ## How it works
 
@@ -38,9 +39,10 @@ flowchart LR
 
 - **Engine:** OpenConnector provides encrypted credential storage, named
   connections, runtime tokens scoped to chosen connections, an action
-  allow/block policy, run logs, and the MCP tools `search_actions`,
-  `get_action_guide`, `list_connections` and `execute_action`. SplitMind
-  writes no provider code; gaps are fixed upstream.
+  allow/block policy, run logs, and five MCP tools: `list_apps`,
+  `list_connections`, `search_actions`, `get_action_guide` and
+  `execute_action`. SplitMind writes no provider code; gaps are fixed
+  upstream.
 - **Host:** your Cloudflare account: Workers, D1, KV and Static Assets for the
   Web Console.
 - **Sign-in:** Claude connects through OpenConnector's built-in MCP OAuth.
