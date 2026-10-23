@@ -1,3 +1,4 @@
 [submodule "vendor/open-connector"]
 	path = vendor/open-connector
 	url = https://github.com/oomol-lab/open-connector.git
+	shallow = true

@@ -34,13 +34,16 @@ explains how to move that pin.
 
    ```sh
    git switch -c upgrade-openconnector-<new-tag>
-   git -C vendor/open-connector fetch --tags origin
+   git -C vendor/open-connector fetch --depth 1 origin tag <new-tag>
    git -C vendor/open-connector checkout --force <new-tag>
    git add vendor/open-connector
    ```
 
    `--force` throws away patches that bootstrap applied to the submodule's
-   working tree. They are re-applied in the next step.
+   working tree. They are re-applied in the next step. The submodule is a
+   shallow clone (`shallow = true` in `.gitmodules`), so fetch only the new
+   tag; `git -C vendor/open-connector fetch --unshallow` gets the full history
+   if you need it.
 
 4. **Re-apply patches.**
 
