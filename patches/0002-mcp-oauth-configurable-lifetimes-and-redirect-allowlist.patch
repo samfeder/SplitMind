@@ -1,0 +1,536 @@
+SplitMind patch 0002 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft texts: docs/upstream/mcp-oauth-issue-drafts.md (filed per E3.3 #15 / E3.5 #17).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From d24d38631f66ed3e284c734afebac1345f9d48bb Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Fri, 23 Oct 2026 15:22:53 +0000
+Subject: [PATCH] feat(cloudflare): configurable MCP OAuth lifetimes and
+ redirect allowlist
+
+Adds four optional Worker settings. Unset, behavior is unchanged.
+
+- OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS (default 3600)
+- OOMOL_CONNECT_MCP_OAUTH_GRANT_TTL_SECONDS (default 2592000, fixed from code exchange)
+- OOMOL_CONNECT_MCP_OAUTH_GRANT_IDLE_TTL_SECONDS (unset: fixed lifetime; set: sliding)
+- OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS (comma separated; empty allows any
+  registered URI; http loopback URIs match on any port)
+
+A set lifetime below 60 seconds or not an integer fails closed with 503.
+The consent page states the configured grant lifetime.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Q3c63Ni4j6J8sKUEcyCovB
+---
+ src/server/cloudflare.ts                  |  36 +++-
+ src/server/cloudflare/cloudflare-env.ts   |   4 +
+ src/server/cloudflare/mcp-consent-page.ts |  22 +-
+ src/server/cloudflare/mcp-oauth.test.ts   | 233 ++++++++++++++++++++++
+ src/server/cloudflare/mcp-oauth.ts        |  62 +++++-
+ vitest.config.ts                          |   2 +
+ 6 files changed, 349 insertions(+), 10 deletions(-)
+ create mode 100644 src/server/cloudflare/mcp-oauth.test.ts
+
+diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
+index 869ca5ca..3557be05 100644
+--- a/src/server/cloudflare.ts
++++ b/src/server/cloudflare.ts
+@@ -1,7 +1,7 @@
+ import type { CatalogStore } from "../catalog-store.ts";
+ import type { AssetsBinding, KVNamespaceBinding, R2BucketBinding } from "./cloudflare/cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+-import type { McpOAuthHandler } from "./cloudflare/mcp-oauth.ts";
++import type { McpOAuthHandler, McpOAuthSettings } from "./cloudflare/mcp-oauth.ts";
+ import type { ConnectApp } from "./connect-app.ts";
+ import type { Logger } from "./logger.ts";
+ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
+@@ -73,9 +73,13 @@ export default {
+         });
+       }
+       const origin = env.OOMOL_CONNECT_ORIGIN.trim().replace(/\/+$/, "");
+-      const oauth = await mcpOAuthCache.get(origin, async () => {
++      const settings = readMcpOAuthSettings(env);
++      if (!settings) {
++        return new Response("MCP OAuth lifetimes must be whole numbers of seconds, at least 60.", { status: 503 });
++      }
++      const oauth = await mcpOAuthCache.get(JSON.stringify({ origin, settings }), async () => {
+         const { createMcpOAuthHandler } = await import("./cloudflare/mcp-oauth.ts");
+-        return createMcpOAuthHandler(origin, fetchRuntime);
++        return createMcpOAuthHandler(origin, fetchRuntime, settings);
+       });
+       return oauth.fetch(request, env, ctx);
+     }
+@@ -83,6 +87,32 @@ export default {
+   },
+ };
+ 
++/**
++ * Read the MCP OAuth lifetimes and redirect allowlist. An unset value keeps the shipped default (1 hour access
++ * tokens, 30-day fixed grants, any registered redirect). A set but invalid lifetime returns undefined, so the
++ * Worker fails closed instead of silently running with a lifetime the operator did not choose.
++ */
++function readMcpOAuthSettings(env: CloudflareEnv): McpOAuthSettings | undefined {
++  const accessTokenTTL = readLifetime(env.OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS, 3600);
++  const grantTTL = readLifetime(env.OOMOL_CONNECT_MCP_OAUTH_GRANT_TTL_SECONDS, 30 * 86400);
++  const grantIdleTTL = readLifetime(env.OOMOL_CONNECT_MCP_OAUTH_GRANT_IDLE_TTL_SECONDS, undefined);
++  if (accessTokenTTL === null || grantTTL === null || grantIdleTTL === null) return undefined;
++  if (accessTokenTTL === undefined || grantTTL === undefined) return undefined;
++  const allowedRedirectUris = (env.OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS ?? "")
++    .split(",")
++    .map((uri) => uri.trim())
++    .filter(Boolean);
++  return { accessTokenTTL, grantTTL, ...(grantIdleTTL === undefined ? {} : { grantIdleTTL }), allowedRedirectUris };
++}
++
++/** Returns the fallback when unset, the value when it is an integer of at least 60, and null otherwise. */
++function readLifetime<T extends number | undefined>(value: string | undefined, fallback: T): number | T | null {
++  const trimmed = value?.trim();
++  if (!trimmed) return fallback;
++  const parsed = Number(trimmed);
++  return Number.isInteger(parsed) && parsed >= 60 ? parsed : null;
++}
++
+ async function fetchRuntime(request: Request, env: CloudflareEnv): Promise<Response> {
+   setPrivateNetworkAccessAllowed(parsePrivateNetworkAccessFlag(env.OOMOL_CONNECT_ALLOW_PRIVATE_NETWORK));
+   setEgressTrustedHosts(parseEgressTrustedHosts(env.OOMOL_CONNECT_EGRESS_TRUSTED_HOSTS));
+diff --git a/src/server/cloudflare/cloudflare-env.ts b/src/server/cloudflare/cloudflare-env.ts
+index 1e83d0eb..f5c9c0df 100644
+--- a/src/server/cloudflare/cloudflare-env.ts
++++ b/src/server/cloudflare/cloudflare-env.ts
+@@ -23,6 +23,10 @@ export interface CloudflareEnv {
+   OOMOL_CONNECT_TRANSIT_FILE_MAX_BYTES?: string;
+   OOMOL_CONNECT_RUN_LIMIT?: string;
+   OOMOL_CONNECT_OAUTH_CLOSE_DELAY_SECONDS?: string;
++  OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS?: string;
++  OOMOL_CONNECT_MCP_OAUTH_GRANT_TTL_SECONDS?: string;
++  OOMOL_CONNECT_MCP_OAUTH_GRANT_IDLE_TTL_SECONDS?: string;
++  OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS?: string;
+ }
+ 
+ export function resolvePublicOrigin(request: Request, env: CloudflareEnv): string {
+diff --git a/src/server/cloudflare/mcp-consent-page.ts b/src/server/cloudflare/mcp-consent-page.ts
+index c54f1590..62c1779f 100644
+--- a/src/server/cloudflare/mcp-consent-page.ts
++++ b/src/server/cloudflare/mcp-consent-page.ts
+@@ -1,3 +1,4 @@
++import type { McpOAuthSettings } from "./mcp-oauth.ts";
+ import type { ConsentDescription } from "@cloudflare/workers-oauth-provider";
+ 
+ /** Render only escaped client metadata; the browser posts the opaque consent handle. */
+@@ -5,13 +6,14 @@ export function renderMcpConsentPage(
+   details: ConsentDescription,
+   handle: string,
+   grantedScopes: readonly string[],
++  lifetime: Pick<McpOAuthSettings, "grantTTL" | "grantIdleTTL"> = { grantTTL: 30 * 86400 },
+ ): string {
+   const publisher = details.clientDomain
+     ? `Client domain: <strong>${escapeHtml(details.clientDomain)}</strong>`
+     : "This client's name is self-reported and has not been verified.";
+   const scopeList = grantedScopes
+     .map((scope) => {
+-      const description = scopeDescription(scope);
++      const description = scopeDescription(scope, lifetime);
+       return `<li><code>${escapeHtml(scope)}</code>${description === undefined ? "" : ` - ${escapeHtml(description)}`}</li>`;
+     })
+     .join("");
+@@ -35,8 +37,22 @@ function escapeHtml(value: string): string {
+ }
+ 
+ /** The user-facing meaning of each scope this server grants. */
+-function scopeDescription(scope: string): string | undefined {
++function scopeDescription(
++  scope: string,
++  lifetime: Pick<McpOAuthSettings, "grantTTL" | "grantIdleTTL">,
++): string | undefined {
+   if (scope === "mcp:access") return "Discover and run Actions through MCP.";
+-  if (scope === "offline_access") return "Keep this connection active for up to 30 days without asking again.";
++  if (scope === "offline_access") {
++    return lifetime.grantIdleTTL === undefined
++      ? `Keep this connection active for up to ${formatDuration(lifetime.grantTTL)} without asking again.`
++      : `Keep this connection active without asking again while it is used at least every ${formatDuration(lifetime.grantIdleTTL)}.`;
++  }
+   return undefined;
+ }
++
++function formatDuration(seconds: number): string {
++  const days = seconds / 86400;
++  if (Number.isInteger(days)) return days === 1 ? "1 day" : `${days} days`;
++  const hours = Math.round(seconds / 3600);
++  return hours === 1 ? "1 hour" : `${hours} hours`;
++}
+diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
+new file mode 100644
+index 00000000..bb617e96
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth.test.ts
+@@ -0,0 +1,233 @@
++import type { AssetsBinding, KVNamespaceBinding } from "./cloudflare-bindings.ts";
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { createHash, randomBytes } from "node:crypto";
++import { describe, expect, it, vi } from "vitest";
++import worker from "../cloudflare.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++
++// The OAuth library imports the Workers runtime module only for its WorkerEntrypoint base class.
++vi.mock("cloudflare:workers", () => ({ WorkerEntrypoint: class {} }));
++
++const origin = "https://connect.example.com";
++const adminToken = "test-admin-token";
++const claudeCallback = "https://claude.ai/api/mcp/auth_callback";
++
++describe("MCP OAuth lifetimes and redirect allowlist", () => {
++  it("issues one-hour access tokens by default", async () => {
++    const tokens = await authorizeAndExchange(createEnv({}), claudeCallback);
++    expect(tokens.status).toBe(200);
++    expect(tokens.body.expires_in).toBe(3600);
++  });
++
++  it("issues access tokens with the configured lifetime", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "86400" });
++    const tokens = await authorizeAndExchange(env, claudeCallback);
++    expect(tokens.status).toBe(200);
++    expect(tokens.body.expires_in).toBe(86400);
++  });
++
++  it("keeps the configured access token lifetime after a refresh", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "43200" });
++    const tokens = await authorizeAndExchange(env, claudeCallback);
++    const refreshed = await post(env, "/oauth/mcp/token", {
++      grant_type: "refresh_token",
++      refresh_token: String(tokens.body.refresh_token),
++      client_id: tokens.clientId,
++    });
++    expect(refreshed.status).toBe(200);
++    expect((await refreshed.json()).expires_in).toBe(43200);
++  });
++
++  it("fails closed on a lifetime below 60 seconds", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: "59" });
++    const response = await worker.fetch(
++      new Request(`${origin}/.well-known/oauth-authorization-server`),
++      env,
++      context(),
++    );
++    expect(response.status).toBe(503);
++  });
++
++  it("states the configured grant lifetime on the consent page", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_GRANT_TTL_SECONDS: "604800" });
++    const clientId = await register(env, [claudeCallback]);
++    const page = await worker.fetch(
++      new Request(authorizeUrl(clientId, claudeCallback, "x".repeat(43))),
++      env,
++      context(),
++    );
++    expect(await page.text()).toContain("Keep this connection active for up to 7 days without asking again.");
++  });
++
++  it("refuses to register a client whose redirect URI is not allowlisted", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback });
++    const response = await registerResponse(env, ["https://attacker.example/callback"]);
++    expect(response.status).toBe(400);
++    expect((await response.json()).error).toBe("invalid_client_metadata");
++  });
++
++  it("completes authorization for an allowlisted redirect URI", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback });
++    const tokens = await authorizeAndExchange(env, claudeCallback);
++    expect(tokens.status).toBe(200);
++  });
++
++  it("matches an allowlisted loopback redirect on any port", async () => {
++    const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: "http://localhost/callback" });
++    const tokens = await authorizeAndExchange(env, "http://localhost:51234/callback");
++    expect(tokens.status).toBe(200);
++  });
++
++  it("refuses consent for a client registered before the allowlist excluded it", async () => {
++    const kv = new MemoryKV();
++    const db = new SqliteD1Database();
++    const open = createEnv({}, kv, db);
++    const clientId = await register(open, ["https://other.example/callback"]);
++    const restricted = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback }, kv, db);
++    const page = await worker.fetch(
++      new Request(authorizeUrl(clientId, "https://other.example/callback", "x".repeat(43))),
++      restricted,
++      context(),
++    );
++    expect(page.status).toBe(403);
++    expect(page.headers.get("location")).toBeNull();
++  });
++});
++
++async function authorizeAndExchange(
++  env: CloudflareEnv,
++  redirectUri: string,
++): Promise<{ status: number; body: Record<string, unknown>; clientId: string }> {
++  const clientId = await register(env, [redirectUri]);
++  const verifier = randomBytes(48).toString("base64url");
++  const challenge = createHash("sha256").update(verifier).digest("base64url");
++  const page = await worker.fetch(new Request(authorizeUrl(clientId, redirectUri, challenge)), env, context());
++  expect(page.status).toBe(200);
++  const handle = /name="handle" value="([^"]+)"/.exec(await page.text())?.[1];
++  const cookies = page.headers
++    .getSetCookie()
++    .map((cookie) => cookie.split(";")[0])
++    .join("; ");
++  const approval = await worker.fetch(
++    new Request(`${origin}/oauth/mcp/authorize`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded", origin, cookie: cookies },
++      body: new URLSearchParams({ handle: handle ?? "", decision: "approve", admin_token: adminToken }),
++    }),
++    env,
++    context(),
++  );
++  expect(approval.status).toBe(302);
++  const code = new URL(approval.headers.get("location") ?? "").searchParams.get("code") ?? "";
++  const exchanged = await post(env, "/oauth/mcp/token", {
++    grant_type: "authorization_code",
++    code,
++    code_verifier: verifier,
++    redirect_uri: redirectUri,
++    client_id: clientId,
++    resource: `${origin}/mcp`,
++  });
++  return { status: exchanged.status, body: await exchanged.json(), clientId };
++}
++
++function authorizeUrl(clientId: string, redirectUri: string, challenge: string): string {
++  return `${origin}/oauth/mcp/authorize?${new URLSearchParams({
++    response_type: "code",
++    client_id: clientId,
++    redirect_uri: redirectUri,
++    scope: "mcp:access offline_access",
++    resource: `${origin}/mcp`,
++    state: "test-state",
++    code_challenge: challenge,
++    code_challenge_method: "S256",
++  })}`;
++}
++
++async function register(env: CloudflareEnv, redirectUris: string[]): Promise<string> {
++  const response = await registerResponse(env, redirectUris);
++  expect(response.status).toBe(201);
++  return (await response.json()).client_id;
++}
++
++function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<Response> {
++  return worker.fetch(
++    new Request(`${origin}/oauth/mcp/register`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({
++        client_name: "Test client",
++        redirect_uris: redirectUris,
++        grant_types: ["authorization_code", "refresh_token"],
++        response_types: ["code"],
++        token_endpoint_auth_method: "none",
++      }),
++    }),
++    env,
++    context(),
++  );
++}
++
++function post(env: CloudflareEnv, path: string, form: Record<string, string>): Promise<Response> {
++  return worker.fetch(
++    new Request(`${origin}${path}`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded" },
++      body: new URLSearchParams(form),
++    }),
++    env,
++    context(),
++  );
++}
++
++function createEnv(
++  vars: Partial<CloudflareEnv>,
++  kv: MemoryKV = new MemoryKV(),
++  db: SqliteD1Database = new SqliteD1Database(),
++): CloudflareEnv {
++  return {
++    DB: db,
++    TRANSIT_FILES: new MemoryKV(),
++    ASSETS: { fetch: async () => new Response("not found", { status: 404 }) } satisfies AssetsBinding,
++    OAUTH_KV: kv,
++    OOMOL_CONNECT_ORIGIN: origin,
++    OOMOL_CONNECT_ADMIN_TOKEN: adminToken,
++    OOMOL_CONNECT_ENCRYPTION_KEY: "test-encryption-key",
++    ...vars,
++  };
++}
++
++function context(): Parameters<typeof worker.fetch>[2] {
++  return { waitUntil() {}, passThroughOnException() {} };
++}
++
++/** The subset of Workers KV the OAuth library uses: text and JSON reads, TTL writes, deletes and prefix listing. */
++class MemoryKV implements KVNamespaceBinding {
++  private readonly store = new Map<string, string>();
++
++  async put(key: string, value: unknown): Promise<void> {
++    this.store.set(key, typeof value === "string" ? value : new TextDecoder().decode(value as ArrayBuffer));
++  }
++
++  // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return text, JSON or bytes by option.
++  async get(key: string, options?: unknown): Promise<any> {
++    const value = this.store.get(key);
++    if (value === undefined) return null;
++    const type = typeof options === "string" ? options : (options as { type?: string } | undefined)?.type;
++    if (type === "json") return JSON.parse(value);
++    if (type === "arrayBuffer") return new TextEncoder().encode(value).buffer;
++    return value;
++  }
++
++  async delete(key: string): Promise<void> {
++    this.store.delete(key);
++  }
++
++  async list(options?: { prefix?: string }): Promise<{ keys: { name: string }[]; list_complete: true }> {
++    const prefix = options?.prefix ?? "";
++    return {
++      keys: [...this.store.keys()].filter((key) => key.startsWith(prefix)).map((name) => ({ name })),
++      list_complete: true,
++    };
++  }
++}
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index a51eeb25..efa25c20 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -35,14 +35,37 @@ export interface McpOAuthHandler {
+ 
+ type RuntimeHandler = (request: Request, env: CloudflareEnv) => Promise<Response>;
+ 
++/** Operator-tunable MCP OAuth policy. The defaults keep the behavior this handler shipped with. */
++export interface McpOAuthSettings {
++  /** Access token lifetime in seconds. */
++  accessTokenTTL: number;
++  /** Grant (refresh token) lifetime in seconds, counted from the code exchange. */
++  grantTTL: number;
++  /** When set, each refresh moves the grant's expiry this many seconds out, so only an unused grant expires. */
++  grantIdleTTL?: number;
++  /** Redirect URIs a client may use. Empty allows any URI the client registered. */
++  allowedRedirectUris: readonly string[];
++}
++
++export const defaultMcpOAuthSettings: McpOAuthSettings = {
++  accessTokenTTL: 3600,
++  grantTTL: 30 * 86400,
++  allowedRedirectUris: [],
++};
++
+ const accessScope = "mcp:access";
+ /** The scopes the consent page shows and the approval grants, so the two cannot drift. */
+ const grantedScopes = [accessScope, "offline_access"];
+ const authorizePath = "/oauth/mcp/authorize";
+ 
+ /** Add MCP OAuth at the Worker boundary without changing administrator or runtime-token auth. */
+-export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler): McpOAuthHandler {
++export function createMcpOAuthHandler(
++  origin: string,
++  runtime: RuntimeHandler,
++  settings: McpOAuthSettings = defaultMcpOAuthSettings,
++): McpOAuthHandler {
+   const resource = `${origin}/mcp`;
++  const redirectAllowed = (uri: string) => isAllowedRedirectUri(uri, settings.allowedRedirectUris);
+   const options: OAuthProviderOptions<CloudflareEnv> = {
+     apiRoute: "/mcp",
+     authorizeEndpoint: `${origin}${authorizePath}`,
+@@ -51,8 +74,9 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+     clientIdMetadataDocumentEnabled: true,
+     scopesSupported: [accessScope, "offline_access"],
+     requiredScopes: [accessScope],
+-    accessTokenTTL: 3600,
+-    refreshTokenTTL: 30 * 86400,
++    accessTokenTTL: settings.accessTokenTTL,
++    refreshTokenTTL: settings.grantTTL,
++    ...(settings.grantIdleTTL === undefined ? {} : { refreshTokenIdleTTL: settings.grantIdleTTL }),
+     resourceMetadata: { resource, authorization_servers: [origin], resource_name: "OpenConnector" },
+     apiHandler: {
+       async fetch(request: Request, env: CloudflareEnv, context: McpAuthorizedContext): Promise<Response> {
+@@ -71,6 +95,11 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+         return runtime(new Request(request, { headers }), env);
+       },
+     },
++    clientRegistrationCallback({ clientMetadata }) {
++      const uris = Array.isArray(clientMetadata.redirect_uris) ? clientMetadata.redirect_uris : [];
++      if (uris.every((uri) => typeof uri === "string" && redirectAllowed(uri))) return;
++      return { description: "This gateway does not accept clients with these redirect URIs." };
++    },
+     async resolveExternalToken({ token, env }) {
+       if (!(await validRuntimeToken(env, token))) return null;
+       return { props: { runtimeToken: token, legacy: true }, audience: resource };
+@@ -92,6 +121,8 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+           if (request.method === "GET") {
+             const auth = await oauth.parseAuthRequest(request);
+             const details = await oauth.describeConsent(auth);
++            // Checked before anything redirects, so a disallowed client never receives a callback.
++            if (!redirectAllowed(details.redirectUri)) return localError("This client is not allowed.", 403);
+             const consent = await oauth.beginConsent(auth);
+             consent.headers.set("Content-Type", "text/html; charset=utf-8");
+             // Chrome applies form-action to the POST's redirect as well as its initial target.
+@@ -105,7 +136,7 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+             // same-origin keeps CSRF validation usable without leaking the authorization URL to the callback.
+             consent.headers.set("Referrer-Policy", "same-origin");
+             consent.headers.set("X-Content-Type-Options", "nosniff");
+-            return new Response(renderMcpConsentPage(details, consent.handle, grantedScopes), {
++            return new Response(renderMcpConsentPage(details, consent.handle, grantedScopes, settings), {
+               headers: consent.headers,
+             });
+           }
+@@ -132,6 +163,7 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+           }
+           const approved = await oauth.approveConsent(request, handle, { scope: [...grantedScopes] });
+           const client = await oauth.describeConsent(approved.request);
++          if (!redirectAllowed(client.redirectUri)) return localError("This client is not allowed.", 403);
+           const tokens = runtimeTokens(env);
+           const backing = await tokens.createToken(`MCP OAuth • ${client.clientName.slice(0, 120)}`, {
+             allowedActions: ["*"],
+@@ -184,6 +216,28 @@ export function createMcpOAuthHandler(origin: string, runtime: RuntimeHandler):
+   };
+ }
+ 
++const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
++
++/** Exact match, except that an http loopback URI matches on any port (RFC 8252 section 7.3). */
++function isAllowedRedirectUri(uri: string, allowed: readonly string[]): boolean {
++  if (allowed.length === 0) return true;
++  if (allowed.includes(uri)) return true;
++  const portless = withoutLoopbackPort(uri);
++  return portless !== undefined && allowed.some((entry) => withoutLoopbackPort(entry) === portless);
++}
++
++function withoutLoopbackPort(uri: string): string | undefined {
++  let url: URL;
++  try {
++    url = new URL(uri);
++  } catch {
++    return undefined;
++  }
++  if (url.protocol !== "http:" || !loopbackHosts.has(url.hostname)) return undefined;
++  url.port = "";
++  return url.href;
++}
++
+ function runtimeTokens(env: CloudflareEnv): RuntimeTokenService {
+   return new RuntimeTokenService(new D1RuntimeDatabase(env.DB).runtimeTokenStore);
+ }
+diff --git a/vitest.config.ts b/vitest.config.ts
+index a3ac9bdf..c4e439ce 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -12,5 +12,7 @@ export default defineConfig({
+   test: {
+     include: ["src/**/*.test.ts", "scripts/**/*.test.ts", "web/src/**/*.test.ts"],
+     setupFiles: ["./vitest.setup.ts"],
++    // Bundle the OAuth library through Vite so tests can stand in for its `cloudflare:workers` import.
++    server: { deps: { inline: ["@cloudflare/workers-oauth-provider"] } },
+   },
+ });
+-- 
+2.43.0
+

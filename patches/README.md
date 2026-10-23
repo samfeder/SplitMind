@@ -13,4 +13,10 @@ Rules:
 - When upstream releases the fix, upgrade the pin and delete the patch. See
   [docs/upgrading-openconnector.md](../docs/upgrading-openconnector.md).
 
-There are no patches yet.
+## Current patches
+
+| Patch | What it does | Upstream | Issues |
+| --- | --- | --- | --- |
+| `0002-mcp-oauth-configurable-lifetimes-and-redirect-allowlist.patch` | Optional `OOMOL_CONNECT_MCP_OAUTH_*` settings for access-token and grant lifetimes and a redirect-URI allowlist. Unset, behaviour is unchanged. | Not filed yet; drafts in [docs/upstream/mcp-oauth-issue-drafts.md](../docs/upstream/mcp-oauth-issue-drafts.md) | #15, #17 |
+
+`0001` is reserved for the key-derivation patch planned under #8.
