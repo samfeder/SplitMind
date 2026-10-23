@@ -12,7 +12,9 @@ and this repository holds the overlay that deploys and configures it.
 - **No secrets, nothing personal.** Docs use placeholders such as
   `<your-worker>.workers.dev` and `<workspace-alias>`. Local config lives in
   git-ignored files (`wrangler.local.jsonc`, `.env`, `.dev.vars`). CI runs
-  gitleaks on every pull request.
+  gitleaks on every pull request, and `npm test` runs `npm run check:docs`'s
+  checks: no real Worker hosts, emails, account ids or tokens in the docs, and
+  no broken relative links.
 - **Test behaviour at the seams.** Tests exercise the deployed Worker's HTTP
   surface and our scripts' command-line behaviour, not internal collaborators.
 - **Tooling:** TypeScript, Node 22+, wrangler via `npx`.

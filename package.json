@@ -13,7 +13,8 @@
     "lint": "oxlint",
     "test": "vitest run",
     "deploy": "node scripts/deploy.ts",
-    "verify": "node scripts/verify-deployment.ts"
+    "verify": "node scripts/verify-deployment.ts",
+    "check:docs": "node scripts/check-docs.ts"
   },
   "devDependencies": {
     "@types/node": "^22.19.0",
