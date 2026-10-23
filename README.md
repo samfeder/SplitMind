@@ -60,9 +60,30 @@ flowchart LR
 
 ## Quickstart
 
-_Coming in v0.1._ The quickstart will cover: cloning with submodules, creating
-the Cloudflare resources, setting secrets, deploying, and adding SplitMind as a
-custom connector in Claude.
+> Written and tested piece by piece, but not yet run end to end on a real account. Until the v0.1 milestone
+> closes, expect rough edges.
+
+You need Node.js 22.18+, git, a Cloudflare account and a password manager.
+
+```bash
+git clone --recurse-submodules https://github.com/samfeder/SplitMind.git
+cd SplitMind
+scripts/bootstrap.sh                                  # pinned OpenConnector + patches + dependencies
+(cd vendor/open-connector && npx wrangler login)      # authorize wrangler in the browser
+npm run deploy                                        # resources, migrations, build, deploy, secrets
+npm run verify                                        # health, OAuth discovery, policy and guardrails
+```
+
+Then:
+
+1. Connect your accounts as **named connections** in the Web Console:
+   [Notion](docs/providers/notion.md), [Slack](docs/providers/slack.md).
+2. Add `<your-worker-url>/mcp` as a custom connector in Claude: [web, desktop, mobile and Claude Code](docs/claude.md).
+3. Ask Claude to "list my connections", then name the account in each request.
+
+More: [Cloudflare setup and Free vs. Paid](docs/setup/cloudflare.md) ·
+[guardrails and run logs](docs/guardrails.md) · [adding a provider](docs/adding-a-provider.md) ·
+[decisions](docs/adr/).
 
 ## Contributing and security
 
