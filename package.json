@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "oxlint",
     "test": "vitest run",
-    "deploy": "node scripts/deploy.ts"
+    "deploy": "node scripts/deploy.ts",
+    "verify": "node scripts/verify-deployment.ts"
   },
   "devDependencies": {
     "@types/node": "^22.19.0",

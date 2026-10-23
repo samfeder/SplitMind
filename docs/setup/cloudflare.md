@@ -82,6 +82,16 @@ Then open the printed URL in a browser and sign in with the admin token.
 ### Check it yourself
 
 ```bash
+npm run verify
+```
+
+This checks health, OAuth discovery and the policy baseline (no raw proxy; only Notion and Slack actions) from the
+outside. It asks for the admin token with hidden input. Expected output and what each line means:
+[guardrails](../guardrails.md#check-a-deployment).
+
+Or by hand:
+
+```bash
 curl https://<your-worker>.workers.dev/health
 # {"ok":true}
 curl -s https://<your-worker>.workers.dev/.well-known/oauth-authorization-server | head -c 120
