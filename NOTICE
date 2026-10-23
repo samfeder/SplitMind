@@ -1,0 +1,11 @@
+SplitMind
+Copyright 2026 The SplitMind Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product builds on and includes OpenConnector (OOMOL Connect),
+https://github.com/oomol-lab/open-connector, licensed under the Apache License,
+Version 2.0. OpenConnector is included as a git submodule under
+vendor/open-connector, and its own LICENSE.txt and NOTICE.md apply to it. Any
+patches SplitMind applies to it at build time are in patches/ and are licensed
+under the Apache License, Version 2.0.
