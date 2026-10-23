@@ -150,13 +150,41 @@ That makes the bill $5.00 flat. D1 and KV paid allowances (25B rows read, 50M ro
 ## Consequences
 
 - **#8 (deploy):**
-  - Add the catalog trim step and the HKDF patch. The patch waits on its upstream issue and on Sam's approval.
-  - Render the template.
+  - Add the catalog trim step and the HKDF patch (done: `scripts/catalog-assets.ts`, `patches/0001-…`). Filing the upstream issue is a public post, so it waits for Sam under #37.
+  - Render the template (done: `scripts/deploy.ts`, see `docs/setup/cloudflare.md`).
   - Apply migrations through `0018_connection_retirement.sql`.
   - Record the bundle sizes and `startup_time_ms`.
   - Run the 24-hour CPU check above.
 - **If the check fails:** Sam switches the account to Workers Paid, a $5/month billing change. The template's `cpu_ms` cap gets uncommented.
 - **#37 (upstream work):** gets the HKDF change, plus the `kv_namespaces` docs fix.
+
+## Addendum: measured while preparing #8 (2026-10-23)
+
+Upstream installs in the cloud sandbox after all: its lockfile points at `registry.npmmirror.com`, which the sandbox refuses, and `npm ci --replace-registry-host=registry.npmmirror.com` fetches the same packages from npmjs. `scripts/bootstrap.sh` now does that.
+
+**Bundle (wrangler 4.150.0, both patches applied, `npm run deploy -- --dry-run`):**
+
+```
+Total Upload: 20873.01 KiB / gzip: 5029.58 KiB
+```
+
+That is 20.4 MiB, 32% of the 64 MiB limit, and larger than upstream's documented 13.8 MiB. It still fits every plan. `startup_time_ms` is only reported by a real upload, so it is recorded at the first deploy.
+
+**Catalog assets:** all 1,667 providers produce 47,814,344 bytes in 12 chunks; Notion and Slack alone produce 144,202 bytes in 1 chunk (`scripts/catalog-assets.ts`).
+
+**Cold first request in local `workerd`** (`wrangler dev`, a fresh process per run, `GET /health`, curl wall time). Wall time includes asset and D1 I/O, which Cloudflare does not count as CPU, so these are upper bounds:
+
+| Configuration | Cold request | Warm request |
+|---|---|---|
+| Full catalog, HKDF key | 885–1,691 ms | 5–6 ms |
+| Trimmed catalog, HKDF key | 76–138 ms | 4–7 ms |
+| Trimmed catalog, passphrase key (PBKDF2) | 91–144 ms | 4–6 ms |
+
+PBKDF2 at upstream's parameters, timed alone in `workerd`: 18–22 ms per derivation against 3 ms for an empty request, so about 15 ms of work; HKDF is indistinguishable from the empty request. That is lower than the Node figure in finding 2, but still over 10 ms by itself, so patch 0001 stays.
+
+Instrumenting `createCloudflareApp` (temporarily, not committed) splits a trimmed cold request into: `preloadOptionalServerModules()` 64 ms, key setup 1 ms, catalog load 23 ms, `createConnectApp` 13 ms. Evaluating the MCP and docs modules is now the largest cost. Moving that call to module scope (startup, which has its own 1 s limit) cut the in-request time from 72–113 ms to 33–41 ms in a quick experiment. That would be a third patch; it is filed as an enhancement to try only if the Free trial fails and Paid is not wanted.
+
+**Expectation:** the trial on Free will probably show cold requests above 10 ms. The pass criteria above still decide.
 
 ## Known vs. assumed
 

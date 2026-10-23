@@ -19,3 +19,6 @@ coverage/
 .vscode/
 .idea/
 *.log
+
+# SplitMind deploy state (account-specific resource ids and origin)
+splitmind.local.json

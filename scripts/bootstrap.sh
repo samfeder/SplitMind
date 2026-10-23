@@ -70,7 +70,9 @@ else
   echo "==> Installing SplitMind dependencies"
   npm ci --no-audit --no-fund
   echo "==> Installing OpenConnector dependencies"
-  (cd "$engine" && npm ci --no-audit --no-fund)
+  # Upstream's lockfile resolves packages from registry.npmmirror.com; fetch them from the configured registry
+  # (npmjs by default) instead, which is faster outside China and reachable from locked-down networks.
+  (cd "$engine" && npm ci --no-audit --no-fund --replace-registry-host=registry.npmmirror.com)
 fi
 
 echo "==> Bootstrap complete"
