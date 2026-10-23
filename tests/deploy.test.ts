@@ -38,6 +38,9 @@ if (args[0] === "whoami") {
     JSON.stringify({ type: "deploy", targets: ["https://splitmind.fake-subdomain.workers.dev"], bundle_size: { raw_bytes: 2097152, gzip_bytes: 1048576 } }) + "\\n");
 } else if (key === "secret list --config") {
   console.log(JSON.stringify(state.secrets.map((name) => ({ name, type: "secret_text" }))));
+} else if (args[0] === "secret" && args[1] === "put") {
+  state.secrets.push(args[2]);
+  state.secretValues[args[2]] = fs.readFileSync(0, "utf8");
 } else {
   console.error("fake wrangler: unexpected " + args.join(" "));
   process.exit(9);
@@ -62,6 +65,7 @@ interface FakeAccount {
   d1: { name: string; uuid: string }[];
   kv: { title: string; id: string }[];
   secrets: string[];
+  secretValues: Record<string, string>;
   deployedOrigins: string[];
 }
 
@@ -91,7 +95,7 @@ beforeEach(() => {
   writeFileSync(wrangler, FAKE_WRANGLER);
   chmodSync(wrangler, 0o755);
   account = join(dir, "account.json");
-  setAccount({ calls: [], d1: [], kv: [], secrets: [], deployedOrigins: [] });
+  setAccount({ calls: [], d1: [], kv: [], secrets: [], secretValues: {}, deployedOrigins: [] });
 });
 
 afterEach(() => {
@@ -106,13 +110,23 @@ function readAccount(): FakeAccount {
   return JSON.parse(readFileSync(account, "utf8")) as FakeAccount;
 }
 
-function deploy(...args: string[]) {
+function deployWith(env: NodeJS.ProcessEnv, ...args: string[]) {
+  // Secrets in the outer environment (e.g. a cloud session set up to deploy) must not leak into these runs.
+  const { SPLITMIND_ADMIN_TOKEN: _admin, SPLITMIND_ENCRYPTION_KEY: _key, ...outer } = process.env;
   return spawnSync(process.execPath, [join(checkout, "scripts/deploy.ts"), ...args], {
     cwd: checkout,
     encoding: "utf8",
-    env: { ...process.env, SPLITMIND_WRANGLER: wrangler, FAKE_CF_STATE: account },
+    env: { ...outer, SPLITMIND_WRANGLER: wrangler, FAKE_CF_STATE: account, ...env },
   });
 }
+
+function deploy(...args: string[]) {
+  return deployWith({}, ...args);
+}
+
+// Built at runtime so secret scanners don't flag test fixtures.
+const encryptionKey = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - index)).toString("base64");
+const adminToken = Buffer.from(Array.from({ length: 32 }, (_, index) => index * 7)).toString("base64");
 
 // Each test runs the script and its npm build steps as real processes, which is slow on a loaded machine.
 describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
@@ -149,6 +163,34 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(JSON.parse(readFileSync(join(engine, "dist/web/catalog/index.json"), "utf8"))).toEqual({
       files: ["notion.json", "slack.json"],
     });
+  });
+
+  it("sets missing secrets from the environment without printing them", () => {
+    const result = deployWith({ SPLITMIND_ADMIN_TOKEN: adminToken, SPLITMIND_ENCRYPTION_KEY: encryptionKey });
+
+    const state = readAccount();
+    expect(state.secretValues).toEqual({
+      OOMOL_CONNECT_ADMIN_TOKEN: adminToken,
+      OOMOL_CONNECT_ENCRYPTION_KEY: encryptionKey,
+    });
+    expect(result.stdout).toContain("OOMOL_CONNECT_ADMIN_TOKEN: set from SPLITMIND_ADMIN_TOKEN");
+    expect(result.stdout).toContain("OOMOL_CONNECT_ENCRYPTION_KEY: set from SPLITMIND_ENCRYPTION_KEY");
+    expect(result.stderr).not.toContain("secrets not set");
+    for (const output of [result.stdout, result.stderr]) {
+      expect(output).not.toContain(adminToken);
+      expect(output).not.toContain(encryptionKey);
+    }
+  });
+
+  it("refuses an encryption key that is not 32 base64 bytes, without echoing it", () => {
+    const shortKey = Buffer.from("sixteen byte key").toString("base64");
+
+    const result = deployWith({ SPLITMIND_ADMIN_TOKEN: adminToken, SPLITMIND_ENCRYPTION_KEY: shortKey });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("SPLITMIND_ENCRYPTION_KEY must be exactly 32 bytes in base64");
+    expect(result.stderr).not.toContain(shortKey);
+    expect(readAccount().secrets).toEqual([]);
   });
 
   it("reuses everything on a re-run and deploys once", () => {

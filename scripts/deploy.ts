@@ -23,6 +23,26 @@ const statePath = join(root, "splitmind.local.json");
 const renderedPath = join(engine, "wrangler.local.jsonc");
 const requiredSecrets = ["OOMOL_CONNECT_ADMIN_TOKEN", "OOMOL_CONNECT_ENCRYPTION_KEY"];
 
+// Where a non-interactive run (CI, a cloud session) may take each secret from. Values are piped to wrangler and
+// never printed.
+const secretSources: Record<string, string> = {
+  OOMOL_CONNECT_ADMIN_TOKEN: "SPLITMIND_ADMIN_TOKEN",
+  OOMOL_CONNECT_ENCRYPTION_KEY: "SPLITMIND_ENCRYPTION_KEY",
+};
+
+// Returns why a secret value is unusable, without repeating the value.
+export function secretProblem(name: string, value: string): string | undefined {
+  if (name === "OOMOL_CONNECT_ENCRYPTION_KEY") {
+    const bytes = Buffer.from(value, "base64");
+    if (bytes.length !== 32 || bytes.toString("base64") !== value) {
+      return "must be exactly 32 bytes in base64 (the output of `openssl rand -base64 32`)";
+    }
+  } else if (value.length < 32) {
+    return "must be at least 32 characters (use `openssl rand -base64 32`)";
+  }
+  return undefined;
+}
+
 export interface DeployState {
   workerName: string;
   d1: { name: string; id: string };
@@ -114,12 +134,16 @@ function wranglerCommand(): string[] {
   return override ? [override] : [join(engine, "node_modules/.bin/wrangler")];
 }
 
-function wrangler(args: string[], options: { cwd?: string; interactive?: boolean; env?: NodeJS.ProcessEnv } = {}): string {
+function wrangler(
+  args: string[],
+  options: { cwd?: string; interactive?: boolean; env?: NodeJS.ProcessEnv; input?: string } = {},
+): string {
   const [command, ...prefix] = wranglerCommand();
   const result = spawnSync(command!, [...prefix, ...args], {
     cwd: options.cwd ?? root,
     encoding: "utf8",
-    stdio: options.interactive ? "inherit" : ["inherit", "pipe", "pipe"],
+    input: options.input,
+    stdio: options.interactive ? "inherit" : [options.input === undefined ? "inherit" : "pipe", "pipe", "pipe"],
     env: { ...process.env, WRANGLER_SEND_METRICS: "false", ...options.env },
   });
   if (result.status !== 0) {
@@ -232,14 +256,32 @@ function ensureSecrets(): void {
       wrangler(["secret", "list", "--config", "wrangler.local.jsonc", "--format", "json"], { cwd: engine }),
     ).map((secret) => secret.name),
   );
-  const missing = requiredSecrets.filter((name) => !present.has(name));
+  let missing = requiredSecrets.filter((name) => !present.has(name));
   if (missing.length === 0) {
     console.log("    secrets: all set");
     return;
   }
+  // Check every value first, so a bad one doesn't leave the Worker with only some of its secrets.
+  const fromEnv = missing.flatMap((name) => {
+    const source = secretSources[name]!;
+    const value = process.env[source]?.trim();
+    if (!value) return [];
+    const problem = secretProblem(name, value);
+    if (problem) throw new Error(`${source} ${problem}`);
+    return [{ name, source, value }];
+  });
+  for (const { name, source, value } of fromEnv) {
+    wrangler(["secret", "put", name, "--config", "wrangler.local.jsonc"], { cwd: engine, input: value });
+    console.log(`    ${name}: set from ${source}`);
+  }
+  missing = missing.filter((name) => !fromEnv.some((secret) => secret.name === name));
+  if (missing.length === 0) return;
   const commands = missing.map((name) => `  (cd vendor/open-connector && npx wrangler secret put ${name} --config wrangler.local.jsonc)`);
   if (!process.stdin.isTTY) {
-    console.error(`deploy: secrets not set: ${missing.join(", ")}. Run these in a terminal, then re-run this script:`);
+    console.error(
+      `deploy: secrets not set: ${missing.join(", ")}. Run these in a terminal, or set ` +
+        `${missing.map((name) => secretSources[name]).join(" and ")} in the environment, then re-run this script:`,
+    );
     console.error(commands.join("\n"));
     throw new Error("missing secrets");
   }
