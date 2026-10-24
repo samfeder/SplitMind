@@ -31,8 +31,17 @@ Placeholders used below:
   allowed because labelling plus-addressed mail by filter is a normal chore to hand to Claude. A filter can forward
   only to an address already verified in that mailbox's settings, and SplitMind cannot add one (that needs
   `gmail.settings.sharing`, which it doesn't request).
-- **Attachments:** `gmail.download_attachment` needs a streaming transit backend, and SplitMind uses KV
-  ([ADR-0001](../adr/0001-deployment-shape.md)), so it fails. Reading message bodies is unaffected.
+- **Attachments:** `gmail.download_attachment` stores the attachment as a transit file and returns its
+  `downloadUrl`. Upstream only supports this on a streaming backend, so SplitMind carries
+  [patch 0003](../../patches/README.md) for its KV backend. Limits:
+  - **Size:** 10 MiB (`OOMOL_CONNECT_TRANSIT_FILE_MAX_BYTES`). A larger one fails with `413`.
+  - **Workers Free CPU:** decoding costs about 4.5 ms of CPU per MiB, measured on Node. Under Free's 10 ms
+    limit, expect attachments above about 1–2 MiB to fail with Cloudflare error 1102 (exceeded CPU). Workers Paid
+    handles the full 10 MiB.
+  - **Who can fetch it:** the `downloadUrl` (`<origin>/api/files/<random id>`) needs no token. Anyone holding the
+    link can download the file until it expires an hour later (`OOMOL_CONNECT_TRANSIT_FILE_TTL_SECONDS`).
+  - **Getting it to Claude:** Claude Code can `curl` the link. On claude.ai, Claude sees the file's name, type and
+    size, but may not be allowed to fetch the link; open it yourself in that case.
 - **Catalog cost on Workers Free:** Gmail adds about 108 KB to the trimmed catalog chunk (144 KB to 252 KB for all
   three providers) and about 0.7 ms of JSON parsing on a cold start, measured locally. The Worker bundle doesn't
   change: provider code ships in it either way.
