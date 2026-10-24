@@ -158,6 +158,8 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(rendered).toContain('{ "binding": "OAUTH_KV", "id": "kv-id-1" }');
     expect(rendered).toContain('"OOMOL_CONNECT_ORIGIN": "https://splitmind.fake-subdomain.workers.dev"');
     expect(rendered).not.toMatch(/"<[a-z0-9-]+>"/);
+    // The engine's sourcemap is over Cloudflare's 60 MiB cap; uploading it fails the deploy.
+    expect(rendered).toContain('"upload_source_maps": false');
 
     // Only the allowlisted providers reach the Worker's catalog assets.
     expect(JSON.parse(readFileSync(join(engine, "dist/web/catalog/index.json"), "utf8"))).toEqual({
