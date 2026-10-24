@@ -11,13 +11,14 @@ below is drafted and waiting to be filed from Sam's GitHub account (#37). Nothin
 | [Per-connection action policy (read-only)](connection-read-only-issue-draft.md) | issue | none | #31 |
 | [Unnamed call returns a misleading auth error](../spikes/notion-provider.md#u1--execute_action-without-connectionname-and-no-default-returns-a-misleading-auth-error) | issue | none | #28 |
 | [Require a connection name per provider](../spikes/notion-provider.md#u2--option-to-require-an-explicit-connection-name-for-some-providers) | issue | none | #28 |
+| [Gmail attachments on KV/R2 transit](gmail-attachments-issue-draft.md) | issue, then PR | `patches/0003-…` | #56 |
 | ["Use with claude.ai" docs + kv_namespaces fix](claude-ai-docs-pr-draft.md) | docs PR | none | #37 |
 
 ## Filing them (Sam)
 
 1. Fork `oomol-lab/open-connector` to `samfeder/open-connector` (GitHub → Fork).
 2. File each issue with the draft's title and body, re-checking upstream `main` first as each draft says.
-3. For the two patches, push a branch to the fork from the patch and open the PR:
+3. For the three patches, push a branch to the fork from the patch and open the PR:
 
    ```bash
    git clone https://github.com/samfeder/open-connector.git && cd open-connector

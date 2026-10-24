@@ -63,6 +63,11 @@
   ],
   "vars": {
     "TRANSIT_FILES_BACKEND": "kv",
+    // Transit files (e.g. a downloaded Gmail attachment) are served at an unguessable but unauthenticated URL, so
+    // keep them 1 hour instead of upstream's 24. Cap them at 10 MiB: a KV-backed download is decoded in memory, and
+    // a 128 MB isolate holds about seven copies of it at peak (patches/0003).
+    "OOMOL_CONNECT_TRANSIT_FILE_TTL_SECONDS": "3600",
+    "OOMOL_CONNECT_TRANSIT_FILE_MAX_BYTES": "10485760",
     // Canonical public origin, no trailing slash, e.g. https://<worker-name>.<subdomain>.workers.dev
     "OOMOL_CONNECT_ORIGIN": "<public-origin>",
     // Pinned decision 7: no raw provider proxy; only Notion, Slack and Gmail actions.
