@@ -127,7 +127,8 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   });
   const record = created.json as { token?: string; record?: { id?: string } } | undefined;
   if (created.status !== 200 && created.status !== 201) {
-    check("create a temporary runtime token (admin token accepted)", false, describe(created));
+    const hint = created.status === 401 ? "; is this the admin token, not the encryption key?" : "";
+    check("create a temporary runtime token (admin token accepted)", false, describe(created) + hint);
     return checks;
   }
   const token = record?.token;
@@ -204,6 +205,11 @@ async function checkGuardrail(
   }
 }
 
+// Terminals with bracketed paste wrap pasted text in ESC[200~ … ESC[201~; password managers can add whitespace.
+export function cleanPastedSecret(raw: string): string {
+  return raw.replace(/\u001b\[20[01]~/g, "").trim();
+}
+
 async function promptHidden(question: string): Promise<string> {
   const { stdin, stdout } = process;
   stdout.write(question);
@@ -252,7 +258,7 @@ async function main(): Promise<number> {
       console.error("verify: set SPLITMIND_ADMIN_TOKEN, or run in a terminal to be prompted");
       return 2;
     }
-    adminToken = (await promptHidden("Admin token (input hidden): ")).trim();
+    adminToken = cleanPastedSecret(await promptHidden("Admin token (input hidden): "));
   }
 
   console.log(`Verifying ${origin}`);
