@@ -12,8 +12,8 @@ Claude's connectors hold one account per service. claude.ai keys custom
 connectors by URL and rejects a second connector whose URL it already has
 ([anthropics/claude-ai-mcp#178](https://github.com/anthropics/claude-ai-mcp/issues/178)),
 and its connector form offers custom request headers only as a beta for some
-organizations. So if you have two Notion workspaces, or two Slack workspaces,
-you can only connect one of each.
+organizations. So if you have two Notion workspaces, two Slack workspaces or
+two Gmail accounts, you can only connect one of each.
 
 ## How it works
 
@@ -31,10 +31,14 @@ flowchart LR
     W --> N2[named connection<br/>notion: personal]
     W --> S1[named connection<br/>slack: team-a]
     W --> S2[named connection<br/>slack: team-b]
+    W --> G1[named connection<br/>gmail: personal]
+    W --> G2[named connection<br/>gmail: work]
     N1 --> NA[(Notion)]
     N2 --> NA
     S1 --> SA[(Slack)]
     S2 --> SA
+    G1 --> GA[(Gmail)]
+    G2 --> GA
 ```
 
 - **Engine:** OpenConnector provides encrypted credential storage, named
@@ -46,8 +50,9 @@ flowchart LR
 - **Host:** your Cloudflare account: Workers, D1, KV and Static Assets for the
   Web Console.
 - **Sign-in:** Claude connects through OpenConnector's built-in MCP OAuth.
-- **v0.1 scope:** two Notion workspaces and two Slack workspaces. The design
-  stays general; other providers come later.
+- **Providers:** Notion and Slack workspaces and Gmail accounts, as many of
+  each as you connect. The design stays general; adding another provider is
+  configuration ([adding a provider](docs/adding-a-provider.md)).
 
 ## Repository layout
 
@@ -77,7 +82,7 @@ npm run verify                                        # health, OAuth discovery,
 Then:
 
 1. Connect your accounts as **named connections** in the Web Console:
-   [Notion](docs/providers/notion.md), [Slack](docs/providers/slack.md).
+   [Notion](docs/providers/notion.md), [Slack](docs/providers/slack.md), [Gmail](docs/providers/gmail.md).
 2. Add `<your-worker-url>/mcp` as a custom connector in Claude: [web, desktop, mobile and Claude Code](docs/claude.md).
 3. Ask Claude to "list my connections", then name the account in each request.
 

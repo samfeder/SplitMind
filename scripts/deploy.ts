@@ -79,7 +79,7 @@ export function renderTemplate(template: string, values: RenderValues): string {
   return rendered;
 }
 
-/** The provider ids in the template's OOMOL_CONNECT_ALLOWED_ACTIONS ("notion.*,slack.*" -> notion, slack). */
+/** The provider ids in the template's OOMOL_CONNECT_ALLOWED_ACTIONS ("notion.*,slack.*,gmail.*" -> gmail, notion, slack). */
 export function allowlistedProviders(template: string): string[] {
   const match = stripComments(template).match(/"OOMOL_CONNECT_ALLOWED_ACTIONS"\s*:\s*"([^"]*)"/);
   if (!match) throw new Error("template has no OOMOL_CONNECT_ALLOWED_ACTIONS");
@@ -89,6 +89,13 @@ export function allowlistedProviders(template: string): string[] {
     .filter(Boolean)
     .map((entry) => entry.split(".")[0]!);
   return [...new Set(providers)].sort();
+}
+
+/** The exact action ids in the template's OOMOL_CONNECT_BLOCKED_ACTIONS; empty if it has none. */
+export function blockedActions(template: string): string[] {
+  const match = stripComments(template).match(/"OOMOL_CONNECT_BLOCKED_ACTIONS"\s*:\s*"([^"]*)"/);
+  if (!match) return [];
+  return [...new Set(match[1]!.split(",").map((entry) => entry.trim()).filter(Boolean))].sort();
 }
 
 export interface DeployRecord {

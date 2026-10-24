@@ -14,7 +14,8 @@ const RUNTIME = "test-runtime-token";
 
 interface Behaviour {
   proxyOpen: boolean;
-  connections?: { service: string; connectionName: string; default: boolean }[];
+  connections?: { service: string; connectionName: string; default: boolean; profile?: { accountId: string } }[];
+  blockOpen?: boolean;
 }
 
 let server: Server | undefined;
@@ -73,8 +74,13 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
         ? send(response, 200, { success: true, data: { status: 200 } })
         : send(response, 403, { success: false, errorCode: "proxy_blocked" });
     }
-    if (key === "GET /v1/providers") return send(response, 200, { success: true, data: [{ service: "slack" }, { service: "notion" }] });
+    if (key === "GET /v1/providers") return send(response, 200, { success: true, data: [{ service: "slack" }, { service: "gmail" }, { service: "notion" }] });
     if (key === "POST /v1/actions/github.get_current_user") return send(response, 404, { success: false, errorCode: "unknown_action" });
+    if (url.startsWith("/v1/actions/gmail.update_") || url === "/v1/actions/gmail.stop_watch") {
+      return behaviour.blockOpen
+        ? send(response, 400, { success: false, errorCode: "invalid_input" })
+        : send(response, 400, { success: false, errorCode: "action_blocked" });
+    }
     if (key === "POST /v1/actions/notion.search") return send(response, 400, { success: false, errorCode: "invalid_input" });
     return send(response, 500, { unexpected: key });
   };
@@ -102,10 +108,13 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("PASS  raw notion proxy is blocked by deployment policy  (403 proxy_blocked)");
-    expect(result.stdout).toContain("PASS  only notion and slack are offered  (200 [notion, slack])");
+    expect(result.stdout).toContain("PASS  raw gmail proxy is blocked by deployment policy  (403 proxy_blocked)");
+    expect(result.stdout).toContain("PASS  only gmail, notion and slack are offered  (200 [gmail, notion, slack])");
+    expect(result.stdout).toContain("PASS  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 action_blocked, ");
+    expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
-    expect(result.stdout).toContain("All 11 checks passed.");
+    expect(result.stdout).toContain("All 14 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -116,7 +125,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("2 of 11 checks failed.");
+    expect(result.stdout).toContain("3 of 14 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -125,14 +134,15 @@ describe("scripts/verify-deployment.ts", () => {
     const origin = await startWorker({
       proxyOpen: false,
       connections: [
-        { service: "notion", connectionName: "notion_a", default: false },
-        { service: "notion", connectionName: "notion_b", default: false },
+        { service: "notion", connectionName: "notion_a", default: false, profile: { accountId: "bot-A" } },
+        { service: "notion", connectionName: "notion_b", default: false, profile: { accountId: "bot-B" } },
       ],
     });
 
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("PASS  no default notion connection  (200 2 connection(s): [notion_a, notion_b])");
+    expect(result.stdout).toContain("PASS  each notion connection is a different account  (2 connection(s))");
     expect(result.stdout).toContain(
       "PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)",
     );
@@ -146,6 +156,34 @@ describe("scripts/verify-deployment.ts", () => {
         connectionName: "default",
       },
     ]);
+  });
+
+  it("fails when a blocked action gets past policy", async () => {
+    const origin = await startWorker({ proxyOpen: false, blockOpen: true });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("FAIL  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 invalid_input, ");
+    expect(result.status).toBe(1);
+  });
+
+  it("fails when one Google account is connected under two aliases", async () => {
+    const origin = await startWorker({
+      proxyOpen: false,
+      connections: [
+        { service: "gmail", connectionName: "personal", default: false, profile: { accountId: "a@example.com" } },
+        { service: "gmail", connectionName: "work", default: false, profile: { accountId: "a@example.com" } },
+        { service: "gmail", connectionName: "side", default: false, profile: { accountId: "b@example.com" } },
+      ],
+    });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("FAIL  each gmail connection is a different account  (same account under [personal, work])");
+    expect(result.stdout).toContain(
+      "PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)",
+    );
+    expect(result.status).toBe(1);
   });
 
   it("never sends the unnamed write when a default connection exists", async () => {
