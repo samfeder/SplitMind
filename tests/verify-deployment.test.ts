@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { cleanPastedSecret } from "../scripts/verify-deployment.ts";
 
 // Runs the real scripts/verify-deployment.ts against a stand-in Worker: a local HTTP server that answers like
 // OpenConnector does. One variant follows the SplitMind policy; the other leaves the raw proxy open.
@@ -21,7 +22,7 @@ let deletedTokens: string[] = [];
 let toolCalls: unknown[] = [];
 
 afterEach(async () => {
-  await new Promise((done) => server?.close(done));
+  if (server) await new Promise((done) => server!.close(done));
   server = undefined;
   deletedTokens = [];
   toolCalls = [];
@@ -166,8 +167,18 @@ describe("scripts/verify-deployment.ts", () => {
 
     const wrong = await verify(origin, "not-the-admin-token");
 
-    expect(wrong.stdout).toContain("FAIL  create a temporary runtime token (admin token accepted)  (401 unauthorized)");
+    expect(wrong.stdout).toContain(
+      "FAIL  create a temporary runtime token (admin token accepted)  (401 unauthorized; is this the admin token, not the encryption key?)",
+    );
     expect(wrong.status).toBe(1);
     expect(wrong.stdout + wrong.stderr).not.toContain("not-the-admin-token");
+  });
+});
+
+describe("cleanPastedSecret", () => {
+  it("strips bracketed-paste markers and surrounding whitespace", () => {
+    expect(cleanPastedSecret("\u001b[200~abc+/=\u001b[201~")).toBe("abc+/=");
+    expect(cleanPastedSecret("  abc+/= \t")).toBe("abc+/=");
+    expect(cleanPastedSecret("abc+/=")).toBe("abc+/=");
   });
 });
