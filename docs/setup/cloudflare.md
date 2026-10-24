@@ -56,7 +56,7 @@ The script prints each step:
    `vendor/open-connector/wrangler.local.jsonc` (git-ignored upstream).
 3. **D1 migrations**, applied remotely. Upstream's deploy does not run them, so the script always does.
 4. **Build.** OpenConnector's catalog and Web Console, then the Worker's catalog assets trimmed to the providers in
-   `OOMOL_CONNECT_ALLOWED_ACTIONS` (Notion and Slack).
+   `OOMOL_CONNECT_ALLOWED_ACTIONS` (Notion, Slack and Gmail).
 5. **Deploy.** The first time, wrangler may ask to register a `workers.dev` subdomain for the account. The script
    then reads the Worker's URL from wrangler, sets it as `OOMOL_CONNECT_ORIGIN` and deploys again. Until that
    second pass the Worker answers every request with 503, so it is never reachable half-configured.
@@ -85,7 +85,7 @@ Then open the printed URL in a browser and sign in with the admin token.
 npm run verify
 ```
 
-This checks health, OAuth discovery and the policy baseline (no raw proxy; only Notion and Slack actions) from the
+This checks health, OAuth discovery and the policy baseline (no raw proxy; only Notion, Slack and Gmail actions, minus the blocked Gmail settings writes) from the
 outside. It asks for the admin token with hidden input. Expected output and what each line means:
 [guardrails](../guardrails.md#check-a-deployment).
 

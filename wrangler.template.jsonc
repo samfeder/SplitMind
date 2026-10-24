@@ -65,13 +65,18 @@
     "TRANSIT_FILES_BACKEND": "kv",
     // Canonical public origin, no trailing slash, e.g. https://<worker-name>.<subdomain>.workers.dev
     "OOMOL_CONNECT_ORIGIN": "<public-origin>",
-    // Pinned decision 7: no raw provider proxy; only Notion and Slack actions.
+    // Pinned decision 7: no raw provider proxy; only Notion, Slack and Gmail actions.
     // Provider ids verified in upstream v1.9.2: src/providers/notion/definition.ts (service = "notion"),
-    // src/providers/slack/definition.ts (service = "slack").
+    // src/providers/slack/definition.ts (service = "slack"), src/providers/gmail/definition.ts (service = "gmail").
     "OOMOL_CONNECT_BLOCKED_PROXIES": "*",
-    "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*",
-    // Pinned decision 4: one internal Slack app per workspace, supplied per connection.
-    "OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH": "slack",
+    "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*",
+    // Gmail mailbox settings Claude has no reason to change: the vacation responder (it mails everyone who
+    // writes), IMAP/POP access, display language, and stopping a push watch. Filters stay allowed
+    // (docs/providers/gmail.md).
+    "OOMOL_CONNECT_BLOCKED_ACTIONS": "gmail.update_vacation_settings,gmail.update_imap_settings,gmail.update_pop_settings,gmail.update_language_settings,gmail.stop_watch",
+    // Pinned decision 4: one internal Slack app per workspace, supplied per connection. Gmail normally uses
+    // the deployment-wide Google OAuth client; per-connection lets a Workspace account use its own Internal one.
+    "OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH": "slack,gmail",
     // Proposed, not pinned: tokens already default to no trigger access; this makes it explicit.
     // "OOMOL_CONNECT_BLOCKED_TRIGGERS": "*",
   },

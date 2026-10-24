@@ -47,7 +47,7 @@ connections and actions, which suits a coding agent.
    read -rs ADMIN                    # paste the admin token, then Enter
    TOKEN=$(curl -s -X POST "$O/api/runtime-tokens" \
      -H "authorization: Bearer $ADMIN" -H 'content-type: application/json' \
-     -d '{"name":"Claude Code","allowedActions":["notion.*","slack.*"],"blockedActions":[],"allowedProxies":[],"allowedConnections":["<conn-id-a>"]}' \
+     -d '{"name":"Claude Code","allowedActions":["notion.*","slack.*","gmail.*"],"blockedActions":[],"allowedProxies":[],"allowedConnections":["<conn-id-a>"]}' \
      | jq -r .token)
    unset ADMIN
    claude mcp add --transport http --scope user splitmind "$O/mcp" --header "Authorization: Bearer $TOKEN"

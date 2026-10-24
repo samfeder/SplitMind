@@ -1,6 +1,7 @@
 // Checks a running SplitMind Worker over HTTP: health, OAuth discovery, the decision-7 policy baseline (no raw
-// provider proxy; only Notion and Slack actions) and the decision-8 guardrail (no default Notion or Slack connection,
-// so a write that names no account is refused). Prints one PASS/FAIL line per check; exits non-zero on any FAIL.
+// provider proxy; only the allowlisted providers' actions, minus the blocked ones) and the decision-8 guardrail (no
+// default connection for any provider, so a write that names no account is refused; no account connected twice).
+// Prints one PASS/FAIL line per check; exits non-zero on any FAIL.
 //
 // Usage: node scripts/verify-deployment.ts [--origin <url>]
 //   --origin  Worker origin (default: the one saved in splitmind.local.json by scripts/deploy.ts).
@@ -11,7 +12,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { allowlistedProviders } from "./deploy.ts";
+import { allowlistedProviders, blockedActions } from "./deploy.ts";
 
 const root = resolve(import.meta.dirname, "..");
 
@@ -25,6 +26,7 @@ interface Connection {
   service: string;
   connectionName: string;
   default?: boolean;
+  profile?: { accountId?: string };
 }
 
 /** One write per provider that would change something if it ever reached a workspace. Used only with no alias. */
@@ -34,7 +36,16 @@ const guardedWrites: Record<string, { actionId: string; input: unknown }> = {
     input: { parent: { page_id: "00000000000000000000000000000000" }, properties: {} },
   },
   slack: { actionId: "slack.post_message", input: { channelId: "C0000000000", text: "SplitMind guardrail check" } },
+  gmail: {
+    actionId: "gmail.create_draft",
+    input: { to: "nobody@example.invalid", subject: "SplitMind guardrail check", body: "SplitMind guardrail check" },
+  },
 };
+
+/** "a", "a and b", "a, b and c". */
+export function listOf(items: string[]): string {
+  return items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
 
 interface Check {
   name: string;
@@ -105,7 +116,9 @@ function describe(result: { status: number; json: Envelope | undefined; text: st
 
 export async function verify(origin: string, adminToken: string): Promise<Check[]> {
   // The providers the deployment should offer are the ones its template allowlists.
-  const expected = allowlistedProviders(readFileSync(join(root, "wrangler.template.jsonc"), "utf8"));
+  const template = readFileSync(join(root, "wrangler.template.jsonc"), "utf8");
+  const expected = allowlistedProviders(template);
+  const blocked = blockedActions(template);
   const checks: Check[] = [];
   const check = (name: string, ok: boolean, detail: string) => checks.push({ name, ok, detail });
 
@@ -148,7 +161,7 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
     const services = Array.isArray(providers.json?.data)
       ? (providers.json.data as { service: string }[]).map((provider) => provider.service).sort()
       : [];
-    check(`only ${expected.join(" and ")} are offered`, providers.status === 200 && services.join(",") === expected.join(","), `${providers.status} [${services.join(", ")}]`);
+    check(`only ${listOf(expected)} are offered`, providers.status === 200 && services.join(",") === expected.join(","), `${providers.status} [${services.join(", ")}]`);
 
     const outside = await request(origin, "POST", "/v1/actions/github.get_current_user", token, {});
     check(
@@ -164,6 +177,20 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
       !["unknown_action", "action_not_allowed", "action_blocked"].includes(inside.json?.errorCode ?? "") && inside.status !== 401,
       describe(inside),
     );
+
+    // Blocked ids sit inside an allowed provider (e.g. gmail.* minus mailbox settings), so the block must win.
+    if (blocked.length > 0) {
+      const codes: string[] = [];
+      for (const actionId of blocked) {
+        const refused = await request(origin, "POST", `/v1/actions/${encodeURIComponent(actionId)}`, token, {});
+        codes.push(`${actionId}=${describe(refused)}`);
+      }
+      check(
+        `the ${blocked.length} blocked action(s) are refused by policy`,
+        codes.every((code) => code.endsWith(" action_blocked")),
+        codes.join(", "),
+      );
+    }
 
     await checkGuardrail(origin, adminToken, token, check);
   } finally {
@@ -195,6 +222,18 @@ async function checkGuardrail(
       continue;
     }
     if (mine.length === 0) continue;
+
+    // Signing in to the provider as the wrong account (e.g. the browser's current Google session) stores the same
+    // account under a second alias, so a call naming either alias would act there.
+    if (mine.length > 1) {
+      const count = (id: string | undefined) => mine.filter((row) => id && row.profile?.accountId === id).length;
+      const repeated = mine.filter((row) => count(row.profile?.accountId) > 1).map((row) => row.connectionName);
+      check(
+        `each ${service} connection is a different account`,
+        repeated.length === 0,
+        repeated.length === 0 ? `${mine.length} connection(s)` : `same account under [${repeated.join(", ")}]`,
+      );
+    }
 
     const { actionId, input } = guardedWrites[service]!;
     const unnamed = await callTool(origin, token, "execute_action", { actionId, input });

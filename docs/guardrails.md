@@ -20,22 +20,32 @@ deployment's own policy. It deletes the token before it exits. Expected output:
 PASS  GET /health returns {"ok":true}  (200)
 PASS  OAuth discovery names this origin as issuer  (200 issuer=https://<your-worker>.workers.dev)
 PASS  POST /mcp without a token is refused  (401)
+PASS  raw gmail proxy is blocked by deployment policy  (403 proxy_blocked)
 PASS  raw notion proxy is blocked by deployment policy  (403 proxy_blocked)
 PASS  raw slack proxy is blocked by deployment policy  (403 proxy_blocked)
-PASS  only notion and slack are offered  (200 [notion, slack])
+PASS  only gmail, notion and slack are offered  (200 [gmail, notion, slack])
 PASS  an action outside the allowlist is refused  (404 unknown_action)
 PASS  an allowlisted action is not refused by policy  (400 invalid_input)
+PASS  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 action_blocked, …)
 PASS  no default notion connection  (200 2 connection(s): [<alias-a>, <alias-b>])
+PASS  each notion connection is a different account  (2 connection(s))
 PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
 PASS  notion write to connectionName "default" is refused  (ok=false connection_not_found)
 PASS  no default slack connection  (200 2 connection(s): [<alias-c>, <alias-d>])
+PASS  each slack connection is a different account  (2 connection(s))
 PASS  unnamed slack write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
 PASS  slack write to connectionName "default" is refused  (ok=false connection_not_found)
+PASS  no default gmail connection  (200 2 connection(s): [<alias-e>, <alias-f>])
+PASS  each gmail connection is a different account  (2 connection(s))
+PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
+PASS  gmail write to connectionName "default" is refused  (ok=false connection_not_found)
 PASS  temporary runtime token deleted  (200)
-All 15 checks passed.
+All 25 checks passed.
 ```
 
-Before any workspace is connected, the unnamed-write lines are skipped and the total is 11.
+Before any account is connected, the per-account lines are skipped and the total is 14. "Different account" runs
+once a provider has two or more connections: it fails when two aliases hold the same account (easy with Google, which
+may sign in as whichever account the browser is using).
 
 ## 1. Policy baseline (decision 7)
 
@@ -44,8 +54,9 @@ Set in [`wrangler.template.jsonc`](../wrangler.template.jsonc):
 | Setting | Value | Effect |
 |---|---|---|
 | `OOMOL_CONNECT_BLOCKED_PROXIES` | `*` | No raw provider API calls (`/v1/proxy/:service`), whatever a token is granted. Refusal: `403 proxy_blocked`. |
-| `OOMOL_CONNECT_ALLOWED_ACTIONS` | `notion.*,slack.*` | Only Notion and Slack actions run. Another provider's action: `400 action_not_allowed`. |
-| Catalog assets | Notion and Slack only | Other providers are not even listed; their actions return `404 unknown_action`. |
+| `OOMOL_CONNECT_ALLOWED_ACTIONS` | `notion.*,slack.*,gmail.*` | Only Notion, Slack and Gmail actions run. Another provider's action: `400 action_not_allowed`. |
+| `OOMOL_CONNECT_BLOCKED_ACTIONS` | five Gmail settings writes | Vacation responder, IMAP, POP, language and `stop_watch` are refused on every account: `400 action_blocked` ([why](providers/gmail.md#what-splitmind-uses)). |
+| Catalog assets | Notion, Slack and Gmail only | Other providers are not even listed; their actions return `404 unknown_action`. |
 
 The allowlist is a real policy layer, not just the trimmed catalog. With `OOMOL_CONNECT_ALLOWED_ACTIONS="notion.*"`
 on a local Worker whose catalog still had Slack, a Slack call was refused:
@@ -62,8 +73,8 @@ the account. See [adding a provider](adding-a-provider.md).
 ## 2. Writes must name an account (decision 8, E6.1)
 
 OpenConnector treats a call with no `connectionName` as a call to the connection literally named `default`
-(`src/connection-service.ts`, `value?.trim() || "default"`). SplitMind therefore never creates a `default` Notion
-or Slack connection. With none:
+(`src/connection-service.ts`, `value?.trim() || "default"`). SplitMind therefore never creates a `default` connection
+for any provider. With none:
 
 - `execute_action` with no `connectionName` fails before any request leaves the Worker (`ok:false`). Upstream's
   message is misleading ("Configure notion credentials first.", `authorization_failed`); an upstream issue is
@@ -163,6 +174,7 @@ Until then, pick one of these:
    - Slack: create that workspace's app from [`slack/app-manifest.json`](../slack/app-manifest.json) minus the
      four write scopes (`chat:write`, `im:write`, `files:write`, `reactions:write`), and untick the same four when
      connecting. Slack rejects a connection that asks for scopes the app lacks.
+   - Gmail: when connecting that mailbox, tick only `gmail.readonly` ([Gmail](providers/gmail.md#a-read-only-mailbox)).
 2. **A read-only runtime token** for Claude Code or scripts. List the provider's read actions and allow only those,
    optionally pinned to one connection with `allowedConnections`:
 

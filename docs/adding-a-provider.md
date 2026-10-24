@@ -1,7 +1,7 @@
 # Adding a provider
 
-SplitMind can reach any provider OpenConnector supports. v0.1 turns on only Notion and Slack; turning on another is
-configuration, not code.
+SplitMind can reach any provider OpenConnector supports. It turns on Notion, Slack and Gmail; turning on another is
+configuration, not code. [Gmail](providers/gmail.md) is the worked example of one added later.
 
 ## Turn on a provider OpenConnector already has
 
@@ -16,13 +16,15 @@ configuration, not code.
    `OOMOL_CONNECT_ALLOWED_ACTIONS`:
 
    ```jsonc
-   "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,<id>.*",
+   "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,<id>.*",
    ```
 
    That one list drives both the policy and the catalog trim: `npm run deploy` ships catalog assets only for the
    providers named there. Keep `OOMOL_CONNECT_BLOCKED_PROXIES="*"` unless you deliberately want raw API access.
    To allow only some actions, list exact ids (`<id>.get_x,<id>.list_y`) instead of `<id>.*`; the trim still
-   ships the whole provider's catalog entry.
+   ships the whole provider's catalog entry. To allow a provider but refuse a few of its actions, add their exact
+   ids to `OOMOL_CONNECT_BLOCKED_ACTIONS` instead (Gmail does this for mailbox settings); a block always wins, and
+   `npm run verify` checks each one is refused.
 
 3. **If each account needs its own OAuth app** (like Slack's one internal app per workspace), add the id to
    `OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH` (comma separated).
