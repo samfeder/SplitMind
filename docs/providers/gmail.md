@@ -70,7 +70,10 @@ Use the Google account you want to own the project. It doesn't have to be one of
    `splitmind`.
 2. **Enable the Gmail API.** APIs & Services → Library → **Gmail API** → **Enable**.
 3. **Branding.** Google Auth Platform → **Branding**: app name `SplitMind`, your support email, your developer
-   contact email. Leave the logo and the authorized domains empty.
+   contact email. Under **App domain**, set the home page to `<origin>` and the privacy policy link to
+   `<origin>/privacy/`, the policy `npm run deploy` serves from `web/privacy/`. Google keeps **Publish app**
+   (step 4) greyed out for Gmail's restricted scopes until the app has a privacy policy link. If Google asks
+   for an authorized domain, add your Worker's host (`<your-worker>.workers.dev`). Leave the logo empty.
 4. **Audience.** Google Auth Platform → **Audience**: user type **External**. Then click **Publish app** so the
    status reads **In production**. Do not stay in **Testing**: there, a test user's authorization (refresh token
    included) expires seven days after consent, and every account would need reconnecting weekly.

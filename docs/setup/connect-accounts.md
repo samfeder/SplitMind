@@ -53,3 +53,7 @@ yourself?** on the Slack card and paste its client ID and secret with the nickna
 `scripts/deploy.ts` copies `web/setup/` and `slack/app-manifest.json` into the Web Console build (`dist/web/setup/`),
 so `npm run deploy` publishes it as a static asset. The page loads no third-party code, and keeps no token in browser
 storage. Its helpers are tested in `tests/setup-page.test.ts`.
+
+The same build step copies `web/privacy/` to `dist/web/privacy/`. That is the privacy policy, served at
+`<origin>/privacy/`, which Google's Branding page needs before it lets the Gmail app go to production. `npm run verify`
+checks that both pages are served.
