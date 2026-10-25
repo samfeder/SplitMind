@@ -9,11 +9,12 @@
 //   --dry-run      Build and bundle with placeholder resource ids; needs no Cloudflare login and changes nothing.
 //
 // Steps: check wrangler login -> create or find D1 + two KV namespaces -> render wrangler.local.jsonc -> apply D1
-// migrations -> build with the trimmed catalog -> deploy -> set missing secrets (you paste them) -> GET /health.
+// migrations -> apply any new patches -> build with the trimmed catalog -> deploy -> set missing secrets (you paste
+// them) -> GET /health.
 // Account-specific state (resource ids, origin) is saved to splitmind.local.json, which git ignores. Secrets are
 // never read, printed or stored by this script: wrangler prompts for them directly.
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -228,10 +229,31 @@ function run(command: string, args: string[], cwd: string): void {
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed (exit ${result.status})`);
 }
 
+/**
+ * Applies any of SplitMind's patches the engine doesn't have yet, the same way scripts/bootstrap.sh does, so a
+ * `git pull` that brings a new patch can't deploy without it. Throws if a patch neither applies nor is applied.
+ */
+export function applyPatches(repoRoot: string, engineDir: string): void {
+  const dir = join(repoRoot, "patches");
+  const patches = existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".patch")).sort() : [];
+  const git = (...args: string[]) => spawnSync("git", ["-C", engineDir, "apply", ...args], { stdio: "ignore" }).status === 0;
+  for (const file of patches) {
+    const patch = join(dir, file);
+    if (git("--reverse", "--check", patch)) continue;
+    if (!git("--check", patch)) {
+      throw new Error(`patches/${file} does not apply to vendor/open-connector; see docs/upgrading-openconnector.md`);
+    }
+    if (!git(patch)) throw new Error(`git apply patches/${file} failed`);
+    console.log(`    applied: patches/${file}`);
+  }
+}
+
 function build(template: string): void {
   if (!existsSync(join(engine, "node_modules"))) {
     throw new Error("vendor/open-connector has no node_modules; run scripts/bootstrap.sh first");
   }
+  console.log("==> Patches");
+  applyPatches(root, engine);
   console.log("==> Building (catalog, Web Console, trimmed catalog assets)");
   run("npm", ["run", "generate:catalog"], engine);
   run("npm", ["run", "build:web"], engine);
