@@ -125,6 +125,9 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   const health = await request(origin, "GET", "/health");
   check("GET /health returns {\"ok\":true}", health.status === 200 && health.text.trim() === '{"ok":true}', describe(health));
 
+  const setup = await request(origin, "GET", "/setup/");
+  check("the account setup page is served at /setup/", setup.status === 200 && setup.text.includes("Connect your accounts"), `${setup.status}`);
+
   const discovery = await request(origin, "GET", "/.well-known/oauth-authorization-server");
   const issuer = (discovery.json as { issuer?: string } | undefined)?.issuer;
   check("OAuth discovery names this origin as issuer", discovery.status === 200 && issuer === origin, `${discovery.status} issuer=${issuer}`);

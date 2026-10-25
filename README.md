@@ -81,8 +81,9 @@ npm run verify                                        # health, OAuth discovery,
 
 Then:
 
-1. Connect your accounts as **named connections** in the Web Console:
-   [Notion](docs/providers/notion.md), [Slack](docs/providers/slack.md), [Gmail](docs/providers/gmail.md).
+1. Open `<your-worker-url>/setup/` and connect each account with a nickname and one click:
+   [setup page](docs/setup/connect-accounts.md). Provider details: [Notion](docs/providers/notion.md),
+   [Slack](docs/providers/slack.md), [Gmail](docs/providers/gmail.md).
 2. Add `<your-worker-url>/mcp` as a custom connector in Claude: [web, desktop, mobile and Claude Code](docs/claude.md).
 3. Ask Claude to "list my connections", then name the account in each request.
 
