@@ -127,8 +127,8 @@ to cap runaway CPU.
 
 ## Re-running and upgrading
 
-- `npm run deploy` again at any time. It reuses the saved resources, applies any new migrations, and only asks for
-  secrets that are missing.
+- `npm run deploy` again at any time. It reuses the saved resources, applies any new migrations and any new
+  `patches/` a `git pull` brought in, and only asks for secrets that are missing.
 - After bumping the OpenConnector pin ([upgrading guide](../upgrading-openconnector.md)), run
   `scripts/bootstrap.sh` and then `npm run deploy`.
 - `npm run deploy -- --render-only` rewrites `wrangler.local.jsonc` from the saved state without touching

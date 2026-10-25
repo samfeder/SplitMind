@@ -223,6 +223,37 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(state.deployedOrigins).toEqual(["https://splitmind.fake-subdomain.workers.dev"]);
   });
 
+  it("applies a patch the engine doesn't have yet, once, before building", () => {
+    writeFileSync(join(engine, "greeting.txt"), "hello\n");
+    mkdirSync(join(checkout, "patches"));
+    writeFileSync(
+      join(checkout, "patches/0001-greeting.patch"),
+      ["--- a/greeting.txt", "+++ b/greeting.txt", "@@ -1 +1 @@", "-hello", "+hello, patched", ""].join("\n"),
+    );
+
+    const first = deploy();
+    const second = deploy();
+
+    expect(readFileSync(join(engine, "greeting.txt"), "utf8")).toBe("hello, patched\n");
+    expect(first.stdout).toContain("applied: patches/0001-greeting.patch");
+    expect(second.stdout).not.toContain("applied: patches/0001-greeting.patch");
+  });
+
+  it("stops before building when a patch no longer fits the engine", () => {
+    writeFileSync(join(engine, "greeting.txt"), "something else\n");
+    mkdirSync(join(checkout, "patches"));
+    writeFileSync(
+      join(checkout, "patches/0001-greeting.patch"),
+      ["--- a/greeting.txt", "+++ b/greeting.txt", "@@ -1 +1 @@", "-hello", "+hello, patched", ""].join("\n"),
+    );
+
+    const result = deploy();
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("patches/0001-greeting.patch does not apply to vendor/open-connector");
+    expect(readAccount().calls.some((call) => call.startsWith("deploy"))).toBe(false);
+  });
+
   it("keeps the saved state out of git", () => {
     deploy();
 
