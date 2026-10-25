@@ -52,7 +52,7 @@ These are set once per deployment, in the wrangler config (not secrets):
 
 Repeat these for each workspace. They need someone who can create and install apps in that workspace; if the workspace requires admin approval for apps, the install becomes a request that a workspace admin must approve.
 
-1. **Edit the manifest.** In a local copy of `slack/app-manifest.json`, replace `<origin>` in the redirect URL with your real origin, so it reads `https://<your-worker>.workers.dev/oauth/callback`. Do not commit the edited copy.
+1. **Get the manifest.** Run `npm run -s slack-manifest | pbcopy` (macOS; elsewhere drop `| pbcopy` and copy the output). It prints `slack/app-manifest.json` with the redirect URL filled in from your deployment, `https://<your-worker>.workers.dev/oauth/callback`, and writes nothing to disk. Pass `-- --origin <origin>` if you deployed from another machine.
 2. **Create the app.** Go to <https://api.slack.com/apps>, click **Create New App → From a manifest**, pick the workspace this app is for, paste the manifest, and click **Create**.
 3. **Do not distribute.** Leave **Manage Distribution** alone.
 4. **Copy the credentials.** Under **Basic Information → App Credentials**, keep the **Client ID** and **Client Secret** at hand for step 6. Do not paste them into chat, issues, or files in the repo.
