@@ -259,6 +259,7 @@ function build(template: string): void {
   run("npm", ["run", "build:web"], engine);
   run(process.execPath, [join(root, "scripts/catalog-assets.ts"), engine, allowlistedProviders(template).join(",")], root);
   installSetupPage(root, join(engine, "dist/web"));
+  installPrivacyPage(root, join(engine, "dist/web"));
 }
 
 /**
@@ -272,6 +273,17 @@ export function installSetupPage(repoRoot: string, webDist: string): void {
   cpSync(join(repoRoot, "web/setup"), target, { recursive: true });
   cpSync(join(repoRoot, "slack/app-manifest.json"), join(target, "slack-manifest.json"));
   console.log("    setup page: /setup/");
+}
+
+/**
+ * Adds the privacy policy (web/privacy/), served at <origin>/privacy/. Google won't publish an OAuth app with Gmail's
+ * restricted scopes to production without a privacy policy link, and Testing mode signs mailboxes out every 7 days.
+ */
+export function installPrivacyPage(repoRoot: string, webDist: string): void {
+  const target = join(webDist, "privacy");
+  rmSync(target, { recursive: true, force: true });
+  cpSync(join(repoRoot, "web/privacy"), target, { recursive: true });
+  console.log("    privacy policy: /privacy/");
 }
 
 function deploy(extraArgs: string[] = []): DeployRecord | undefined {

@@ -186,6 +186,10 @@ function redirectUri() {
   return `${window.location.origin}/oauth/callback`;
 }
 
+function privacyUri() {
+  return `${window.location.origin}/privacy/`;
+}
+
 // One-time OAuth app instructions for the providers that use a deployment-wide app.
 const APP_STEPS = {
   gmail: {
@@ -193,7 +197,7 @@ const APP_STEPS = {
     steps: [
       ["In the ", ["Google Cloud console", "https://console.cloud.google.com/projectcreate"], ", create a project named splitmind."],
       ["Enable the ", ["Gmail API", "https://console.cloud.google.com/apis/library/gmail.googleapis.com"], " for it."],
-      ["Google Auth Platform → ", ["Branding", "https://console.cloud.google.com/auth/branding"], ": app name SplitMind and your email. Leave the rest empty."],
+      ["Google Auth Platform → ", ["Branding", "https://console.cloud.google.com/auth/branding"], ": app name SplitMind and your email. Under App domain, set the home page to this site and the privacy policy link to the privacy address below (Google won't publish the app without it)."],
       ["", ["Audience", "https://console.cloud.google.com/auth/audience"], ": External, then Publish app so it says In production. (Testing mode logs you out every 7 days.)"],
       ["", ["Clients", "https://console.cloud.google.com/auth/clients/create"], " → Create client → Web application. Under Authorized redirect URIs add the address below. Create, then paste the Client ID and Client secret here."],
     ],
@@ -236,7 +240,7 @@ function appSetup(card, service) {
     return el(
       "details",
       { className: "app" },
-      el("summary", {}, `OAuth app saved (client ${config.clientId}). Replace it`),
+      el("summary", {}, config.clientId ? `OAuth app saved (client ${config.clientId}). Replace it` : "OAuth app saved. Replace it"),
       appForm(card, service, info),
     );
   }
@@ -245,7 +249,10 @@ function appSetup(card, service) {
     { className: "app todo" },
     el("h3", {}, info.title),
     stepList(info.steps),
-    el("p", { className: "uri" }, el("code", {}, redirectUri()), copyButton(redirectUri())),
+    el("p", { className: "uri" }, "Redirect URI: ", el("code", {}, redirectUri()), copyButton(redirectUri())),
+    service === "gmail"
+      ? el("p", { className: "uri" }, "Privacy policy: ", el("code", {}, privacyUri()), copyButton(privacyUri()))
+      : null,
     appForm(card, service, info),
   );
 }
@@ -376,14 +383,16 @@ function render() {
     ...PROVIDERS.map((service) => {
       const card = el("section", { className: "card", "data-service": service });
       const needsApp = service !== "slack" && !state.configs.get(service)?.configured;
-      card.append(
+      // Element.append turns null into the text "null", so drop the parts this card doesn't show.
+      const parts = [
         el("h2", {}, TITLES[service]),
         service === "slack" ? null : appSetup(card, service),
         accountList(card, service),
         needsApp ? null : el("p", { className: "hint" }, HINTS[service]),
         needsApp ? null : connectForm(card, service),
         el("p", { className: "status", role: "status" }),
-      );
+      ];
+      card.append(...parts.filter((part) => part !== null));
       return card;
     }),
   );

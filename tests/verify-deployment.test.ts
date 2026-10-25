@@ -50,6 +50,10 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
       response.writeHead(200, { "content-type": "text/html" });
       return response.end("<h1>Connect your accounts</h1>");
     }
+    if (key === "GET /privacy/") {
+      response.writeHead(200, { "content-type": "text/html" });
+      return response.end("<h1>SplitMind privacy policy</h1>");
+    }
     if (key === "GET /.well-known/oauth-authorization-server") return send(response, 200, { issuer: origin });
     if (key === "POST /mcp" && auth !== `Bearer ${RUNTIME}`) return send(response, 401, { error: "invalid_token" });
     if (key === "POST /mcp") {
@@ -118,7 +122,7 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
-    expect(result.stdout).toContain("All 15 checks passed.");
+    expect(result.stdout).toContain("All 16 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -129,7 +133,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("3 of 15 checks failed.");
+    expect(result.stdout).toContain("3 of 16 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });

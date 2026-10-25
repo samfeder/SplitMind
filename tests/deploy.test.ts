@@ -83,6 +83,7 @@ beforeEach(() => {
   mkdirSync(join(engine, "scripts"), { recursive: true });
   mkdirSync(join(engine, "node_modules"), { recursive: true });
   mkdirSync(join(checkout, "web/setup"), { recursive: true });
+  mkdirSync(join(checkout, "web/privacy"), { recursive: true });
   mkdirSync(join(checkout, "slack"), { recursive: true });
   for (const file of [
     "scripts/deploy.ts",
@@ -90,6 +91,7 @@ beforeEach(() => {
     "wrangler.template.jsonc",
     "web/setup/index.html",
     "web/setup/setup.js",
+    "web/privacy/index.html",
     "slack/app-manifest.json",
   ]) {
     copyFileSync(join(repo, file), join(checkout, file));

@@ -127,6 +127,8 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
 
   const setup = await request(origin, "GET", "/setup/");
   check("the account setup page is served at /setup/", setup.status === 200 && setup.text.includes("Connect your accounts"), `${setup.status}`);
+  const privacy = await request(origin, "GET", "/privacy/");
+  check("the privacy policy is served at /privacy/", privacy.status === 200 && privacy.text.includes("SplitMind privacy policy"), `${privacy.status}`);
 
   const discovery = await request(origin, "GET", "/.well-known/oauth-authorization-server");
   const issuer = (discovery.json as { issuer?: string } | undefined)?.issuer;

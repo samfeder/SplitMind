@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { installSetupPage } from "../scripts/deploy.ts";
+import { installPrivacyPage, installSetupPage } from "../scripts/deploy.ts";
 import {
   accountsOf,
   nicknameProblem,
@@ -121,5 +121,24 @@ describe("installSetupPage", () => {
     } finally {
       rmSync(dist, { recursive: true, force: true });
     }
+  });
+});
+
+describe("installPrivacyPage", () => {
+  it("copies the privacy policy into the Web Console build", () => {
+    const dist = mkdtempSync(join(tmpdir(), "splitmind-web-"));
+    try {
+      installPrivacyPage(repo, dist);
+      expect(readdirSync(join(dist, "privacy"))).toEqual(["index.html"]);
+      expect(readFileSync(join(dist, "privacy/index.html"), "utf8")).toContain("<h1>SplitMind privacy policy</h1>");
+    } finally {
+      rmSync(dist, { recursive: true, force: true });
+    }
+  });
+
+  it("states the Limited Use commitment Google asks for", () => {
+    const policy = readFileSync(join(repo, "web/privacy/index.html"), "utf8");
+    expect(policy).toContain("Google API Services User Data Policy");
+    expect(policy).toContain("Limited Use requirements");
   });
 });
