@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>SplitMind setup</title>
+    <style>
+      :root {
+        --bg: #fafaf9;
+        --card: #ffffff;
+        --text: #1c1917;
+        --muted: #78716c;
+        --border: #e7e5e4;
+        --accent: #2563eb;
+        --ok: #15803d;
+        --error: #b91c1c;
+        --warn-bg: #fef3c7;
+        --todo-bg: #f5f5f4;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0c0a09;
+          --card: #1c1917;
+          --text: #f5f5f4;
+          --muted: #a8a29e;
+          --border: #292524;
+          --accent: #60a5fa;
+          --ok: #4ade80;
+          --error: #f87171;
+          --warn-bg: #422006;
+          --todo-bg: #0c0a09;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 24px 16px 64px;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main, header { max-width: 760px; margin: 0 auto; }
+      h1 { font-size: 24px; margin: 0 0 4px; }
+      h2 { font-size: 18px; margin: 0 0 12px; }
+      h3 { font-size: 15px; margin: 0 0 8px; }
+      a { color: var(--accent); }
+      .lead { color: var(--muted); margin: 0 0 24px; }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 16px;
+      }
+      .app.todo { background: var(--todo-bg); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+      .app summary, .manual summary { cursor: pointer; color: var(--muted); }
+      details.app { margin-bottom: 12px; }
+      ol { padding-left: 20px; margin: 0 0 8px; }
+      .uri { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      code { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; word-break: break-all; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      .row input { flex: 1 1 200px; }
+      .manual { flex-basis: 100%; }
+      .manual input { margin: 8px 8px 0 0; }
+      input {
+        font: inherit;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg);
+        color: var(--text);
+        min-width: 0;
+      }
+      button {
+        font: inherit;
+        padding: 8px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: #fff;
+        cursor: pointer;
+      }
+      button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+      button.small { padding: 2px 10px; font-size: 13px; }
+      .accounts { list-style: none; padding: 0; margin: 0 0 8px; }
+      .accounts li { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 0; border-bottom: 1px solid var(--border); }
+      .accounts li .muted { flex: 1 1 auto; }
+      .muted, .hint { color: var(--muted); }
+      .hint { font-size: 14px; }
+      .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; }
+      .badge.warn { background: var(--warn-bg); }
+      .status[data-kind="ok"] { color: var(--ok); }
+      .status[data-kind="error"] { color: var(--error); }
+      .status:empty { display: none; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Connect your accounts</h1>
+      <p class="lead">
+        Give every account a short nickname, like <em>home</em> or <em>work</em>. That's the name you use with Claude.
+        For everything else, use the <a href="/providers">Web Console</a>.
+      </p>
+    </header>
+    <main>
+      <section id="signin" class="card" hidden>
+        <h2>Sign in</h2>
+        <form class="row">
+          <input name="token" type="password" placeholder="Admin token" required autocomplete="current-password" />
+          <button type="submit">Sign in</button>
+        </form>
+        <p id="signin-status" class="status" data-kind="error" role="status"></p>
+      </section>
+      <div id="providers" hidden></div>
+    </main>
+    <script type="module" src="./setup.js"></script>
+  </body>
+</html>

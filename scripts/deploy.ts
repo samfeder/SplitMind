@@ -13,7 +13,7 @@
 // Account-specific state (resource ids, origin) is saved to splitmind.local.json, which git ignores. Secrets are
 // never read, printed or stored by this script: wrangler prompts for them directly.
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -236,6 +236,20 @@ function build(template: string): void {
   run("npm", ["run", "generate:catalog"], engine);
   run("npm", ["run", "build:web"], engine);
   run(process.execPath, [join(root, "scripts/catalog-assets.ts"), engine, allowlistedProviders(template).join(",")], root);
+  installSetupPage(root, join(engine, "dist/web"));
+}
+
+/**
+ * Adds SplitMind's account setup page (web/setup/) to the Web Console build, served at <origin>/setup/. The Slack
+ * manifest goes alongside it with its <origin> placeholder intact: the page fills in its own origin.
+ */
+export function installSetupPage(repoRoot: string, webDist: string): void {
+  const target = join(webDist, "setup");
+  rmSync(target, { recursive: true, force: true });
+  mkdirSync(target, { recursive: true });
+  cpSync(join(repoRoot, "web/setup"), target, { recursive: true });
+  cpSync(join(repoRoot, "slack/app-manifest.json"), join(target, "slack-manifest.json"));
+  console.log("    setup page: /setup/");
 }
 
 function deploy(extraArgs: string[] = []): DeployRecord | undefined {

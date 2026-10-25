@@ -84,10 +84,14 @@ Use the Google account you want to own the project. It doesn't have to be one of
    **Authorized redirect URIs** → add `<origin>/oauth/callback` exactly, with no trailing slash. Create it, and keep
    the **Client ID** and **Client secret** at hand for the next step. Do not paste them into chat, issues, or files in
    the repo.
-7. **Give the Worker the client.** Open `<origin>`, sign in with the admin token, go to **Providers → Gmail**, and
-   save the Client ID and secret as the provider's OAuth app. The Console stores the secret encrypted.
+7. **Give the Worker the client.** Open `<origin>/setup/`, sign in with the admin token, and paste the Client ID and
+   secret on the Gmail card (or use the Web Console's **Providers → Gmail**). The Console stores the secret encrypted.
 
 ## Connect each account
+
+**Shortcut:** on `<origin>/setup/`, type the mailbox's nickname and click **Connect a mailbox**. The page always asks
+Google for the account chooser (`prompt=select_account consent`), so step 1 below isn't needed there; pick the
+mailbox you mean, then continue at step 3. See the [setup page guide](../setup/connect-accounts.md).
 
 Repeat for every mailbox.
 

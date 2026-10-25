@@ -82,7 +82,16 @@ beforeEach(() => {
   mkdirSync(join(checkout, "scripts"), { recursive: true });
   mkdirSync(join(engine, "scripts"), { recursive: true });
   mkdirSync(join(engine, "node_modules"), { recursive: true });
-  for (const file of ["scripts/deploy.ts", "scripts/catalog-assets.ts", "wrangler.template.jsonc"]) {
+  mkdirSync(join(checkout, "web/setup"), { recursive: true });
+  mkdirSync(join(checkout, "slack"), { recursive: true });
+  for (const file of [
+    "scripts/deploy.ts",
+    "scripts/catalog-assets.ts",
+    "wrangler.template.jsonc",
+    "web/setup/index.html",
+    "web/setup/setup.js",
+    "slack/app-manifest.json",
+  ]) {
     copyFileSync(join(repo, file), join(checkout, file));
   }
   writeFileSync(join(engine, "scripts/copy-catalog-assets.ts"), FAKE_COPY_CATALOG);

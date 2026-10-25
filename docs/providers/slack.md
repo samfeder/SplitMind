@@ -50,6 +50,10 @@ These are set once per deployment, in the wrangler config (not secrets):
 
 ## Steps for each workspace
 
+**Shortcut:** the [setup page](../setup/connect-accounts.md) at `<origin>/setup/` does all of this from a Slack
+configuration token: it creates the app in that workspace from the manifest and starts the install. The steps below
+are the manual way, and what to do if the page can't reach Slack.
+
 Repeat these for each workspace. They need someone who can create and install apps in that workspace; if the workspace requires admin approval for apps, the install becomes a request that a workspace admin must approve.
 
 1. **Get the manifest.** Run `npm run -s slack-manifest | pbcopy` (macOS; elsewhere drop `| pbcopy` and copy the output). It prints `slack/app-manifest.json` with the redirect URL filled in from your deployment, `https://<your-worker>.workers.dev/oauth/callback`, and writes nothing to disk. Pass `-- --origin <origin>` if you deployed from another machine.
