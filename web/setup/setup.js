@@ -134,8 +134,9 @@ function pollUntilConnected(card, service, nickname) {
 }
 
 function openPopup() {
-  // Called inside the click, before any await, so the browser doesn't block it as a pop-up.
-  return window.open("about:blank", "splitmind_oauth", "width=560,height=720");
+  // Called inside the click, before any await, so the browser doesn't block it as a pop-up. No window features, so it
+  // opens as a normal tab: a pop-up window hides behind the main one, and browser agents can't drive it.
+  return window.open("about:blank", "splitmind_oauth");
 }
 
 async function startOAuth(card, service, nickname, clientConfig, popup = openPopup()) {
@@ -148,7 +149,7 @@ async function startOAuth(card, service, nickname, clientConfig, popup = openPop
     const url = withGoogleAccountChooser(authorizationUrl);
     if (popup) popup.location.href = url;
     else window.location.href = url;
-    setStatus(card, `Finish signing in to ${nickname} in the window that opened. This page updates by itself.`);
+    setStatus(card, `Finish signing in to ${nickname} in the tab that opened. This page updates by itself.`);
     pollUntilConnected(card, service, nickname);
   } catch (error) {
     popup?.close();
