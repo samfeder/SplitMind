@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { installPrivacyPage, installSetupPage } from "../scripts/deploy.ts";
+import { installPrivacyPage, installSecurityHeaders, installSetupPage } from "../scripts/deploy.ts";
 import {
   accountsOf,
   nicknameProblem,
@@ -121,6 +121,44 @@ describe("installSetupPage", () => {
     } finally {
       rmSync(dist, { recursive: true, force: true });
     }
+  });
+});
+
+describe("installSecurityHeaders", () => {
+  const upstream = "/assets/*\n  Cache-Control: public, max-age=31536000, immutable\n";
+
+  it("keeps the Web Console's own rules and adds ours once, however often it runs", () => {
+    const dist = mkdtempSync(join(tmpdir(), "splitmind-web-"));
+    try {
+      writeFileSync(join(dist, "_headers"), upstream);
+      installSecurityHeaders(repo, dist);
+      installSecurityHeaders(repo, dist);
+      const headers = readFileSync(join(dist, "_headers"), "utf8");
+      expect(headers.startsWith(upstream)).toBe(true);
+      expect(headers.match(/^\/setup\/\*$/gm)).toHaveLength(1);
+      expect(headers.match(/X-Frame-Options: DENY/g)).toHaveLength(1);
+    } finally {
+      rmSync(dist, { recursive: true, force: true });
+    }
+  });
+
+  it("writes the file when the build has none", () => {
+    const dist = mkdtempSync(join(tmpdir(), "splitmind-web-"));
+    try {
+      installSecurityHeaders(repo, dist);
+      expect(readFileSync(join(dist, "_headers"), "utf8")).toContain("frame-ancestors 'none'");
+    } finally {
+      rmSync(dist, { recursive: true, force: true });
+    }
+  });
+
+  it("lets the setup page reach only itself and Slack, and nobody frame it", () => {
+    const rules = readFileSync(join(repo, "web/_headers"), "utf8");
+    const csp = rules.split("\n/setup/*\n")[1].split("\n")[0];
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("script-src 'self';");
+    expect(csp).toContain("connect-src 'self' https://slack.com;");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 });
 

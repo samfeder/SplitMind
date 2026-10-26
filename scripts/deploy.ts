@@ -260,6 +260,26 @@ function build(template: string): void {
   run(process.execPath, [join(root, "scripts/catalog-assets.ts"), engine, allowlistedProviders(template).join(",")], root);
   installSetupPage(root, join(engine, "dist/web"));
   installPrivacyPage(root, join(engine, "dist/web"));
+  installSecurityHeaders(root, join(engine, "dist/web"));
+}
+
+const headersBegin = "# --- SplitMind security headers (web/_headers) ---";
+const headersEnd = "# --- end SplitMind security headers ---";
+
+/**
+ * Appends SplitMind's security headers (web/_headers) to the Web Console's _headers, keeping upstream's rules. A
+ * re-run replaces the earlier SplitMind block rather than adding a second one.
+ */
+export function installSecurityHeaders(repoRoot: string, webDist: string): void {
+  const target = join(webDist, "_headers");
+  const upstream = existsSync(target) ? readFileSync(target, "utf8") : "";
+  const start = upstream.indexOf(headersBegin);
+  const end = upstream.indexOf(headersEnd);
+  const kept = start === -1 || end === -1 ? upstream : upstream.slice(0, start) + upstream.slice(end + headersEnd.length);
+  const ours = readFileSync(join(repoRoot, "web/_headers"), "utf8").trimEnd();
+  const base = kept.trimEnd();
+  writeFileSync(target, `${base ? `${base}\n\n` : ""}${headersBegin}\n${ours}\n${headersEnd}\n`);
+  console.log("    security headers: _headers");
 }
 
 /**
