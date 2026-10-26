@@ -16,7 +16,10 @@ Add → Custom → Web**, then each member connects):
    Leave request headers, transport and client ID/secret blank.
 4. Click **Add**, then **Connect**.
 5. A SplitMind consent page opens. Check it says `Client domain: claude.ai` and `Authorization returns to
-   claude.ai`, paste your **admin token**, and click **Allow access**.
+   claude.ai`. Choose **Access**: *Read only* (the default: Claude can search and read but never send, post, change
+   or delete) or *Read and write*. Under **Accounts**, leave it empty for every account, or list nicknames such as
+   `work, slack:team` (`slack:team` means only the Slack account named `team`). Paste your **admin token** and click
+   **Allow access**. To change the choice later, delete the key (below) and connect again.
 6. Back in Claude, the connector shows as connected. In a chat, turn it on in the tools menu and ask:
    "Use SplitMind's list_connections."
 
