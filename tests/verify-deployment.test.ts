@@ -67,7 +67,7 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
     if (key === "POST /mcp") {
       const call = JSON.parse(body) as { params: { arguments: { connectionName?: string } } };
       toolCalls.push(call.params.arguments);
-      const code = call.params.arguments.connectionName ? "connection_not_found" : "authorization_failed";
+      const code = call.params.arguments.connectionName ? "connection_not_found" : "connection_required";
       const result = { structuredContent: { ok: false, error: { code } } };
       response.writeHead(200, { "content-type": "text/event-stream" });
       return response.end(`event: message\ndata: ${JSON.stringify({ result, jsonrpc: "2.0", id: 1 })}\n\n`);
@@ -179,7 +179,7 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.stdout).toContain("PASS  no default notion connection  (200 2 connection(s): [notion_a, notion_b])");
     expect(result.stdout).toContain("PASS  each notion connection is a different account  (2 connection(s))");
     expect(result.stdout).toContain(
-      "PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)",
+      "PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false connection_required)",
     );
     expect(result.stdout).toContain('PASS  notion write to connectionName "default" is refused  (ok=false connection_not_found)');
     expect(result.status).toBe(0);
@@ -216,7 +216,7 @@ describe("scripts/verify-deployment.ts", () => {
 
     expect(result.stdout).toContain("FAIL  each gmail connection is a different account  (same account under [personal, work])");
     expect(result.stdout).toContain(
-      "PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)",
+      "PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false connection_required)",
     );
     expect(result.status).toBe(1);
   });

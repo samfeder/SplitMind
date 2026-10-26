@@ -9,7 +9,7 @@ below is drafted and waiting to be filed from Sam's GitHub account (#37). Nothin
 | [Configurable MCP OAuth lifetimes](mcp-oauth-issue-drafts.md#draft-1-configurable-mcp-oauth-token-lifetimes-cloudflare) | issue, then PR | `patches/0002-…` | #15 |
 | [Restrict MCP OAuth clients](mcp-oauth-issue-drafts.md#draft-2-restrict-which-oauth-clients-can-connect-cloudflare) | issue, then PR | `patches/0002-…` | #17 |
 | [Per-connection action policy (read-only)](connection-read-only-issue-draft.md) | issue | none | #31 |
-| [Unnamed call returns a misleading auth error](../spikes/notion-provider.md#u1--execute_action-without-connectionname-and-no-default-returns-a-misleading-auth-error) | issue | none | #28 |
+| [Unnamed call returns a misleading auth error](../spikes/notion-provider.md#u1--execute_action-without-connectionname-and-no-default-returns-a-misleading-auth-error) | issue, then PR | `patches/0005-…` | #28 |
 | [Require a connection name per provider](../spikes/notion-provider.md#u2--option-to-require-an-explicit-connection-name-for-some-providers) | issue | none | #28 |
 | [Gmail attachments on KV/R2 transit](gmail-attachments-issue-draft.md) | issue, then PR | `patches/0003-…` | #56 |
 | [Choose read-only access and accounts at MCP consent](mcp-grant-scope-issue-draft.md) | issue, then PR | `patches/0004-…` | #76 |
