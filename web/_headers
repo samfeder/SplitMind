@@ -1,0 +1,17 @@
+# SplitMind security headers for the static pages (#79). scripts/deploy.ts appends this file to the Web Console's
+# own dist/web/_headers, between markers, so upstream's cache rules stay. Workers Static Assets applies these to
+# asset responses only; the Worker's own routes (/api, /mcp, /oauth, the consent page) set their own headers.
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: same-origin
+  Strict-Transport-Security: max-age=31536000
+
+# The setup page takes the admin token and Slack configuration tokens. It loads only its own script, and calls only
+# this origin and Slack's apps.manifest.create.
+/setup/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://slack.com; form-action 'self'; base-uri 'none'; frame-ancestors 'none'
+
+/privacy/*
+  Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'

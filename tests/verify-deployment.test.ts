@@ -16,6 +16,7 @@ interface Behaviour {
   proxyOpen: boolean;
   connections?: { service: string; connectionName: string; default: boolean; profile?: { accountId: string } }[];
   blockOpen?: boolean;
+  noCsp?: boolean;
 }
 
 let server: Server | undefined;
@@ -47,7 +48,8 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
   const route = (request: IncomingMessage, response: ServerResponse, key: string, url: string, auth: string | undefined, body: string) => {
     if (key === "GET /health") return send(response, 200, '{"ok":true}\n');
     if (key === "GET /setup/") {
-      response.writeHead(200, { "content-type": "text/html" });
+      const csp = "default-src 'none'; script-src 'self'; frame-ancestors 'none'";
+      response.writeHead(200, { "content-type": "text/html", ...(behaviour.noCsp ? {} : { "content-security-policy": csp }) });
       return response.end("<h1>Connect your accounts</h1>");
     }
     if (key === "GET /privacy/") {
@@ -122,9 +124,18 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
-    expect(result.stdout).toContain("All 16 checks passed.");
+    expect(result.stdout).toContain("All 17 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
+  });
+
+  it("fails when the setup page has no Content-Security-Policy", async () => {
+    const origin = await startWorker({ proxyOpen: false, noCsp: true });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("FAIL  the setup page has a strict Content-Security-Policy  (no Content-Security-Policy header)");
+    expect(result.status).toBe(1);
   });
 
   it("fails when the raw proxy is open, and still deletes its token", async () => {
@@ -133,7 +144,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("3 of 16 checks failed.");
+    expect(result.stdout).toContain("3 of 17 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });

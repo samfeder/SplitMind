@@ -92,6 +92,7 @@ beforeEach(() => {
     "web/setup/index.html",
     "web/setup/setup.js",
     "web/privacy/index.html",
+    "web/_headers",
     "slack/app-manifest.json",
   ]) {
     copyFileSync(join(repo, file), join(checkout, file));

@@ -59,7 +59,7 @@ async function request(
   path: string,
   token?: string,
   body?: unknown,
-): Promise<{ status: number; text: string; json: Envelope | undefined }> {
+): Promise<{ status: number; text: string; json: Envelope | undefined; headers: Headers }> {
   const response = await fetch(`${origin}${path}`, {
     method,
     headers: {
@@ -75,7 +75,7 @@ async function request(
   } catch {
     json = undefined;
   }
-  return { status: response.status, text, json };
+  return { status: response.status, text, json, headers: response.headers };
 }
 
 /** Calls an MCP tool with a runtime token and returns its structured result (the endpoint answers in SSE framing). */
@@ -127,6 +127,14 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
 
   const setup = await request(origin, "GET", "/setup/");
   check("the account setup page is served at /setup/", setup.status === 200 && setup.text.includes("Connect your accounts"), `${setup.status}`);
+  // Security headers from web/_headers (#79): the page that takes the admin token must not be frameable or load
+  // anything but its own script.
+  const csp = setup.headers.get("content-security-policy") ?? "";
+  check(
+    "the setup page has a strict Content-Security-Policy",
+    csp.includes("frame-ancestors 'none'") && csp.includes("script-src 'self'"),
+    csp ? csp : "no Content-Security-Policy header",
+  );
   const privacy = await request(origin, "GET", "/privacy/");
   check("the privacy policy is served at /privacy/", privacy.status === 200 && privacy.text.includes("SplitMind privacy policy"), `${privacy.status}`);
 
