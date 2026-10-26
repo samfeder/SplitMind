@@ -17,6 +17,7 @@ interface Behaviour {
   connections?: { service: string; connectionName: string; default: boolean; profile?: { accountId: string } }[];
   blockOpen?: boolean;
   noCsp?: boolean;
+  registrationOpen?: boolean;
 }
 
 let server: Server | undefined;
@@ -55,6 +56,11 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
     if (key === "GET /privacy/") {
       response.writeHead(200, { "content-type": "text/html" });
       return response.end("<h1>SplitMind privacy policy</h1>");
+    }
+    if (key === "POST /oauth/mcp/register") {
+      return behaviour.registrationOpen
+        ? send(response, 201, { client_id: "stranger" })
+        : send(response, 400, { error: "invalid_client_metadata" });
     }
     if (key === "GET /.well-known/oauth-authorization-server") return send(response, 200, { issuer: origin });
     if (key === "POST /mcp" && auth !== `Bearer ${RUNTIME}`) return send(response, 401, { error: "invalid_token" });
@@ -124,7 +130,8 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
-    expect(result.stdout).toContain("All 17 checks passed.");
+    expect(result.stdout).toContain("PASS  a client with a non-Claude redirect URI can't register  (400 invalid_client_metadata)");
+    expect(result.stdout).toContain("All 18 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -138,13 +145,22 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.status).toBe(1);
   });
 
+  it("fails when any client may register, whatever its redirect URI", async () => {
+    const origin = await startWorker({ proxyOpen: false, registrationOpen: true });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("FAIL  a client with a non-Claude redirect URI can't register  (201)");
+    expect(result.status).toBe(1);
+  });
+
   it("fails when the raw proxy is open, and still deletes its token", async () => {
     const origin = await startWorker({ proxyOpen: true });
 
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("3 of 17 checks failed.");
+    expect(result.stdout).toContain("3 of 18 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });

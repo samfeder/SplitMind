@@ -142,6 +142,17 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   const issuer = (discovery.json as { issuer?: string } | undefined)?.issuer;
   check("OAuth discovery names this origin as issuer", discovery.status === 200 && issuer === origin, `${discovery.status} issuer=${issuer}`);
 
+  // The redirect allowlist (#77): a client that would send the code anywhere but Claude is refused at registration.
+  const stranger = await request(origin, "POST", "/oauth/mcp/register", undefined, {
+    client_name: "splitmind-verify (should be refused)",
+    redirect_uris: ["https://splitmind-verify.invalid/callback"],
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+  });
+  const refusal = (stranger.json as { error?: string } | undefined)?.error;
+  check("a client with a non-Claude redirect URI can't register", stranger.status === 400, `${stranger.status} ${refusal ?? ""}`.trim());
+
   const anonymous = await request(origin, "POST", "/mcp", undefined, { jsonrpc: "2.0", id: 1, method: "tools/list" });
   check("POST /mcp without a token is refused", anonymous.status === 401, describe(anonymous));
 
