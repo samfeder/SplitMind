@@ -232,14 +232,18 @@ function run(command: string, args: string[], cwd: string): void {
 /**
  * Applies any of SplitMind's patches the engine doesn't have yet, the same way scripts/bootstrap.sh does, so a
  * `git pull` that brings a new patch can't deploy without it. Throws if a patch neither applies nor is applied.
+ *
+ * Patches are applied in name order and later ones may edit lines earlier ones added, so an applied patch can stop
+ * reversing cleanly once a later one is on top. The newest patch that reverses cleanly therefore marks the applied
+ * prefix: it and everything before it are applied, and only the patches after it are applied now.
  */
 export function applyPatches(repoRoot: string, engineDir: string): void {
   const dir = join(repoRoot, "patches");
   const patches = existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".patch")).sort() : [];
   const git = (...args: string[]) => spawnSync("git", ["-C", engineDir, "apply", ...args], { stdio: "ignore" }).status === 0;
-  for (const file of patches) {
+  const applied = patches.findLastIndex((file) => git("--reverse", "--check", join(dir, file)));
+  for (const file of patches.slice(applied + 1)) {
     const patch = join(dir, file);
-    if (git("--reverse", "--check", patch)) continue;
     if (!git("--check", patch)) {
       throw new Error(`patches/${file} does not apply to vendor/open-connector; see docs/upgrading-openconnector.md`);
     }

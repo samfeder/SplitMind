@@ -46,9 +46,20 @@ shopt -u nullglob
 if [ ${#patches[@]} -eq 0 ]; then
   echo "    No patches to apply."
 fi
-for patch in ${patches[@]+"${patches[@]}"}; do
+# Later patches may edit lines earlier ones added, so an applied patch can stop
+# reversing cleanly once a later one is on top. The newest patch that reverses
+# cleanly marks the applied prefix: it and everything before it are applied.
+applied=-1
+for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
+  if git -C "$engine" apply --reverse --check "${patches[$i]}" 2>/dev/null; then
+    applied=$i
+    break
+  fi
+done
+for ((i = 0; i < ${#patches[@]}; i++)); do
+  patch="${patches[$i]}"
   name="patches/$(basename "$patch")"
-  if git -C "$engine" apply --reverse --check "$patch" 2>/dev/null; then
+  if [ "$i" -le "$applied" ]; then
     echo "    already applied: $name"
   elif git -C "$engine" apply --check "$patch" 2>/dev/null; then
     git -C "$engine" apply "$patch"
