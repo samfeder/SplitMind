@@ -192,7 +192,8 @@ Until then, pick one of these:
    token restricted this way refused `slack.post_message` with `400 action_not_allowed` and let
    `slack.list_channels` through to the provider.
 
-   This does not help claude.ai: its OAuth key covers every connection, and claude.ai cannot add a second
-   connector with the same URL.
-3. **Deployment-wide:** put explicit read action ids in `OOMOL_CONNECT_ALLOWED_ACTIONS` instead of `slack.*`.
+3. **claude.ai and other OAuth clients:** choose *Read only* on the consent page, and list the accounts the client
+   may use (patch 0004, #76). This applies to the whole connector, not one account: claude.ai cannot add a second
+   connector with the same URL, so "read-only on `<alias-a>`, writes on `<alias-b>`" still needs option 1.
+4. **Deployment-wide:** put explicit read action ids in `OOMOL_CONNECT_ALLOWED_ACTIONS` instead of `slack.*`.
    That makes the provider read-only for every account.

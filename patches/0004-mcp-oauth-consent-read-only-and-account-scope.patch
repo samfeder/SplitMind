@@ -1,0 +1,392 @@
+SplitMind patch 0004 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft text: docs/upstream/mcp-grant-scope-issue-draft.md (#76).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 853cc42f9ac656889ba4361e1ab58834b0dcb443 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Mon, 26 Oct 2026 10:23:48 +0000
+Subject: [PATCH] feat(cloudflare): let MCP OAuth consent choose read-only
+ access and accounts
+
+The consent page created every MCP grant with all actions and all connections,
+so one client could act as every connected account, including sending mail.
+It now asks for Access (read only, the default, or read and write) and an
+optional list of account nicknames. After the administrator token is checked,
+read-only resolves to the catalog's read actions and nicknames resolve to
+connection ids ("alias" on every service, or "service:alias"), and the backing
+runtime token is created with that grant. Accounts are never listed on the page,
+so an anonymous visitor learns nothing. A nickname that matches nothing is
+refused before the consent handle is spent, so the operator can go back and fix it.
+---
+ .../cloudflare/mcp-consent-page.test.ts       |  2 +-
+ src/server/cloudflare/mcp-consent-page.ts     | 13 ++-
+ src/server/cloudflare/mcp-grant-scope.test.ts | 91 +++++++++++++++++++
+ src/server/cloudflare/mcp-grant-scope.ts      | 90 ++++++++++++++++++
+ src/server/cloudflare/mcp-oauth.test.ts       | 55 +++++++----
+ src/server/cloudflare/mcp-oauth.ts            | 13 ++-
+ 6 files changed, 239 insertions(+), 25 deletions(-)
+ create mode 100644 src/server/cloudflare/mcp-grant-scope.test.ts
+ create mode 100644 src/server/cloudflare/mcp-grant-scope.ts
+
+diff --git a/src/server/cloudflare/mcp-consent-page.test.ts b/src/server/cloudflare/mcp-consent-page.test.ts
+index e9058ab..e2effd6 100644
+--- a/src/server/cloudflare/mcp-consent-page.test.ts
++++ b/src/server/cloudflare/mcp-consent-page.test.ts
+@@ -20,7 +20,7 @@ it("escapes untrusted client metadata and the consent handle", () => {
+   expect(html).not.toContain('value="" autofocus');
+   expect(html).toContain("&#60;img");
+   expect(html).toContain('type="password"');
+-  expect(html).toContain("including write Actions");
++  expect(html).toContain("Read only: search and read, never send, post, change or delete");
+   expect(html).toContain("<code>mcp:access</code>");
+   expect(html).toContain("<code>offline_access</code>");
+   expect(html).toContain("<code>evil&#60;script&#62;</code>");
+diff --git a/src/server/cloudflare/mcp-consent-page.ts b/src/server/cloudflare/mcp-consent-page.ts
+index 62c1779..f02df72 100644
+--- a/src/server/cloudflare/mcp-consent-page.ts
++++ b/src/server/cloudflare/mcp-consent-page.ts
+@@ -6,7 +6,9 @@ export function renderMcpConsentPage(
+   details: ConsentDescription,
+   handle: string,
+   grantedScopes: readonly string[],
+-  lifetime: Pick<McpOAuthSettings, "grantTTL" | "grantIdleTTL"> = { grantTTL: 30 * 86400 },
++  lifetime: Pick<McpOAuthSettings, "grantTTL" | "grantIdleTTL"> = {
++    grantTTL: 30 * 86400,
++  },
+ ): string {
+   const publisher = details.clientDomain
+     ? `Client domain: <strong>${escapeHtml(details.clientDomain)}</strong>`
+@@ -19,12 +21,17 @@ export function renderMcpConsentPage(
+     .join("");
+   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize OpenConnector</title>
+-<style>body{font:16px/1.6 system-ui,sans-serif;background:#f7f7f5;color:#242424;margin:0;padding:32px 20px}main{max-width:520px;margin:40px auto;padding:32px;background:white;border:1px solid #ddd;border-radius:16px}h1{font-size:25px;line-height:1.3}input,button{box-sizing:border-box;font:inherit;padding:12px;border:1px solid #aaa;border-radius:8px}input{width:100%;margin:8px 0 20px}button{cursor:pointer;background:#222;color:white}button[value=deny]{background:white;color:#222;margin-left:12px}small{display:block;color:#555}ul{margin:0 0 20px;padding-left:20px}code{font-size:14px}strong{overflow-wrap:anywhere}</style></head>
++<style>body{font:16px/1.6 system-ui,sans-serif;background:#f7f7f5;color:#242424;margin:0;padding:32px 20px}main{max-width:520px;margin:40px auto;padding:32px;background:white;border:1px solid #ddd;border-radius:16px}h1{font-size:25px;line-height:1.3}input,button{box-sizing:border-box;font:inherit;padding:12px;border:1px solid #aaa;border-radius:8px}input{width:100%;margin:8px 0 20px}button{cursor:pointer;background:#222;color:white}button[value=deny]{background:white;color:#222;margin-left:12px}small{display:block;color:#555}ul{margin:0 0 20px;padding-left:20px}code{font-size:14px}strong{overflow-wrap:anywhere}fieldset{border:1px solid #ddd;border-radius:8px;margin:0 0 20px;padding:8px 16px}fieldset label{display:block;margin:6px 0}input[type=radio]{width:auto;margin:0 8px 0 0}#accounts{margin-bottom:4px}small{margin-bottom:20px}</style></head>
+ <body><main><small>OPENCONNECTOR</small><h1>Allow ${escapeHtml(details.clientName)} to use your gateway?</h1>
+ <p>${publisher}</p><p>Authorization returns to <strong>${escapeHtml(details.redirectHost)}</strong>.</p>
+ ${details.redirectIsLoopback ? "<p>This sends access to an app on your computer. Continue only if you started this connection.</p>" : ""}
+ <p>This authorizes:</p><ul>${scopeList}</ul>
+-<p>Actions run with your connected accounts, including write Actions. Your gateway's policies still apply. It does not grant access to administrator settings, raw proxies, or triggers.</p>
++<p>Actions run with your connected accounts. Your gateway's policies still apply. It does not grant access to administrator settings, raw proxies, or triggers.</p>
++<fieldset><legend>Access</legend>
++<label><input type="radio" name="access" value="read" checked> Read only: search and read, never send, post, change or delete</label>
++<label><input type="radio" name="access" value="all"> Read and write: every Action your gateway allows</label></fieldset>
++<label for="accounts">Accounts</label><input id="accounts" name="accounts" autocomplete="off" maxlength="2000" placeholder="All accounts">
++<small>Leave empty for every connected account, or list nicknames such as <code>work, slack:team</code>.</small>
+ <p>A separate API Key will appear in your console. Delete it there to revoke this connection.</p>
+ <form method="post" action="/oauth/mcp/authorize"><input type="hidden" name="handle" value="${escapeHtml(handle)}">
+ <label for="admin-token">Administrator token</label><input id="admin-token" type="password" name="admin_token" autocomplete="off" required maxlength="1024">
+diff --git a/src/server/cloudflare/mcp-grant-scope.test.ts b/src/server/cloudflare/mcp-grant-scope.test.ts
+new file mode 100644
+index 0000000..f093f42
+--- /dev/null
++++ b/src/server/cloudflare/mcp-grant-scope.test.ts
+@@ -0,0 +1,91 @@
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { describe, expect, it } from "vitest";
++import { McpGrantScopeError, readMcpGrantRequest, resolveMcpGrantScope } from "./mcp-grant-scope.ts";
++
++const origin = "https://connect.example.com";
++const env = { OOMOL_CONNECT_ADMIN_TOKEN: "test-admin-token" } as CloudflareEnv;
++
++const actions = [
++  { id: "gmail.search_messages", operationType: "read" },
++  { id: "gmail.send_message", operationType: "write" },
++  { id: "notion.search", operationType: "read" },
++  { id: "notion.delete_block", operationType: "destructive" },
++];
++const connections = [
++  { id: "c1", service: "gmail", alias: "work" },
++  { id: "c2", service: "slack", alias: "work" },
++  { id: "c3", service: "slack", alias: "team" },
++];
++
++// Stands in for the Worker's runtime, answering only an administrator.
++function runtime(seen: string[] = []) {
++  return async (request: Request) => {
++    seen.push(new URL(request.url).pathname);
++    if (request.headers.get("authorization") !== "Bearer test-admin-token") return new Response(null, { status: 401 });
++    const path = new URL(request.url).pathname;
++    if (path === "/api/actions") return Response.json(actions);
++    if (path === "/v1/connections") return Response.json({ success: true, data: connections });
++    return new Response(null, { status: 404 });
++  };
++}
++
++describe("MCP grant scope", () => {
++  it("reads an empty consent form as read-only for every account", () => {
++    expect(readMcpGrantRequest(new URLSearchParams())).toEqual({
++      access: "read",
++      accounts: [],
++    });
++    expect(readMcpGrantRequest(new URLSearchParams({ access: "all", accounts: " work,  slack:team " }))).toEqual({
++      access: "all",
++      accounts: ["work", "slack:team"],
++    });
++  });
++
++  it("grants only read actions for read-only access", async () => {
++    const scope = await resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, runtime());
++    expect(scope).toEqual({
++      allowedActions: ["gmail.search_messages", "notion.search"],
++      allowedConnections: [],
++    });
++  });
++
++  it("grants every action without reading the catalog for full access", async () => {
++    const seen: string[] = [];
++    const scope = await resolveMcpGrantScope({ access: "all", accounts: [] }, origin, env, runtime(seen));
++    expect(scope).toEqual({ allowedActions: ["*"], allowedConnections: [] });
++    expect(seen).toEqual([]);
++  });
++
++  it("matches a bare nickname on every service and a service:nickname on one", async () => {
++    const scope = await resolveMcpGrantScope(
++      { access: "all", accounts: ["work", "slack:team"] },
++      origin,
++      env,
++      runtime(),
++    );
++    expect(scope.allowedConnections.sort()).toEqual(["c1", "c2", "c3"]);
++    const one = await resolveMcpGrantScope({ access: "all", accounts: ["gmail:work"] }, origin, env, runtime());
++    expect(one.allowedConnections).toEqual(["c1"]);
++  });
++
++  it("names every nickname that matches no account", async () => {
++    const pending = resolveMcpGrantScope(
++      { access: "all", accounts: ["work", "home", "gmail:team"] },
++      origin,
++      env,
++      runtime(),
++    );
++    await expect(pending).rejects.toThrow(new McpGrantScopeError("No connected account is named home, gmail:team."));
++  });
++
++  it("refuses read-only access when no action is read-only, rather than granting everything", async () => {
++    const writesOnly = async (request: Request) =>
++      new URL(request.url).pathname === "/api/actions"
++        ? Response.json([{ id: "gmail.send_message", operationType: "write" }])
++        : new Response(null, { status: 404 });
++    await expect(resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, writesOnly)).rejects.toThrow(
++      McpGrantScopeError,
++    );
++  });
++});
+diff --git a/src/server/cloudflare/mcp-grant-scope.ts b/src/server/cloudflare/mcp-grant-scope.ts
+new file mode 100644
+index 0000000..c6a88fb
+--- /dev/null
++++ b/src/server/cloudflare/mcp-grant-scope.ts
+@@ -0,0 +1,90 @@
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++/** What the consent form asked for: read-only or every action, and which accounts. */
++export interface McpGrantRequest {
++  /** "read" grants only actions whose operationType is read; "all" grants every action the deployment allows. */
++  access: "read" | "all";
++  /** Connection nicknames, as typed: "alias" (any service) or "service:alias". Empty grants every connection. */
++  accounts: readonly string[];
++}
++
++export interface McpGrantScope {
++  allowedActions: string[];
++  allowedConnections: string[];
++}
++
++type RuntimeHandler = (request: Request, env: CloudflareEnv) => Promise<Response>;
++
++/** Thrown for a request the operator can fix on the consent page, such as a nickname that matches no account. */
++export class McpGrantScopeError extends Error {}
++
++/** Read the access and accounts fields of a consent form. Missing access means read-only. */
++export function readMcpGrantRequest(form: URLSearchParams): McpGrantRequest {
++  const access = form.get("access") === "all" ? "all" : "read";
++  const accounts = (form.get("accounts") ?? "")
++    .split(/[\s,]+/)
++    .map((name) => name.trim())
++    .filter(Boolean);
++  return { access, accounts };
++}
++
++/**
++ * Turn the consent form's choice into the backing runtime token's grant. Runs only after the administrator token
++ * was checked, and asks the runtime with that token, so the consent page never lists accounts to an anonymous
++ * visitor.
++ */
++export async function resolveMcpGrantScope(
++  grant: McpGrantRequest,
++  origin: string,
++  env: CloudflareEnv,
++  runtime: RuntimeHandler,
++): Promise<McpGrantScope> {
++  const adminRequest = (path: string) =>
++    runtime(
++      new Request(`${origin}${path}`, {
++        headers: {
++          authorization: `Bearer ${env.OOMOL_CONNECT_ADMIN_TOKEN?.trim()}`,
++        },
++      }),
++      env,
++    );
++
++  let allowedActions = ["*"];
++  if (grant.access === "read") {
++    const response = await adminRequest("/api/actions");
++    if (!response.ok) throw new Error(`Unable to read the action catalog (${response.status}).`);
++    const actions = (await response.json()) as {
++      id: string;
++      operationType?: string;
++    }[];
++    allowedActions = actions.filter((action) => action.operationType === "read").map((action) => action.id);
++    // An empty list would mean "every action" to the policy, the opposite of read-only.
++    if (allowedActions.length === 0) throw new McpGrantScopeError("This gateway has no read-only actions to grant.");
++  }
++
++  let allowedConnections: string[] = [];
++  if (grant.accounts.length > 0) {
++    const response = await adminRequest("/v1/connections");
++    if (!response.ok) throw new Error(`Unable to read the connections (${response.status}).`);
++    const connections =
++      (
++        (await response.json()) as {
++          data?: { id: string; service: string; alias: string }[];
++        }
++      ).data ?? [];
++    const unknown: string[] = [];
++    const ids = new Set<string>();
++    for (const name of grant.accounts) {
++      const [service, alias] = name.includes(":") ? name.split(":", 2) : [undefined, name];
++      const matches = connections.filter(
++        (connection) => connection.alias === alias && (!service || connection.service === service),
++      );
++      if (matches.length === 0) unknown.push(name);
++      for (const match of matches) ids.add(match.id);
++    }
++    if (unknown.length > 0) throw new McpGrantScopeError(`No connected account is named ${unknown.join(", ")}.`);
++    allowedConnections = [...ids];
++  }
++
++  return { allowedActions, allowedConnections };
++}
+diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
+index bb617e9..517110e 100644
+--- a/src/server/cloudflare/mcp-oauth.test.ts
++++ b/src/server/cloudflare/mcp-oauth.test.ts
+@@ -79,6 +79,15 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+     expect(tokens.status).toBe(200);
+   });
+ 
++  it("asks for read-only access by default on the consent page", async () => {
++    const env = createEnv({});
++    const clientId = await register(env, [claudeCallback]);
++    const page = await worker.fetch(new Request(authorizeUrl(clientId, claudeCallback, "x".repeat(43))), env, context());
++    const html = await page.text();
++    expect(html).toContain('<input type="radio" name="access" value="read" checked>');
++    expect(html).not.toContain('value="all" checked');
++  });
++
+   it("refuses consent for a client registered before the allowlist excluded it", async () => {
+     const kv = new MemoryKV();
+     const db = new SqliteD1Database();
+@@ -99,25 +108,9 @@ async function authorizeAndExchange(
+   env: CloudflareEnv,
+   redirectUri: string,
+ ): Promise<{ status: number; body: Record<string, unknown>; clientId: string }> {
+-  const clientId = await register(env, [redirectUri]);
+-  const verifier = randomBytes(48).toString("base64url");
+-  const challenge = createHash("sha256").update(verifier).digest("base64url");
+-  const page = await worker.fetch(new Request(authorizeUrl(clientId, redirectUri, challenge)), env, context());
+-  expect(page.status).toBe(200);
+-  const handle = /name="handle" value="([^"]+)"/.exec(await page.text())?.[1];
+-  const cookies = page.headers
+-    .getSetCookie()
+-    .map((cookie) => cookie.split(";")[0])
+-    .join("; ");
+-  const approval = await worker.fetch(
+-    new Request(`${origin}/oauth/mcp/authorize`, {
+-      method: "POST",
+-      headers: { "content-type": "application/x-www-form-urlencoded", origin, cookie: cookies },
+-      body: new URLSearchParams({ handle: handle ?? "", decision: "approve", admin_token: adminToken }),
+-    }),
+-    env,
+-    context(),
+-  );
++  const { clientId, verifier, consent } = await openConsent(env, redirectUri);
++  // The test Worker has no catalog assets, so grant every action rather than the read-only default.
++  const approval = await consent({ access: "all" });
+   expect(approval.status).toBe(302);
+   const code = new URL(approval.headers.get("location") ?? "").searchParams.get("code") ?? "";
+   const exchanged = await post(env, "/oauth/mcp/token", {
+@@ -131,6 +124,30 @@ async function authorizeAndExchange(
+   return { status: exchanged.status, body: await exchanged.json(), clientId };
+ }
+ 
++async function openConsent(env: CloudflareEnv, redirectUri: string) {
++  const clientId = await register(env, [redirectUri]);
++  const verifier = randomBytes(48).toString("base64url");
++  const challenge = createHash("sha256").update(verifier).digest("base64url");
++  const page = await worker.fetch(new Request(authorizeUrl(clientId, redirectUri, challenge)), env, context());
++  expect(page.status).toBe(200);
++  const handle = /name="handle" value="([^"]+)"/.exec(await page.text())?.[1];
++  const cookies = page.headers
++    .getSetCookie()
++    .map((cookie) => cookie.split(";")[0])
++    .join("; ");
++  const consent = (fields: Record<string, string>) =>
++    worker.fetch(
++      new Request(`${origin}/oauth/mcp/authorize`, {
++        method: "POST",
++        headers: { "content-type": "application/x-www-form-urlencoded", origin, cookie: cookies },
++        body: new URLSearchParams({ handle: handle ?? "", decision: "approve", admin_token: adminToken, ...fields }),
++      }),
++      env,
++      context(),
++    );
++  return { clientId, verifier, consent };
++}
++
+ function authorizeUrl(clientId: string, redirectUri: string, challenge: string): string {
+   return `${origin}/oauth/mcp/authorize?${new URLSearchParams({
+     response_type: "code",
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index efa25c2..ca24539 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -13,6 +13,7 @@ import { readBoundedResponseBytes } from "../../core/request.ts";
+ import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
+ import { RuntimeTokenService } from "../storage/runtime-token-service.ts";
+ import { renderMcpConsentPage } from "./mcp-consent-page.ts";
++import { McpGrantScopeError, readMcpGrantRequest, resolveMcpGrantScope } from "./mcp-grant-scope.ts";
+ 
+ interface McpOAuthProps {
+   runtimeToken: string;
+@@ -161,15 +162,23 @@ export function createMcpOAuthHandler(
+           if (!sameToken(form.get("admin_token") ?? "", env.OOMOL_CONNECT_ADMIN_TOKEN.trim())) {
+             return localError("Invalid administrator token. Go back and try again.", 401);
+           }
++          // Resolved before the handle is spent, so a mistyped nickname can be fixed by going back.
++          let scope;
++          try {
++            scope = await resolveMcpGrantScope(readMcpGrantRequest(form), origin, env, runtime);
++          } catch (error) {
++            if (error instanceof McpGrantScopeError) return localError(`${error.message} Go back and try again.`, 400);
++            throw error;
++          }
+           const approved = await oauth.approveConsent(request, handle, { scope: [...grantedScopes] });
+           const client = await oauth.describeConsent(approved.request);
+           if (!redirectAllowed(client.redirectUri)) return localError("This client is not allowed.", 403);
+           const tokens = runtimeTokens(env);
+           const backing = await tokens.createToken(`MCP OAuth • ${client.clientName.slice(0, 120)}`, {
+-            allowedActions: ["*"],
++            allowedActions: scope.allowedActions,
+             blockedActions: [],
+             allowedProxies: [],
+-            allowedConnections: [],
++            allowedConnections: scope.allowedConnections,
+             allowedTriggers: [],
+           });
+           try {
+-- 
+2.43.0
+
