@@ -18,7 +18,11 @@ deployment's own policy. It deletes the token before it exits. Expected output:
 
 ```
 PASS  GET /health returns {"ok":true}  (200)
+PASS  the account setup page is served at /setup/  (200)
+PASS  the setup page has a strict Content-Security-Policy  (default-src 'none'; script-src 'self'; …)
+PASS  the privacy policy is served at /privacy/  (200)
 PASS  OAuth discovery names this origin as issuer  (200 issuer=https://<your-worker>.workers.dev)
+PASS  a client with a non-Claude redirect URI can't register  (400 invalid_client_metadata)
 PASS  POST /mcp without a token is refused  (401)
 PASS  raw gmail proxy is blocked by deployment policy  (403 proxy_blocked)
 PASS  raw notion proxy is blocked by deployment policy  (403 proxy_blocked)

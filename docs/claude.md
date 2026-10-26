@@ -85,4 +85,5 @@ Tested against a local Worker on 2026-10-23 (Claude Code 2.1.309): `splitmind-lo
 | Consent approved, but Claude still shows **Connect** | Known claude.ai issue (anthropics/claude-ai-mcp #215, #313). Remove the connector, wait 15 minutes, add it again. |
 | Tools vanish after about an hour | Claude did not refresh the token (anthropics/claude-ai-mcp #228). See issue #15 for the longer-lifetime setting in patch 0002. |
 | "A server with this URL already exists" | You already added SplitMind. You only need one; all accounts are behind it. |
+| Consent page says "This client is not allowed." | The client's callback isn't in `OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS` (`wrangler.template.jsonc`). Only Claude's callbacks are listed; add another client's documented callback there and redeploy. |
 | Claude Code: `✘ Failed to connect` | The token was deleted or mistyped. Create a new one (step 2). |

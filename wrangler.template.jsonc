@@ -82,6 +82,10 @@
     // Pinned decision 4: one internal Slack app per workspace, supplied per connection. Gmail normally uses
     // the deployment-wide Google OAuth client; per-connection lets a Workspace account use its own Internal one.
     "OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH": "slack,gmail",
+    // Only Claude may finish the MCP OAuth flow (patches/0002, #77): claude.ai's callback for web, desktop and mobile,
+    // and Claude Code's loopback callback (any port). Any other client's registration is refused, so a look-alike
+    // "Claude" can't be sent to your consent page. Add a client's documented callback here to allow it.
+    "OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,http://localhost/callback,http://127.0.0.1/callback",
     // Proposed, not pinned: tokens already default to no trigger access; this makes it explicit.
     // "OOMOL_CONNECT_BLOCKED_TRIGGERS": "*",
   },

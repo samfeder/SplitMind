@@ -175,6 +175,10 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     // gmail.* is allowed, but not the mailbox-settings writes.
     expect(rendered).toContain('"OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*"');
     expect(rendered).toContain('"OOMOL_CONNECT_BLOCKED_ACTIONS": "gmail.update_vacation_settings,');
+    // Only Claude's callbacks may finish MCP OAuth (#77).
+    expect(rendered).toContain(
+      '"OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,http://localhost/callback,http://127.0.0.1/callback"',
+    );
 
     // Only the allowlisted providers reach the Worker's catalog assets.
     expect(JSON.parse(readFileSync(join(engine, "dist/web/catalog/index.json"), "utf8"))).toEqual({
