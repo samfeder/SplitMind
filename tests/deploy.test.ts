@@ -246,6 +246,29 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(second.stdout).not.toContain("applied: patches/0001-greeting.patch");
   });
 
+  it("applies a new patch on top of stacked patches that no longer reverse one by one", () => {
+    writeFileSync(join(engine, "greeting.txt"), "hello\n");
+    writeFileSync(join(engine, "farewell.txt"), "bye\n");
+    mkdirSync(join(checkout, "patches"));
+    const edit = (file: string, from: string, to: string) =>
+      [`--- a/${file}`, `+++ b/${file}`, "@@ -1 +1 @@", `-${from}`, `+${to}`, ""].join("\n");
+    writeFileSync(join(checkout, "patches/0001-greeting.patch"), edit("greeting.txt", "hello", "hello, patched"));
+    writeFileSync(
+      join(checkout, "patches/0002-greeting-again.patch"),
+      edit("greeting.txt", "hello, patched", "hello, patched twice"),
+    );
+    deploy();
+    writeFileSync(join(checkout, "patches/0003-farewell.patch"), edit("farewell.txt", "bye", "bye, patched"));
+
+    const result = deploy();
+
+    expect(result.stderr).not.toContain("does not apply");
+    expect(result.stdout).toContain("applied: patches/0003-farewell.patch");
+    expect(result.stdout).not.toContain("applied: patches/0001-greeting.patch");
+    expect(readFileSync(join(engine, "greeting.txt"), "utf8")).toBe("hello, patched twice\n");
+    expect(readFileSync(join(engine, "farewell.txt"), "utf8")).toBe("bye, patched\n");
+  });
+
   it("stops before building when a patch no longer fits the engine", () => {
     writeFileSync(join(engine, "greeting.txt"), "something else\n");
     mkdirSync(join(checkout, "patches"));

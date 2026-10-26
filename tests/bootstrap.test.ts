@@ -115,6 +115,25 @@ describe("scripts/bootstrap.sh", () => {
     expect(greeting()).toBe("hello from upstream, patched\n");
   });
 
+  it("skips stacked patches that no longer reverse one by one", () => {
+    addPatch("0001-greeting.patch", VALID_PATCH);
+    addPatch(
+      "0002-greeting-again.patch",
+      VALID_PATCH.replace("-hello from upstream\n", "-hello from upstream, patched\n").replace(
+        "+hello from upstream, patched\n",
+        "+hello from upstream, patched twice\n",
+      ),
+    );
+    expect(bootstrap(checkout, "--skip-install").status).toBe(0);
+
+    const second = bootstrap(checkout, "--skip-install");
+
+    expect(second.status).toBe(0);
+    expect(second.stdout).toContain("already applied: patches/0001-greeting.patch");
+    expect(second.stdout).toContain("already applied: patches/0002-greeting-again.patch");
+    expect(greeting()).toBe("hello from upstream, patched twice\n");
+  });
+
   it("stops and names a patch that does not apply", () => {
     addPatch("0001-broken.patch", BROKEN_PATCH);
 
