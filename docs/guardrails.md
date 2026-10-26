@@ -33,15 +33,15 @@ PASS  an allowlisted action is not refused by policy  (400 invalid_input)
 PASS  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 action_blocked, …)
 PASS  no default notion connection  (200 2 connection(s): [<alias-a>, <alias-b>])
 PASS  each notion connection is a different account  (2 connection(s))
-PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
+PASS  unnamed notion write is refused (MCP execute_action, no connectionName)  (ok=false connection_required)
 PASS  notion write to connectionName "default" is refused  (ok=false connection_not_found)
 PASS  no default slack connection  (200 2 connection(s): [<alias-c>, <alias-d>])
 PASS  each slack connection is a different account  (2 connection(s))
-PASS  unnamed slack write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
+PASS  unnamed slack write is refused (MCP execute_action, no connectionName)  (ok=false connection_required)
 PASS  slack write to connectionName "default" is refused  (ok=false connection_not_found)
 PASS  no default gmail connection  (200 2 connection(s): [<alias-e>, <alias-f>])
 PASS  each gmail connection is a different account  (2 connection(s))
-PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false authorization_failed)
+PASS  unnamed gmail write is refused (MCP execute_action, no connectionName)  (ok=false connection_required)
 PASS  gmail write to connectionName "default" is refused  (ok=false connection_not_found)
 PASS  temporary runtime token deleted  (200)
 All 25 checks passed.
@@ -80,9 +80,10 @@ OpenConnector treats a call with no `connectionName` as a call to the connection
 (`src/connection-service.ts`, `value?.trim() || "default"`). SplitMind therefore never creates a `default` connection
 for any provider. With none:
 
-- `execute_action` with no `connectionName` fails before any request leaves the Worker (`ok:false`). Upstream's
-  message is misleading ("Configure notion credentials first.", `authorization_failed`); an upstream issue is
-  drafted in [the Notion spike](spikes/notion-provider.md) (U1).
+- `execute_action` with no `connectionName` fails before any request leaves the Worker (`ok:false`,
+  `connection_required`: "notion has no default connection. Pass connectionName; …"). Upstream's own message is
+  misleading ("Configure notion credentials first.", `authorization_failed`), which agents read as an expired
+  sign-in; `patches/0005-…` replaces it until upstream fixes it (U1 in [the Notion spike](spikes/notion-provider.md)).
 - `connectionName: "default"` fails with `connection_not_found`.
 
 **The one way to break this:** the Web Console pre-fills `default` as the name of a provider's first connection.

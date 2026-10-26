@@ -1,0 +1,98 @@
+SplitMind patch 0005 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft text: docs/spikes/notion-provider.md, U1 (#28).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 2b17eb1283a17f53dbf73225a01b0aaf7e0d8f77 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Mon, 26 Oct 2026 21:00:06 +0000
+Subject: [PATCH] fix(connections): say "pass connectionName" when only named
+ connections exist
+
+A call without connectionName looks up the connection named "default". When
+a provider has only named connections (one per Slack workspace, say), the
+lookup found nothing, the action ran with no credential, and the provider
+answered "Configure slack credentials first." That reads as a broken or
+expired connection, so agents told users to reconnect accounts that worked.
+
+resolveForExecution now fails with connection_required and a message that
+says to pass connectionName and points at list_connections. It does not
+list the names, since the caller may not be granted every connection.
+Providers with no_auth, and providers with no connections at all, are
+unchanged.
+---
+ src/connection-service.test.ts | 21 +++++++++++++++++++++
+ src/connection-service.ts      | 19 +++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/src/connection-service.test.ts b/src/connection-service.test.ts
+index 1c44daf..c38df35 100644
+--- a/src/connection-service.test.ts
++++ b/src/connection-service.test.ts
+@@ -270,6 +270,27 @@ describe("ConnectionService", () => {
+     });
+   });
+ 
++  it("points a call without connectionName at the named connections when no default exists", async () => {
++    const service = createService([apiKeyProvider]);
++    await expect(service.resolveForExecution("uptimerobot")).resolves.toMatchObject({ kind: "local" });
++
++    await service.connectWithApiKey("uptimerobot", {
++      connectionName: "work",
++      values: { apiKey: "test-key", accountId: "account-1" },
++    });
++
++    await expect(service.resolveForExecution("uptimerobot")).rejects.toMatchObject({
++      code: "connection_required",
++      message: "uptimerobot has no default connection. Pass connectionName; list_connections shows the uptimerobot accounts.",
++    });
++    await expect(service.resolveForExecution("uptimerobot", "work")).resolves.toMatchObject({ kind: "local" });
++
++    await service.connectWithApiKey("uptimerobot", { values: { apiKey: "other-key", accountId: "account-2" } });
++    await expect(service.resolveForExecution("uptimerobot")).resolves.toMatchObject({
++      summary: { connectionName: "default" },
++    });
++  });
++
+   it("requires declared API key extra fields", async () => {
+     const service = createService([apiKeyProvider]);
+ 
+diff --git a/src/connection-service.ts b/src/connection-service.ts
+index f9ffec9..032d48c 100644
+--- a/src/connection-service.ts
++++ b/src/connection-service.ts
+@@ -355,6 +355,9 @@ export class ConnectionService {
+     if (!stored && connectionName && !this.supportsAuth(provider, "no_auth")) {
+       throw new ConnectionError("connection_not_found", `${service} connection not found: ${name}.`);
+     }
++    if (!stored && !connectionName && !connectionId && !this.supportsAuth(provider, "no_auth")) {
++      await this.assertNoNamedConnectionsOnly(service);
++    }
+ 
+     if (stored?.source === "saas")
+       return { kind: "saas", summary: this.createManagedConnectionSummary(stored), reference: stored.reference };
+@@ -526,6 +529,22 @@ export class ConnectionService {
+     };
+   }
+ 
++  /**
++   * Fail with a pointer to connectionName when a call names no connection, the provider has no
++   * default one, and named ones exist. Without this the provider runs with no credential and
++   * answers "Configure <service> credentials first.", which reads as a broken connection. The
++   * message does not list the names, because the caller may not be granted every connection.
++   */
++  private async assertNoNamedConnectionsOnly(service: string): Promise<void> {
++    const named = (await this.store.list()).some((connection) => connection.service === service);
++    if (named) {
++      throw new ConnectionError(
++        "connection_required",
++        `${service} has no default connection. Pass connectionName; list_connections shows the ${service} accounts.`,
++      );
++    }
++  }
++
+   private async selectStoredConnection(
+     service: string,
+     name: string | undefined,
+-- 
+2.43.0
+
