@@ -1,4 +1,5 @@
-// SplitMind setup page: one place to connect every Gmail, Notion and Slack account by OAuth.
+// SplitMind setup page: one place to connect every Gmail, Notion and Slack account by OAuth, and every Netlify and
+// Cloudflare account by API token.
 //
 // Served as a static asset at <origin>/setup/ (scripts/deploy.ts copies web/setup/ into the Web Console build). It
 // only calls the Worker's own console API with the admin session cookie, plus Slack's apps.manifest.create straight
@@ -6,7 +7,46 @@
 //
 // The pure helpers are exported for tests/setup-page.test.ts; main() runs only in a browser.
 
-export const PROVIDERS = ["gmail", "notion", "slack"];
+export const PROVIDERS = ["gmail", "notion", "slack", "netlify", "cloudflare_dns", "cloudflare_worker"];
+
+/**
+ * Providers connected by pasting a token instead of OAuth. Field keys and auth types match upstream's provider
+ * definitions (src/providers/<id>/definition.ts in the pinned release): Netlify and Cloudflare DNS take an api_key,
+ * Cloudflare Workers a custom_credential with an account ID beside the token.
+ */
+export const TOKEN_PROVIDERS = {
+  netlify: {
+    authType: "api_key",
+    fields: [{ key: "apiKey", placeholder: "Personal access token (nfp_…)", secret: true }],
+  },
+  cloudflare_dns: {
+    authType: "api_key",
+    fields: [{ key: "apiKey", placeholder: "Cloudflare API token", secret: true }],
+  },
+  cloudflare_worker: {
+    authType: "custom_credential",
+    fields: [
+      { key: "apiKey", placeholder: "Cloudflare API token", secret: true },
+      { key: "accountId", placeholder: "Account ID (32 hex characters)", secret: false },
+    ],
+  },
+};
+
+/** The console API body that stores a token connection, or a readable error when a field is missing. */
+export function tokenConnectionBody(service, nickname, rawValues) {
+  const spec = TOKEN_PROVIDERS[service];
+  if (!spec) throw new Error(`${service} doesn't connect with a token.`);
+  const values = {};
+  for (const field of spec.fields) {
+    const value = (rawValues[field.key] ?? "").trim();
+    if (!value) throw new Error(`Paste the ${field.placeholder.replace(/ \(.*\)$/, "")} first.`);
+    values[field.key] = value;
+  }
+  if (values.accountId !== undefined && !/^[0-9a-f]{32}$/i.test(values.accountId)) {
+    throw new Error("A Cloudflare account ID is 32 hex characters (Workers & Pages → Account details).");
+  }
+  return { authType: spec.authType, connectionName: nickname, values };
+}
 
 const NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 
@@ -309,7 +349,8 @@ function accountList(card, service) {
 
 function connectForm(card, service) {
   const taken = accountsOf(state.connections, service).map((c) => c.connectionName);
-  const label = { gmail: "Connect a mailbox", notion: "Connect a workspace", slack: "Connect a workspace" }[service];
+  const label = { gmail: "Connect a mailbox", notion: "Connect a workspace", slack: "Connect a workspace" }[service] ?? "Connect an account";
+  const token = TOKEN_PROVIDERS[service];
   return el(
     "form",
     {
@@ -320,6 +361,7 @@ function connectForm(card, service) {
         const problem = nicknameProblem(nickname, taken);
         if (problem) return setStatus(card, problem, "error");
         if (service === "slack") return connectSlack(card, nickname, event.target);
+        if (token) return connectToken(card, service, nickname, event.target);
         startOAuth(card, service, nickname);
       },
     },
@@ -327,6 +369,15 @@ function connectForm(card, service) {
     service === "slack"
       ? el("input", { name: "configToken", type: "password", placeholder: "Slack configuration token (xoxe.xoxp-…)", autocomplete: "off" })
       : null,
+    ...(token?.fields ?? []).map((field) =>
+      el("input", {
+        name: field.key,
+        type: field.secret ? "password" : undefined,
+        placeholder: field.placeholder,
+        required: true,
+        autocomplete: "off",
+      }),
+    ),
     el("button", { type: "submit" }, label),
     service === "slack" ? slackManual() : null,
   );
@@ -340,6 +391,20 @@ function slackManual() {
     el("input", { name: "clientId", placeholder: "Client ID", autocomplete: "off" }),
     el("input", { name: "clientSecret", type: "password", placeholder: "Client Secret", autocomplete: "off" }),
   );
+}
+
+async function connectToken(card, service, nickname, form) {
+  try {
+    const raw = Object.fromEntries(TOKEN_PROVIDERS[service].fields.map((field) => [field.key, form[field.key].value]));
+    const body = tokenConnectionBody(service, nickname, raw);
+    setStatus(card, "Checking the token…");
+    await api("PUT", `/api/connections/${service}`, body);
+    for (const field of TOKEN_PROVIDERS[service].fields) form[field.key].value = "";
+    await refresh();
+    setStatus($(`[data-service="${service}"]`), `Connected ${nickname}.`, "ok");
+  } catch (error) {
+    setStatus(card, error.message, "error");
+  }
 }
 
 async function connectSlack(card, nickname, form) {
@@ -371,10 +436,23 @@ async function connectSlack(card, nickname, form) {
   }
 }
 
-const TITLES = { gmail: "Gmail", notion: "Notion", slack: "Slack" };
+const TITLES = {
+  gmail: "Gmail",
+  notion: "Notion",
+  slack: "Slack",
+  netlify: "Netlify",
+  cloudflare_dns: "Cloudflare DNS",
+  cloudflare_worker: "Cloudflare Workers",
+};
 const HINTS = {
   gmail: "Google shows an account chooser each time, so pick the mailbox you mean. On the unverified-app screen click Advanced → Go to SplitMind: it's your own app.",
   notion: "Notion asks which workspace and which pages to share. Pick only the pages Claude should see; you can add more later from a page's ••• → Connections.",
+  netlify:
+    "Netlify → User settings → Applications → Personal access tokens → New access token. It reaches every team that Netlify login can see, so use one nickname per login.",
+  cloudflare_dns:
+    "Cloudflare → My Profile → API Tokens → Create Token → Edit zone DNS template, scoped to the zones Claude may change (Zone Read + DNS Edit). For read-only, use DNS Read instead.",
+  cloudflare_worker:
+    "Cloudflare → My Profile → API Tokens → Create Token → Edit Cloudflare Workers template (add Workers Builds Configuration for builds). Paste it with the account ID from Workers & Pages → Account details.",
   slack: "Once per workspace. On api.slack.com/apps, under Your App Configuration Tokens, click Generate Token, pick the workspace and copy the Access Token. Paste it here with a nickname, then click Allow on Slack's screen. The token is used once, in your browser, and never stored.",
 };
 
@@ -383,11 +461,12 @@ function render() {
   main.replaceChildren(
     ...PROVIDERS.map((service) => {
       const card = el("section", { className: "card", "data-service": service });
-      const needsApp = service !== "slack" && !state.configs.get(service)?.configured;
+      const oauthApp = service !== "slack" && !TOKEN_PROVIDERS[service];
+      const needsApp = oauthApp && !state.configs.get(service)?.configured;
       // Element.append turns null into the text "null", so drop the parts this card doesn't show.
       const parts = [
         el("h2", {}, TITLES[service]),
-        service === "slack" ? null : appSetup(card, service),
+        oauthApp ? appSetup(card, service) : null,
         accountList(card, service),
         needsApp ? null : el("p", { className: "hint" }, HINTS[service]),
         needsApp ? null : connectForm(card, service),

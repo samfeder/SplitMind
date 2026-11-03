@@ -58,7 +58,7 @@ export async function copyCatalogAssets({ sourceDir, targetDir }) {
 }
 `;
 
-const GENERATE = `node -e "const fs=require('fs');fs.mkdirSync('catalog/apps',{recursive:true});for(const s of ['github','gmail','notion','slack'])fs.writeFileSync('catalog/apps/'+s+'.json','{}')"`;
+const GENERATE = `node -e "const fs=require('fs');fs.mkdirSync('catalog/apps',{recursive:true});for(const s of ['github','gmail','notion','slack','netlify','cloudflare_dns','cloudflare_worker'])fs.writeFileSync('catalog/apps/'+s+'.json','{}')"`;
 
 interface FakeAccount {
   calls: string[];
@@ -173,7 +173,9 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     // The engine's sourcemap is over Cloudflare's 60 MiB cap; uploading it fails the deploy.
     expect(rendered).toContain('"upload_source_maps": false');
     // gmail.* is allowed, but not the mailbox-settings writes.
-    expect(rendered).toContain('"OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*"');
+    expect(rendered).toContain(
+      '"OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,netlify.*,cloudflare_dns.*,cloudflare_worker.*"',
+    );
     expect(rendered).toContain('"OOMOL_CONNECT_BLOCKED_ACTIONS": "gmail.update_vacation_settings,');
     // Only Claude's callbacks may finish MCP OAuth (#77).
     expect(rendered).toContain(
@@ -182,7 +184,14 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
 
     // Only the allowlisted providers reach the Worker's catalog assets.
     expect(JSON.parse(readFileSync(join(engine, "dist/web/catalog/index.json"), "utf8"))).toEqual({
-      files: ["gmail.json", "notion.json", "slack.json"],
+      files: [
+        "cloudflare_dns.json",
+        "cloudflare_worker.json",
+        "gmail.json",
+        "netlify.json",
+        "notion.json",
+        "slack.json",
+      ],
     });
   });
 
