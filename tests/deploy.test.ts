@@ -269,6 +269,14 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(readFileSync(join(engine, "farewell.txt"), "utf8")).toBe("bye, patched\n");
   });
 
+  it("says to run bootstrap when wrangler is not installed", () => {
+    const result = deployWith({ SPLITMIND_WRANGLER: join(engine, "node_modules/.bin/wrangler") });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("could not start wrangler");
+    expect(result.stderr).toContain("run scripts/bootstrap.sh first");
+  });
+
   it("stops before building when a patch no longer fits the engine", () => {
     writeFileSync(join(engine, "greeting.txt"), "something else\n");
     mkdirSync(join(checkout, "patches"));
