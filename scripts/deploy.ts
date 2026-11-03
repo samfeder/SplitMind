@@ -154,6 +154,10 @@ function wrangler(
     stdio: options.interactive ? "inherit" : [options.input === undefined ? "inherit" : "pipe", "pipe", "pipe"],
     env: { ...process.env, WRANGLER_SEND_METRICS: "false", ...options.env },
   });
+  if (result.error) {
+    // Not a wrangler failure: it never started, usually because the engine's node_modules is missing.
+    throw new Error(`could not start wrangler (${command}: ${result.error.message}); run scripts/bootstrap.sh first`);
+  }
   if (result.status !== 0) {
     if (!options.interactive) process.stderr.write(result.stderr ?? "");
     throw new Error(`wrangler ${args.slice(0, 3).join(" ")} failed (exit ${result.status})`);
