@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,7 +7,10 @@ import {
   accountsOf,
   nicknameProblem,
   renderSlackManifest,
+  PROVIDERS,
   slackCredentials,
+  TOKEN_PROVIDERS,
+  tokenConnectionBody,
   withGoogleAccountChooser,
 } from "../web/setup/setup.js";
 
@@ -178,5 +181,53 @@ describe("installPrivacyPage", () => {
     const policy = readFileSync(join(repo, "web/privacy/index.html"), "utf8");
     expect(policy).toContain("Google API Services User Data Policy");
     expect(policy).toContain("Limited Use requirements");
+  });
+});
+
+describe("token providers (Netlify, Cloudflare)", () => {
+  const upstream = (service: string) =>
+    readFileSync(join(repo, "vendor/open-connector/src/providers", service, "definition.ts"), "utf8");
+  const template = readFileSync(join(repo, "wrangler.template.jsonc"), "utf8");
+
+  const vendored = existsSync(join(repo, "vendor/open-connector/src/providers"));
+
+  it.each(Object.keys(TOKEN_PROVIDERS))("%s is on the page and allowlisted", (service) => {
+    expect(PROVIDERS).toContain(service);
+    expect(template).toContain(`${service}.*`);
+  });
+
+  // CI checks out without the submodule; locally (and after bootstrap) this pins the fields to the vendored release.
+  it.skipIf(!vendored).each(Object.keys(TOKEN_PROVIDERS))("%s matches upstream's auth definition", (service) => {
+    const spec = TOKEN_PROVIDERS[service as keyof typeof TOKEN_PROVIDERS];
+    const definition = upstream(service);
+    expect(definition).toContain(`type: "${spec.authType}"`);
+    if (spec.authType === "custom_credential") {
+      for (const field of spec.fields) expect(definition).toContain(`key: "${field.key}"`);
+    } else {
+      expect(spec.fields.map((field) => field.key)).toEqual(["apiKey"]);
+    }
+  });
+
+  it("builds the api_key body the console API expects, trimming pasted whitespace", () => {
+    expect(tokenConnectionBody("netlify", "home", { apiKey: "  nfp_x \n" })).toEqual({
+      authType: "api_key",
+      connectionName: "home",
+      values: { apiKey: "nfp_x" },
+    });
+  });
+
+  it("builds the custom_credential body for Workers with the account ID", () => {
+    const accountId = "0".repeat(32);
+    expect(tokenConnectionBody("cloudflare_worker", "work", { apiKey: "t", accountId })).toEqual({
+      authType: "custom_credential",
+      connectionName: "work",
+      values: { apiKey: "t", accountId },
+    });
+  });
+
+  it("refuses a missing token or a malformed account ID", () => {
+    expect(() => tokenConnectionBody("cloudflare_dns", "a", { apiKey: " " })).toThrow(/Cloudflare API token/);
+    expect(() => tokenConnectionBody("cloudflare_worker", "a", { apiKey: "t", accountId: "abc" })).toThrow(/32 hex/);
+    expect(() => tokenConnectionBody("gmail", "a", {})).toThrow(/doesn't connect with a token/);
   });
 });

@@ -8,7 +8,7 @@ API and the same admin sign-in, so nothing new is exposed.
 
 ## What still has to be done by hand, and why
 
-Every provider needs an OAuth app that belongs to you before any account can sign in to SplitMind. That app holds
+Every OAuth provider needs an OAuth app that belongs to you before any account can sign in to SplitMind. That app holds
 the client ID and secret the Worker uses, and the providers only let you create it while signed in to their
 developer sites.
 
@@ -17,6 +17,8 @@ developer sites.
 | Gmail | Create a Google Cloud project and a Web OAuth client | Once per deployment | Google has no public API for creating OAuth clients for a consent screen |
 | Notion | Create a public connection in Notion's developer portal | Once per deployment | Notion has no API for creating connections |
 | Slack | Generate an app configuration token on api.slack.com | Once per workspace | The page creates the app from it, but only Slack's site issues the token. One app per workspace keeps Slack's higher rate limits ([why](../providers/slack.md#why-one-internal-app-per-workspace)) |
+
+| Netlify, Cloudflare | Create an API token on the provider's site | Once per account | They connect by token, not OAuth, so there is no app to create. Steps: [Netlify](../providers/netlify.md), [Cloudflare](../providers/cloudflare.md) |
 
 After that, each account is a nickname plus **Connect**. The setup page shows the exact steps and the redirect URI
 to copy while an app is missing.
@@ -36,6 +38,9 @@ to copy while an app is missing.
      from your browser to Slack's `apps.manifest.create`, which creates a SplitMind app in that workspace from
      `slack/app-manifest.json`. It then starts the install with that app. The token is used once and never sent to
      the Worker or stored.
+   - **Netlify and Cloudflare** take a token instead of a sign-in screen: paste it (plus the account ID for
+     Cloudflare Workers) with the nickname. The Worker checks it with the provider before saving it encrypted, and the
+     page clears the fields.
 4. The card updates by itself when the provider sends you back. Each account shows its nickname and the account name
    the provider reported.
 

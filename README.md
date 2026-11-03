@@ -50,8 +50,8 @@ flowchart LR
 - **Host:** your Cloudflare account: Workers, D1, KV and Static Assets for the
   Web Console.
 - **Sign-in:** Claude connects through OpenConnector's built-in MCP OAuth.
-- **Providers:** Notion and Slack workspaces and Gmail accounts, as many of
-  each as you connect. The design stays general; adding another provider is
+- **Providers:** Notion and Slack workspaces, Gmail accounts, and Netlify and
+  Cloudflare accounts (DNS and Workers), as many of each as you connect. The design stays general; adding another provider is
   configuration ([adding a provider](docs/adding-a-provider.md)).
 
 ## Repository layout
@@ -83,7 +83,8 @@ Then:
 
 1. Open `<your-worker-url>/setup/` and connect each account with a nickname and one click:
    [setup page](docs/setup/connect-accounts.md). Provider details: [Notion](docs/providers/notion.md),
-   [Slack](docs/providers/slack.md), [Gmail](docs/providers/gmail.md).
+   [Slack](docs/providers/slack.md), [Gmail](docs/providers/gmail.md), [Netlify](docs/providers/netlify.md),
+   [Cloudflare](docs/providers/cloudflare.md).
 2. Add `<your-worker-url>/mcp` as a custom connector in Claude: [web, desktop, mobile and Claude Code](docs/claude.md).
 3. Ask Claude to "list my connections", then name the account in each request.
 

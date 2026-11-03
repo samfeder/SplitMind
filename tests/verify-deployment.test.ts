@@ -11,6 +11,7 @@ import { cleanPastedSecret } from "../scripts/verify-deployment.ts";
 const script = resolve(import.meta.dirname, "../scripts/verify-deployment.ts");
 const ADMIN = "test-admin-token";
 const RUNTIME = "test-runtime-token";
+const OFFERED = ["slack", "gmail", "notion", "netlify", "cloudflare_dns", "cloudflare_worker"];
 
 interface Behaviour {
   proxyOpen: boolean;
@@ -90,7 +91,7 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
         ? send(response, 200, { success: true, data: { status: 200 } })
         : send(response, 403, { success: false, errorCode: "proxy_blocked" });
     }
-    if (key === "GET /v1/providers") return send(response, 200, { success: true, data: [{ service: "slack" }, { service: "gmail" }, { service: "notion" }] });
+    if (key === "GET /v1/providers") return send(response, 200, { success: true, data: OFFERED.map((service) => ({ service })) });
     if (key === "POST /v1/actions/github.get_current_user") return send(response, 404, { success: false, errorCode: "unknown_action" });
     if (url.startsWith("/v1/actions/gmail.update_") || url === "/v1/actions/gmail.stop_watch") {
       return behaviour.blockOpen
@@ -125,13 +126,13 @@ describe("scripts/verify-deployment.ts", () => {
 
     expect(result.stdout).toContain("PASS  raw notion proxy is blocked by deployment policy  (403 proxy_blocked)");
     expect(result.stdout).toContain("PASS  raw gmail proxy is blocked by deployment policy  (403 proxy_blocked)");
-    expect(result.stdout).toContain("PASS  only gmail, notion and slack are offered  (200 [gmail, notion, slack])");
+    expect(result.stdout).toContain("PASS  only cloudflare_dns, cloudflare_worker, gmail, netlify, notion and slack are offered  (200 [cloudflare_dns, cloudflare_worker, gmail, netlify, notion, slack])",);
     expect(result.stdout).toContain("PASS  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 action_blocked, ");
     expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  a client with a non-Claude redirect URI can't register  (400 invalid_client_metadata)");
-    expect(result.stdout).toContain("All 18 checks passed.");
+    expect(result.stdout).toContain("All 24 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -160,7 +161,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("3 of 18 checks failed.");
+    expect(result.stdout).toContain("6 of 24 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });

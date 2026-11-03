@@ -1,7 +1,9 @@
 # Adding a provider
 
-SplitMind can reach any provider OpenConnector supports. It turns on Notion, Slack and Gmail; turning on another is
-configuration, not code. [Gmail](providers/gmail.md) is the worked example of one added later.
+SplitMind can reach any provider OpenConnector supports. It turns on Notion, Slack, Gmail, Netlify and Cloudflare (DNS
+and Workers); turning on another is configuration, not code. [Gmail](providers/gmail.md) is the worked example of an
+OAuth provider added later, and [Netlify](providers/netlify.md) of a token one (add it to `TOKEN_PROVIDERS` in
+`web/setup/setup.js` so the setup page shows its token fields).
 
 ## Turn on a provider OpenConnector already has
 

@@ -40,6 +40,15 @@ const guardedWrites: Record<string, { actionId: string; input: unknown }> = {
     actionId: "gmail.create_draft",
     input: { to: "nobody@example.invalid", subject: "SplitMind guardrail check", body: "SplitMind guardrail check" },
   },
+  netlify: { actionId: "netlify.lock_deploy", input: { deployId: "000000000000000000000000" } },
+  cloudflare_dns: {
+    actionId: "cloudflare_dns.create_dns_record",
+    input: { zoneId: "00000000000000000000000000000000", type: "TXT", name: "splitmind-guardrail-check", content: "check" },
+  },
+  cloudflare_worker: {
+    actionId: "cloudflare_worker.create_manual_build",
+    input: { triggerUuid: "00000000-0000-0000-0000-000000000000", branch: "splitmind-guardrail-check" },
+  },
 };
 
 /** "a", "a and b", "a, b and c". */
