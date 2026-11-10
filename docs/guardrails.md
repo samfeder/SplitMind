@@ -208,11 +208,39 @@ the period your plan allows.
 
 ## 5. Read-only accounts (E6.4)
 
-OpenConnector has no per-connection read-only switch. The policy layers (deployment, runtime, token) all match on
-action ids, and a token applies to every connection it may use. An upstream issue is drafted in
-[docs/upstream/connection-read-only-issue-draft.md](upstream/connection-read-only-issue-draft.md).
+OpenConnector v1.9.2 has no per-connection read-only switch, so SplitMind carries one as patch 0007
+([patches/README.md](../patches/README.md)). The upstream issue is drafted in
+[docs/upstream/connection-read-only-issue-draft.md](upstream/connection-read-only-issue-draft.md). Option 0 is the
+switch; options 1 to 4 are workarounds that still apply and stack with it.
 
-Until then, pick one of these:
+0. **Mark the connection read-only (patch 0007).** Set `OOMOL_CONNECT_READ_ONLY_CONNECTIONS` to a comma- or
+   whitespace-separated list of `<providerId>:<connectionName>` entries, for example
+   `notion:<alias-a>, slack:<alias-b>`. It is a deployment setting like `OOMOL_CONNECT_BLOCKED_ACTIONS` (a Worker
+   variable, not stored per connection), and it applies to every caller: MCP OAuth clients such as claude.ai,
+   runtime tokens and the HTTP API. Other connections of the same provider are unaffected. Use `<providerId>:default`
+   for an unnamed connection.
+   - Actions: only a catalog `operationType` of `read` runs. `write`, `destructive` and an action with no
+     `operationType` are refused with `action_blocked` (a deployment policy check, message `Connection
+     "<providerId>:<connectionName>" is read-only; write actions are refused.`), and the run log records it.
+   - Proxy: every `POST /v1/proxy/:service` request through the connection is refused with 403, whatever the
+     method, because a raw request cannot be safely classed as a read (Notion's search is a POST).
+   - Triggers: creating or deleting a provider webhook or resource (`reconcile`, `resource`) is refused with 403.
+     Polling, options, event-source checks and inbound deliveries still work, and cleanup and maintenance still
+     remove existing webhooks, so none are orphaned.
+   - `list_connections` and `/v1/apps/services/:service` add `readOnly: true` to listed connections, so agents
+     can pick the right account.
+   - **What it trusts:** the catalog's `operationType` labels. Patch 0008 corrects the known mislabels (presigned
+     URL generators, one-time verifications and similar actions that were labelled `read` but write), so keep it
+     with 0007. An action nobody has audited can still carry a wrong label.
+   - **It keys on the connection name.** Connecting the same account again under another name gives a writable
+     connection, so restrict who can add connections (the admin token) if that matters.
+   - **Webhooks created before the connection was marked read-only** can no longer be renewed or deactivated by
+     callers. Only the admin cancel route (`POST /api/trigger-subscriptions/:id/cancel`) and the maintenance job
+     remove them.
+   - **It does not cap spend.** Billed read actions (LLM calls, embeddings, screenshots) still run.
+   - Matching is exact and case-sensitive. A malformed entry (no `:`, more than one, or an empty side) is ignored
+     and logged once as a warning at startup. Unset or empty changes nothing. Changing the variable takes effect on
+     the next request after deploy.
 
 1. **Least privilege at the provider (recommended).** Each workspace has its own Notion integration or Slack app,
    so give the read-only one fewer rights. The provider then refuses writes itself, whatever SplitMind allows.

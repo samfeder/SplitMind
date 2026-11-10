@@ -1,0 +1,387 @@
+SplitMind patch 0008 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md, section "Mislabelled actions" (#31).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 438349dc83c07fe5c10ec53ecc62ab54636090b2 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 10 Nov 2026 17:01:25 -0500
+Subject: [PATCH] fix(catalog): label actions that write as write or
+ destructive
+
+Read-only connections, and the read-only MCP consent grants, trust each
+action's operationType. These actions were labelled read although they
+mutate state, sign write or delete URLs, consume one-time state, or may
+leave files in the account:
+
+destructive: aws_s3.generate_presigned_url, aliyun_oss.generate_presigned_url
+(both can sign a DELETE).
+
+write: cloudflare_r2.generate_presigned_url, tailscale.rotate_webhook_secret,
+pinata.pin_by_cid, keygen.ping_machine, keygen.ping_process,
+mailgun.verify_domain, vercel.verify_project_domain, msg91.verify_otp,
+myotp_app.verify_otp, fusion-api.file_upload_generate_presigned_url and
+..._urls, harpa_ai.run_ai_prompt, and fuxin.create_pdf_from_document,
+create_pdf_from_html, merge_documents, remove_password_from_document.
+The last few are uncertain, so they fail closed.
+
+Billed but non-mutating actions (LLM completions, embeddings, screenshots)
+stay read. Adds a catalog test for every label and Worker tests that a
+read-only aws_s3 connection refuses a presigned URL.
+---
+ src/providers/aliyun_oss/actions.ts           |  2 +-
+ src/providers/aws_s3/actions.ts               |  2 +-
+ src/providers/catalog-write-labels.test.ts    | 72 +++++++++++++++++++
+ src/providers/cloudflare_r2/actions.ts        |  2 +-
+ src/providers/fusion-api/operations.ts        |  4 +-
+ src/providers/fuxin/actions.ts                |  8 +--
+ src/providers/harpa_ai/actions.ts             |  2 +-
+ src/providers/keygen/actions.ts               |  4 +-
+ src/providers/mailgun/actions.ts              |  2 +-
+ src/providers/msg91/actions.ts                |  2 +-
+ src/providers/myotp_app/actions.ts            |  2 +-
+ src/providers/pinata/actions.ts               |  2 +-
+ src/providers/tailscale/operations.ts         |  2 +-
+ src/providers/vercel/actions.ts               |  2 +-
+ .../cloudflare-read-only-connections.test.ts  | 34 +++++++++
+ 15 files changed, 124 insertions(+), 18 deletions(-)
+ create mode 100644 src/providers/catalog-write-labels.test.ts
+
+diff --git a/src/providers/aliyun_oss/actions.ts b/src/providers/aliyun_oss/actions.ts
+index f6281fbf..c0b396ce 100644
+--- a/src/providers/aliyun_oss/actions.ts
++++ b/src/providers/aliyun_oss/actions.ts
+@@ -224,7 +224,7 @@ export const aliyunOssActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "generate_presigned_url",
+-    operationType: "read",
++    operationType: "destructive",
+     description: "Generate a pre-signed OSS URL for reading, uploading, or deleting one object.",
+     inputSchema: s.object(
+       "The input payload for this action.",
+diff --git a/src/providers/aws_s3/actions.ts b/src/providers/aws_s3/actions.ts
+index 40417ec3..54e5fb07 100644
+--- a/src/providers/aws_s3/actions.ts
++++ b/src/providers/aws_s3/actions.ts
+@@ -228,7 +228,7 @@ export const awsActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "generate_presigned_url",
+-    operationType: "read",
++    operationType: "destructive",
+     description: "Generate a pre-signed S3 URL for reading, uploading, or deleting one object.",
+     inputSchema: s.object(
+       "The input payload for this action.",
+diff --git a/src/providers/catalog-write-labels.test.ts b/src/providers/catalog-write-labels.test.ts
+new file mode 100644
+index 00000000..3707fa36
+--- /dev/null
++++ b/src/providers/catalog-write-labels.test.ts
+@@ -0,0 +1,72 @@
++import type { ProviderDefinition } from "../core/types.ts";
++
++import { describe, expect, it } from "vitest";
++
++/**
++ * Read-only connections (and the read-only consent grants) trust each action's `operationType`. These actions
++ * were labelled `read` although they mutate, sign write or delete URLs, consume one-time state, or may leave
++ * files behind in the account, so a read-only connection would have let them through. Labels are read from the
++ * provider definitions, the same objects the catalog is generated from.
++ *
++ * Each expected value is a literal from the revision-2 review list, not derived from the code under test.
++ */
++
++const definitions: Record<string, () => Promise<{ provider: ProviderDefinition }>> = {
++  aws_s3: () => import("./aws_s3/definition.ts"),
++  aliyun_oss: () => import("./aliyun_oss/definition.ts"),
++  cloudflare_r2: () => import("./cloudflare_r2/definition.ts"),
++  tailscale: () => import("./tailscale/definition.ts"),
++  pinata: () => import("./pinata/definition.ts"),
++  keygen: () => import("./keygen/definition.ts"),
++  mailgun: () => import("./mailgun/definition.ts"),
++  vercel: () => import("./vercel/definition.ts"),
++  msg91: () => import("./msg91/definition.ts"),
++  myotp_app: () => import("./myotp_app/definition.ts"),
++  "fusion-api": () => import("./fusion-api/definition.ts"),
++  harpa_ai: () => import("./harpa_ai/definition.ts"),
++  fuxin: () => import("./fuxin/definition.ts"),
++};
++
++const expected: [actionId: string, operationType: "write" | "destructive"][] = [
++  // Presigned URLs that can be used for DELETE.
++  ["aws_s3.generate_presigned_url", "destructive"],
++  ["aliyun_oss.generate_presigned_url", "destructive"],
++  // Presigned URLs for PUT, and calls that change provider state.
++  ["cloudflare_r2.generate_presigned_url", "write"],
++  ["tailscale.rotate_webhook_secret", "write"],
++  ["pinata.pin_by_cid", "write"],
++  ["keygen.ping_machine", "write"],
++  ["keygen.ping_process", "write"],
++  ["mailgun.verify_domain", "write"],
++  ["vercel.verify_project_domain", "write"],
++  ["msg91.verify_otp", "write"],
++  ["myotp_app.verify_otp", "write"],
++  // Uncertain ones fail closed.
++  ["fusion-api.file_upload_generate_presigned_url", "write"],
++  ["fusion-api.file_upload_generate_presigned_urls", "write"],
++  ["harpa_ai.run_ai_prompt", "write"],
++  ["fuxin.create_pdf_from_document", "write"],
++  ["fuxin.create_pdf_from_html", "write"],
++  ["fuxin.merge_documents", "write"],
++  ["fuxin.remove_password_from_document", "write"],
++];
++
++async function labelOf(actionId: string): Promise<string | undefined> {
++  const service = actionId.slice(0, actionId.indexOf("."));
++  const load = definitions[service];
++  if (!load) throw new Error(`no definition loader for ${service}`);
++  const { provider } = await load();
++  return provider.actions.find((action) => action.id === actionId)?.operationType;
++}
++
++describe("catalog labels for actions that write", () => {
++  it("lists every service the review named", () => {
++    expect(new Set(expected.map(([id]) => id.slice(0, id.indexOf("."))))).toEqual(new Set(Object.keys(definitions)));
++  });
++
++  it.each(expected)("%s exists and is labelled %s", async (actionId, operationType) => {
++    const label = await labelOf(actionId);
++    expect(label, `${actionId} must exist in the catalog with an operationType`).toBeDefined();
++    expect(label).toBe(operationType);
++  });
++});
+diff --git a/src/providers/cloudflare_r2/actions.ts b/src/providers/cloudflare_r2/actions.ts
+index d926dc55..b3abf941 100644
+--- a/src/providers/cloudflare_r2/actions.ts
++++ b/src/providers/cloudflare_r2/actions.ts
+@@ -355,7 +355,7 @@ const cloudflareR2CoreActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "generate_presigned_url",
+-    operationType: "read",
++    operationType: "write",
+     description:
+       "Generate a pre-signed R2 URL for a single GET, PUT, or HEAD request so the caller transfers bytes directly with R2. Preferred over the put_object and download_object relays. Requires a custom API token credential; OAuth connections cannot mint R2 S3 signatures.",
+     requiredScopes: [r2ReadScope, r2WriteScope],
+diff --git a/src/providers/fusion-api/operations.ts b/src/providers/fusion-api/operations.ts
+index 39567cff..1ffe66d1 100644
+--- a/src/providers/fusion-api/operations.ts
++++ b/src/providers/fusion-api/operations.ts
+@@ -988,7 +988,7 @@ export const fusionApiOperations: FusionApiOperation[] = [
+   },
+   {
+     actionName: "file_upload_generate_presigned_url",
+-    operationType: "read",
++    operationType: "write",
+     method: "POST",
+     path: "/v1/file-upload/action/generate-presigned-url",
+     tag: "file-upload",
+@@ -1012,7 +1012,7 @@ export const fusionApiOperations: FusionApiOperation[] = [
+   },
+   {
+     actionName: "file_upload_generate_presigned_urls",
+-    operationType: "read",
++    operationType: "write",
+     method: "POST",
+     path: "/v1/file-upload/action/generate-presigned-urls",
+     tag: "file-upload",
+diff --git a/src/providers/fuxin/actions.ts b/src/providers/fuxin/actions.ts
+index 89b94928..d98baef5 100644
+--- a/src/providers/fuxin/actions.ts
++++ b/src/providers/fuxin/actions.ts
+@@ -479,14 +479,14 @@ export const fuxinActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "create_pdf_from_document",
+-    operationType: "read",
++    operationType: "write",
+     description: "Create a PDF from a Word, Excel, PowerPoint, image, or text source in Foxit.",
+     inputSchema: createPdfFromDocumentInputSchema,
+     outputSchema: taskSubmissionSchema,
+   }),
+   defineProviderAction(service, {
+     name: "create_pdf_from_html",
+-    operationType: "read",
++    operationType: "write",
+     description: "Create a PDF from HTML content, an HTML file, or a webpage URL in Foxit.",
+     inputSchema: createPdfFromHtmlInputSchema,
+     outputSchema: taskSubmissionSchema,
+@@ -521,7 +521,7 @@ export const fuxinActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "merge_documents",
+-    operationType: "read",
++    operationType: "write",
+     description: "Merge multiple PDF documents into a single PDF with Foxit.",
+     inputSchema: mergeDocumentsInputSchema,
+     outputSchema: taskSubmissionSchema,
+@@ -542,7 +542,7 @@ export const fuxinActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "remove_password_from_document",
+-    operationType: "read",
++    operationType: "write",
+     description: "Remove the password from one protected PDF with Foxit.",
+     inputSchema: removePasswordDocumentInputSchema,
+     outputSchema: taskSubmissionSchema,
+diff --git a/src/providers/harpa_ai/actions.ts b/src/providers/harpa_ai/actions.ts
+index e8207a4c..9ceb6936 100644
+--- a/src/providers/harpa_ai/actions.ts
++++ b/src/providers/harpa_ai/actions.ts
+@@ -98,7 +98,7 @@ export const harpaAiActions: ProviderActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "run_ai_prompt",
+-    operationType: "read",
++    operationType: "write",
+     description: "Run an AI prompt, optionally with a web page as context, in a connected HARPA browser node.",
+     inputSchema: s.object(
+       "The AI prompt and optional browser context to run through HARPA GRID.",
+diff --git a/src/providers/keygen/actions.ts b/src/providers/keygen/actions.ts
+index d54f9821..66ed07ed 100644
+--- a/src/providers/keygen/actions.ts
++++ b/src/providers/keygen/actions.ts
+@@ -673,7 +673,7 @@ export const keygenActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "ping_machine",
+-    operationType: "read",
++    operationType: "write",
+     description: "Ping a Keygen machine heartbeat.",
+     requiredScopes: [],
+     inputSchema: idInputSchema("machine"),
+@@ -793,7 +793,7 @@ export const keygenActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "ping_process",
+-    operationType: "read",
++    operationType: "write",
+     description: "Ping a Keygen process heartbeat.",
+     requiredScopes: [],
+     inputSchema: idInputSchema("process"),
+diff --git a/src/providers/mailgun/actions.ts b/src/providers/mailgun/actions.ts
+index 2fd2951d..a047c830 100644
+--- a/src/providers/mailgun/actions.ts
++++ b/src/providers/mailgun/actions.ts
+@@ -405,7 +405,7 @@ export const mailgunActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "verify_domain",
+-    operationType: "read",
++    operationType: "write",
+     description: "Ask Mailgun to verify DNS records for a sending domain.",
+     inputSchema: domainInputSchema,
+     outputSchema: genericMessageOutputSchema,
+diff --git a/src/providers/msg91/actions.ts b/src/providers/msg91/actions.ts
+index c3a638ba..75e7698a 100644
+--- a/src/providers/msg91/actions.ts
++++ b/src/providers/msg91/actions.ts
+@@ -122,7 +122,7 @@ export const msg91Actions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "verify_otp",
+-    operationType: "read",
++    operationType: "write",
+     description: "Verify an OTP previously sent through MSG91.",
+     inputSchema: s.actionInput(
+       {
+diff --git a/src/providers/myotp_app/actions.ts b/src/providers/myotp_app/actions.ts
+index ab3cb510..0a9043db 100644
+--- a/src/providers/myotp_app/actions.ts
++++ b/src/providers/myotp_app/actions.ts
+@@ -94,7 +94,7 @@ export const myOtpAppActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "verify_otp",
+-    operationType: "read",
++    operationType: "write",
+     description: "Verify an OTP using its message id or destination phone number.",
+     requiredScopes: [],
+     inputSchema: s.object(
+diff --git a/src/providers/pinata/actions.ts b/src/providers/pinata/actions.ts
+index e03d7a87..faf71ac7 100644
+--- a/src/providers/pinata/actions.ts
++++ b/src/providers/pinata/actions.ts
+@@ -211,7 +211,7 @@ export const pinataActions: readonly ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "pin_by_cid",
+-    operationType: "read",
++    operationType: "write",
+     description: "Ask Pinata to pin an existing public IPFS CID.",
+     requiredScopes: ["org:files:write"],
+     followUpActions: ["pinata.query_pin_requests"],
+diff --git a/src/providers/tailscale/operations.ts b/src/providers/tailscale/operations.ts
+index 9febc359..0f5b7bf5 100644
+--- a/src/providers/tailscale/operations.ts
++++ b/src/providers/tailscale/operations.ts
+@@ -1200,7 +1200,7 @@ export const tailscaleOperations: readonly TailscaleOperationDefinition[] = [
+   },
+   {
+     name: "rotate_webhook_secret",
+-    operationType: "read",
++    operationType: "write",
+     description: "Rotate a webhook signing secret and return the new secret once.",
+     method: "POST",
+     path: "/webhooks/{endpointId}/rotate",
+diff --git a/src/providers/vercel/actions.ts b/src/providers/vercel/actions.ts
+index 8d5d260b..798d3f7e 100644
+--- a/src/providers/vercel/actions.ts
++++ b/src/providers/vercel/actions.ts
+@@ -362,7 +362,7 @@ const actionSources: readonly VercelActionSource[] = [
+   },
+   {
+     name: "verify_project_domain",
+-    operationType: "read",
++    operationType: "write",
+     description: "Verify a Vercel project domain.",
+     inputSchema: input({ idOrName: projectIdOrName, domain: s.nonEmptyString("Domain name.") }, ["idOrName", "domain"]),
+     outputSchema: s.object({ domain }, { required: ["domain"] }),
+diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
+index 632607b7..271b8164 100644
+--- a/src/server/cloudflare-read-only-connections.test.ts
++++ b/src/server/cloudflare-read-only-connections.test.ts
+@@ -838,6 +838,40 @@ describe("read-only connections: Triggers", () => {
+   });
+ });
+ 
++describe("read-only connections: a presigned URL is not a read (catalog label)", () => {
++  // aws_s3.generate_presigned_url can sign a DELETE or PUT, so the catalog must label it `destructive`.
++  // Presigning is local, so the observable fact is the refusal itself, not a provider call.
++  const presign = {
++    actionId: "aws_s3.generate_presigned_url",
++    input: { bucket: "my-bucket", objectKey: "k", method: "DELETE" },
++  };
++
++  it("is refused through MCP on a read-only aws_s3 connection", async () => {
++    const site = await boot({ readOnly: "aws_s3:a", connections: [], awsConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...presign, connectionName: "a" });
++
++    expect(result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    expect(String((result.error as { message: string }).message)).toContain('"aws_s3:a"');
++  });
++
++  it("is refused through the HTTP execute API on a read-only aws_s3 connection", async () => {
++    const site = await boot({ readOnly: "aws_s3:a", connections: [], awsConnections: ["a", "b"] });
++    const token = await site.createRuntimeToken(["aws_s3.*"]);
++    const response = await site.httpExecute(token, presign.actionId, presign.input, { connectionName: "a" });
++
++    expect(response.status).toBe(400);
++    await expect(response.json()).resolves.toMatchObject({ success: false, errorCode: "action_blocked" });
++  });
++
++  it("still runs on an aws_s3 connection that is not read-only and returns a signed URL", async () => {
++    const site = await boot({ readOnly: "aws_s3:a", connections: [], awsConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...presign, connectionName: "b" });
++
++    expect(result.ok).toBe(true);
++    expect((result.data as { url: string }).url).toContain("my-bucket");
++  });
++});
++
+ // ---------------------------------------------------------------------------------------------------------------------
+ // Harness
+ // ---------------------------------------------------------------------------------------------------------------------
+-- 
+2.34.1
+
