@@ -2,7 +2,7 @@ SplitMind patch 0009 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: none yet (directive #126).
 Replace this line with the upstream issue or pull request link once it exists.
 
-From cfc1f08718d79c8344e2ff9651ed396e4608ae2c Mon Sep 17 00:00:00 2001
+From 8e03107b199e36b2c3949d18e6e7d712b8055aba Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
 Date: Wed, 11 Nov 2026 08:26:34 -0500
 Subject: [PATCH] feat(email-watch): opt-in Gmail watch on the Worker cron,
@@ -64,9 +64,11 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/server/email-watch/watch-runner.ts        |  45 +
  src/server/email-watch/watcher.test.ts        | 939 ++++++++++++++++++
  src/server/email-watch/watcher.ts             | 506 ++++++++++
+ .../storage/postgres/runtime-store.test.ts    |   2 +
  src/server/storage/runtime-store.ts           |   2 +-
+ .../storage/sqlite/runtime-store.test.ts      |   1 +
  web/src/model.ts                              |   2 +-
- 30 files changed, 4583 insertions(+), 22 deletions(-)
+ 32 files changed, 4586 insertions(+), 22 deletions(-)
  create mode 100644 migrations/0019_email_watch.sql
  create mode 100644 migrations/postgresql/0019_email_watch.sql
  create mode 100644 src/providers/gmail/executors.metadata-headers.test.ts
@@ -4982,6 +4984,26 @@ index 00000000..5600ebd5
 +  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
 +  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 +}
+diff --git a/src/server/storage/postgres/runtime-store.test.ts b/src/server/storage/postgres/runtime-store.test.ts
+index 9809da2a..8802004c 100644
+--- a/src/server/storage/postgres/runtime-store.test.ts
++++ b/src/server/storage/postgres/runtime-store.test.ts
+@@ -165,6 +165,7 @@ describe("PostgreSQL migrations with PGlite", () => {
+           { name: "0016_trigger_policy.sql" },
+           { name: "0017_trigger_subscriptions.sql" },
+           { name: "0018_connection_retirement.sql" },
++          { name: "0019_email_watch.sql" },
+         ],
+       });
+ 
+@@ -228,6 +229,7 @@ describe("PostgreSQL migrations with a custom migration source", () => {
+           { name: "0016_trigger_policy.sql" },
+           { name: "0017_trigger_subscriptions.sql" },
+           { name: "0018_connection_retirement.sql" },
++          { name: "0019_email_watch.sql" },
+           { name: "9998_custom.sql" },
+         ],
+       });
 diff --git a/src/server/storage/runtime-store.ts b/src/server/storage/runtime-store.ts
 index 755b07be..f3ef0d65 100644
 --- a/src/server/storage/runtime-store.ts
@@ -4995,6 +5017,18 @@ index 755b07be..f3ef0d65 100644
  
  /**
   * One recent action run shown by the local runtime.
+diff --git a/src/server/storage/sqlite/runtime-store.test.ts b/src/server/storage/sqlite/runtime-store.test.ts
+index 8c5ecf13..06140d97 100644
+--- a/src/server/storage/sqlite/runtime-store.test.ts
++++ b/src/server/storage/sqlite/runtime-store.test.ts
+@@ -61,6 +61,7 @@ describe("SqliteRuntimeDatabase", () => {
+       "0016_trigger_policy.sql",
+       "0017_trigger_subscriptions.sql",
+       "0018_connection_retirement.sql",
++      "0019_email_watch.sql",
+     ];
+     expect(entries.filter((entry) => entry.message === "sqlite migration started")).toEqual(
+       migrations.map((migration) => ({ fields: { migration }, message: "sqlite migration started" })),
 diff --git a/web/src/model.ts b/web/src/model.ts
 index 34fec42d..9cb9e343 100644
 --- a/web/src/model.ts
