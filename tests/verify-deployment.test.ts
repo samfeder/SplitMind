@@ -11,7 +11,7 @@ import { cleanPastedSecret } from "../scripts/verify-deployment.ts";
 const script = resolve(import.meta.dirname, "../scripts/verify-deployment.ts");
 const ADMIN = "test-admin-token";
 const RUNTIME = "test-runtime-token";
-const OFFERED = ["slack", "gmail", "notion", "netlify", "cloudflare_dns", "cloudflare_worker"];
+const OFFERED = ["slack", "gmail", "notion", "netlify", "cloudflare_dns", "cloudflare_worker", "mail_watch"];
 
 interface Behaviour {
   proxyOpen: boolean;
@@ -126,13 +126,13 @@ describe("scripts/verify-deployment.ts", () => {
 
     expect(result.stdout).toContain("PASS  raw notion proxy is blocked by deployment policy  (403 proxy_blocked)");
     expect(result.stdout).toContain("PASS  raw gmail proxy is blocked by deployment policy  (403 proxy_blocked)");
-    expect(result.stdout).toContain("PASS  only cloudflare_dns, cloudflare_worker, gmail, netlify, notion and slack are offered  (200 [cloudflare_dns, cloudflare_worker, gmail, netlify, notion, slack])",);
+    expect(result.stdout).toContain("PASS  only cloudflare_dns, cloudflare_worker, gmail, mail_watch, netlify, notion and slack are offered  (200 [cloudflare_dns, cloudflare_worker, gmail, mail_watch, netlify, notion, slack])",);
     expect(result.stdout).toContain("PASS  the 5 blocked action(s) are refused by policy  (gmail.stop_watch=400 action_blocked, ");
     expect(result.stdout).toContain("PASS  no default gmail connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  a client with a non-Claude redirect URI can't register  (400 invalid_client_metadata)");
-    expect(result.stdout).toContain("All 24 checks passed.");
+    expect(result.stdout).toContain("All 25 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -161,7 +161,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("6 of 24 checks failed.");
+    expect(result.stdout).toContain("7 of 25 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });

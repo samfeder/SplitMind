@@ -58,7 +58,7 @@ export async function copyCatalogAssets({ sourceDir, targetDir }) {
 }
 `;
 
-const GENERATE = `node -e "const fs=require('fs');fs.mkdirSync('catalog/apps',{recursive:true});for(const s of ['github','gmail','notion','slack','netlify','cloudflare_dns','cloudflare_worker'])fs.writeFileSync('catalog/apps/'+s+'.json','{}')"`;
+const GENERATE = `node -e "const fs=require('fs');fs.mkdirSync('catalog/apps',{recursive:true});for(const s of ['github','gmail','notion','slack','netlify','cloudflare_dns','cloudflare_worker','mail_watch'])fs.writeFileSync('catalog/apps/'+s+'.json','{}')"`;
 
 interface FakeAccount {
   calls: string[];
@@ -174,7 +174,7 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(rendered).toContain('"upload_source_maps": false');
     // gmail.* is allowed, but not the mailbox-settings writes.
     expect(rendered).toContain(
-      '"OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,netlify.*,cloudflare_dns.*,cloudflare_worker.*"',
+      '"OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,netlify.*,cloudflare_dns.*,cloudflare_worker.*,mail_watch.*"',
     );
     expect(rendered).toContain('"OOMOL_CONNECT_BLOCKED_ACTIONS": "gmail.update_vacation_settings,');
     // Only Claude's callbacks may finish MCP OAuth (#77).
@@ -188,11 +188,41 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
         "cloudflare_dns.json",
         "cloudflare_worker.json",
         "gmail.json",
+        "mail_watch.json",
         "netlify.json",
         "notion.json",
         "slack.json",
       ],
     });
+  });
+
+  it("leaves the email watch off: neither variable is in the template or the rendered config (patch 0009)", () => {
+    deploy();
+
+    const rendered = readFileSync(join(engine, "wrangler.local.jsonc"), "utf8");
+    const template = readFileSync(join(repo, "wrangler.template.jsonc"), "utf8");
+    for (const name of ["OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS", "OOMOL_CONNECT_EMAIL_WATCH_INTERVAL_MINUTES"]) {
+      expect(rendered).not.toContain(name);
+      // Not even as a commented-out example: Sam names the connections and the chief approves, in a later change.
+      expect(template).not.toContain(name);
+    }
+    expect(rendered).not.toContain("EMAIL_WATCH");
+    // The Worker's cron already fires every minute; the watch rides on it and adds no second trigger.
+    expect(rendered).toContain('"crons": ["* * * * *"]');
+  });
+
+  it("allows the mail_watch actions, or the list and acknowledge actions would be refused and left out of the catalog (patch 0009)", () => {
+    deploy();
+
+    const rendered = readFileSync(join(engine, "wrangler.local.jsonc"), "utf8");
+    const allowed = rendered.match(/"OOMOL_CONNECT_ALLOWED_ACTIONS": "([^"]*)"/)![1]!.split(",");
+    expect(allowed).toContain("mail_watch.*");
+    // The watcher's own Gmail reads stay inside gmail.* and the blocked list does not name them.
+    expect(allowed).toContain("gmail.*");
+    const blocked = rendered.match(/"OOMOL_CONNECT_BLOCKED_ACTIONS": "([^"]*)"/)![1]!.split(",");
+    for (const action of ["gmail.get_profile", "gmail.list_history", "gmail.fetch_message_by_message_id"]) {
+      expect(blocked).not.toContain(action);
+    }
   });
 
   it("sets missing secrets from the environment without printing them", () => {

@@ -75,7 +75,7 @@
     // cloudflare_dns and cloudflare_worker. Netlify and Cloudflare connect by API token (docs/providers/netlify.md,
     // docs/providers/cloudflare.md), so they need no OAuth app.
     "OOMOL_CONNECT_BLOCKED_PROXIES": "*",
-    "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,netlify.*,cloudflare_dns.*,cloudflare_worker.*",
+    "OOMOL_CONNECT_ALLOWED_ACTIONS": "notion.*,slack.*,gmail.*,netlify.*,cloudflare_dns.*,cloudflare_worker.*,mail_watch.*",
     // Gmail mailbox settings Claude has no reason to change: the vacation responder (it mails everyone who
     // writes), IMAP/POP access, display language, and stopping a push watch. Filters stay allowed
     // (docs/providers/gmail.md).

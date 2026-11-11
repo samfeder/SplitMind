@@ -58,7 +58,7 @@ Set in [`wrangler.template.jsonc`](../wrangler.template.jsonc):
 | Setting | Value | Effect |
 |---|---|---|
 | `OOMOL_CONNECT_BLOCKED_PROXIES` | `*` | No raw provider API calls (`/v1/proxy/:service`), whatever a token is granted. Refusal: `403 proxy_blocked`. |
-| `OOMOL_CONNECT_ALLOWED_ACTIONS` | `notion.*,slack.*,gmail.*` | Only Notion, Slack and Gmail actions run. Another provider's action: `400 action_not_allowed`. |
+| `OOMOL_CONNECT_ALLOWED_ACTIONS` | `notion.*,slack.*,gmail.*` (the template also lists Netlify, Cloudflare and `mail_watch.*`) | Only those providers' actions run. Another provider's action: `400 action_not_allowed`. |
 | `OOMOL_CONNECT_BLOCKED_ACTIONS` | five Gmail settings writes | Vacation responder, IMAP, POP, language and `stop_watch` are refused on every account: `400 action_blocked` ([why](providers/gmail.md#what-splitmind-uses)). |
 | Catalog assets | Notion, Slack and Gmail only | Other providers are not even listed; their actions return `404 unknown_action`. |
 
@@ -128,7 +128,7 @@ Every action call through HTTP, MCP or the Web Console is recorded in the D1 dat
     "https://<your-worker>.workers.dev/api/runs/<run-id>"
   ```
 
-  Filters: `limit` (1–100, default 50), `service`, `actionId`, `caller` (`http`, `mcp`, `web`), `ok` (`true`,
+  Filters: `limit` (1–100, default 50), `service`, `actionId`, `caller` (`http`, `mcp`, `web`, `cron`), `ok` (`true`,
   `false`), and `cursor` (from `nextCursor`) for the next page.
 
 **What an entry shows** (a real entry from a local Worker; ids shortened):
@@ -198,3 +198,81 @@ Until then, pick one of these:
    connector with the same URL, so "read-only on `<alias-a>`, writes on `<alias-b>`" still needs option 1.
 4. **Deployment-wide:** put explicit read action ids in `OOMOL_CONNECT_ALLOWED_ACTIONS` instead of `slack.*`.
    That makes the provider read-only for every account.
+
+## 6. Email watch (patch 0009, #126)
+
+The Worker's existing once-a-minute cron can check named Gmail accounts for new inbox mail and keep a short list of
+machine mail that needs action: a failed deploy or build, a GitHub failure or review request, a billing or quota
+warning, an account or security notice. A read action lists them and a write action marks them handled. It is **off
+by default**; neither setting below is in `wrangler.template.jsonc`.
+
+**What it reads.** Only three Gmail reads, hard-coded in the watcher (any other action is refused before it reaches
+the action runner): `gmail.get_profile` (once per account, for the starting point), `gmail.list_history` (new inbox
+messages since the last check; drafts, sent mail, spam and trash are skipped) and `gmail.fetch_message_by_message_id`
+with `format: "metadata"` and five named headers: `From`, `Subject`, `Authentication-Results`, `X-GitHub-Reason`
+and `List-Id`. It never asks for a body, a snippet, recipients, labels or attachments. Every call goes through the
+normal action runner, so `OOMOL_CONNECT_ALLOWED_ACTIONS`, `OOMOL_CONNECT_BLOCKED_ACTIONS` and the runtime policy
+apply: an account whose policy refuses one of the three is skipped for that run. Do not put those three actions in
+`OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 15 Gmail action runs (each can cost two subrequests on Workers Free, which allows 50); more mail than that is read over the next
+minutes.
+
+**What it stores.** Two D1 tables (migration `0019_email_watch.sql`):
+
+- `email_watch_cursors`: per account, the Gmail history id it has read up to, a page token while it is part-way
+  through a backlog, the last run time and a catch-up flag.
+- `email_watch_items`: one row per kept message: the account alias, Gmail's message and thread ids, the sender's
+  **domain** (not the address), the subject (control characters removed, at most 200 characters), the category and
+  rule id, the received time, status (`pending` or `acknowledged`) and a duplicate key. The same alert in the same
+  or another account within 24 hours counts on the first row (`occurrences`) instead of adding a row.
+
+Mail that matches no rule writes nothing. Full addresses, recipients, snippets, bodies, labels and other header
+values are never stored. If Gmail has dropped the history the watcher was reading (after about a week without a
+check), it restarts from the mailbox's current position and adds one `watch_gap` item saying which period was not
+checked.
+
+**Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
+pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
+matches, in that order, wins. GitHub items depend on the `X-GitHub-Reason` header (`review_requested`,
+`security_alert`, or `ci_activity` with a failing subject), never on the subject alone, because issue and pull
+request titles are written by anyone. Mail from github.com that carries that header is judged by the GitHub rule
+only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
+
+**Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
+contain a verification code. Treat `email_watch_items` like the run log: private, and kept only for the retention
+period below.
+
+**Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
+message has the authserv-id `mx.google.com` (Gmail's own mail server stamps it, above anything the sender wrote), says
+`dmarc=pass`, and its `header.from` equals the domain of the `From` address. Later `Authentication-Results` headers
+and `ARC-*` headers are ignored, because a sender can write those. A message with no such header, a failed or
+missing DMARC result, or a `header.from` for another domain stores nothing, so mail that only claims to be from a
+rule domain does not appear in the list.
+
+**Logs.** Watcher log lines carry only the account alias, counts, rule ids, categories and error codes: never a
+subject, an address, a header value or a Gmail id. Its run-log entries (Runs page, `caller` = `cron`) record the
+outcome and policy decision but no `inputSummary` or `outputSummary`, so nothing from a message reaches the run log,
+unlike the rows in section 4.
+
+**Retention.** Once a day, on the first watch run after 00:00 UTC, `pending` items older than 14 days and
+`acknowledged` items older than 7 days are deleted. Cursors stay.
+
+**Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)
+returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
+profile (the address is not copied into the new tables). `mail_watch.acknowledge_mail` (write; 1–100 item ids) marks
+items acknowledged and writes only to `email_watch_items`. A read-only MCP grant (patch 0004) gets the list action and
+not the acknowledge action. A token or grant scoped to chosen accounts (patch 0004) sees and
+acknowledges only the items of those Gmail accounts, `watch_gap` items included; an unscoped one sees all. With the watch off both return `enabled: false` / `acknowledged: 0` and touch nothing.
+
+**Turning it on** is a deliberate step, not part of `npm run deploy`:
+
+1. Sam names the accounts, and the chief approves the list.
+2. In the Cloudflare dashboard (or a local, uncommitted wrangler config) set
+   `OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS="gmail:<alias-a>,gmail:<alias-b>"`. Entries for another provider or
+   without an alias are ignored with one warning. `OOMOL_CONNECT_EMAIL_WATCH_INTERVAL_MINUTES` (1 to 60, default 10)
+   is how often it runs. The rendered config does not name them, and Wrangler replaces
+   variables that exist only in the dashboard when it deploys, so confirm they are still set after each
+   `npm run deploy`; if they are gone the watch is simply off.
+3. Check **Runs**: `caller=cron` rows for `gmail.get_profile` mean the first pass worked. The first pass reads
+   nothing from the past; only mail that arrives afterwards is checked.
+
+**CPU.** On Workers Free each invocation has 10 ms of CPU. Measurements for this patch are in the pull request.
