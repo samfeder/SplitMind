@@ -232,7 +232,14 @@ checked.
 
 **Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
 pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
-matches, in that order, wins.
+matches, in that order, wins. GitHub items depend on the `X-GitHub-Reason` header (`review_requested`,
+`security_alert`, or `ci_activity` with a failing subject), never on the subject alone, because issue and pull
+request titles are written by anyone. Mail from github.com that carries that header is judged by the GitHub rule
+only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
+
+**Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
+contain a verification code. Treat `email_watch_items` like the run log: private, and kept only for the retention
+period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
 message has the authserv-id `mx.google.com` (Gmail's own mail server stamps it, above anything the sender wrote), says
@@ -253,7 +260,8 @@ unlike the rows in section 4.
 returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
 profile (the address is not copied into the new tables). `mail_watch.acknowledge_mail` (write; 1–100 item ids) marks
 items acknowledged and writes only to `email_watch_items`. A read-only MCP grant (patch 0004) gets the list action and
-not the acknowledge action. With the watch off both return `enabled: false` / `acknowledged: 0` and touch nothing.
+not the acknowledge action. A token or grant scoped to chosen accounts (patch 0004) sees and
+acknowledges only the items of those Gmail accounts, `watch_gap` items included; an unscoped one sees all. With the watch off both return `enabled: false` / `acknowledged: 0` and touch nothing.
 
 **Turning it on** is a deliberate step, not part of `npm run deploy`:
 

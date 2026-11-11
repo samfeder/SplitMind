@@ -2,7 +2,7 @@ SplitMind patch 0009 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: none yet (directive #126).
 Replace this line with the upstream issue or pull request link once it exists.
 
-From ac19de5dc036294d2600196718b310dbc6351bea Mon Sep 17 00:00:00 2001
+From 95a524abd47de107567225cfbf005f2ed8f350af Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
 Date: Wed, 11 Nov 2026 08:26:34 -0500
 Subject: [PATCH] feat(email-watch): opt-in Gmail watch on the Worker cron,
@@ -24,11 +24,15 @@ Unset, the cron makes no D1 query and no Gmail call for the watch.
   mx.google.com with dmarc=pass and header.from equal to the From domain.
 - RunActionInput.audit "outcome" records a run row with no input or output
   summary; the watcher uses it, under a new "cron" run-log caller.
-- At most 30 Gmail action runs per invocation, a per-connection cursor updated
+- At most 15 Gmail action runs per invocation (each costs two subrequests), a per-connection cursor updated
   by compare-and-set, catch-up runs off-interval, an expired cursor leaves one
   watch_gap item, and a daily retention sweep.
 - New built-in mail_watch provider (no_auth): list_pending_mail (read) and
   acknowledge_mail (write), bound to the D1 store at app creation.
+- mail_watch honours chosen-account grants: the action runner gives executors an
+  isConnectionAllowed predicate, and list and acknowledge keep only allowed
+  connections' items.
+- GitHub mail is matched only on X-GitHub-Reason, never on a subject alone.
 - Migration 0019_email_watch.sql (D1 and PostgreSQL).
 - The cron builds the smallest runner it needs (catalog, D1 stores, Gmail
   executors, ConnectionService, ActionRunner), not the whole app.
@@ -38,14 +42,15 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
 ---
  migrations/0019_email_watch.sql               |  30 +
  migrations/postgresql/0019_email_watch.sql    |  30 +
+ src/core/types.ts                             |   6 +
  src/providers/gmail/actions.ts                |   8 +-
  .../gmail/executors.metadata-headers.test.ts  | 126 +++
  src/providers/gmail/executors.ts              |  24 +-
  src/providers/mail_watch/actions.ts           |  71 ++
  src/providers/mail_watch/definition.ts        |  18 +
- src/providers/mail_watch/executors.ts         | 114 +++
+ src/providers/mail_watch/executors.ts         | 162 +++
  .../actions/action-runner-audit.test.ts       | 166 +++
- src/server/actions/action-runner.ts           |   9 +-
+ src/server/actions/action-runner.ts           |  23 +-
  src/server/api/openapi.ts                     |   2 +-
  src/server/api/run-log-routes.ts              |   2 +-
  src/server/cloudflare-email-watch.test.ts     | 534 ++++++++++
@@ -56,10 +61,11 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  .../email-watch/fake-gmail-contract.test.ts   | 131 +++
  src/server/email-watch/gmail-access.test.ts   | 141 +++
  src/server/email-watch/gmail-access.ts        |  42 +
- .../email-watch/mail-watch-provider.test.ts   | 304 ++++++
+ .../email-watch/mail-watch-provider.test.ts   | 316 ++++++
+ .../email-watch/mail-watch-scope.test.ts      | 254 +++++
  src/server/email-watch/migration.test.ts      | 153 +++
- src/server/email-watch/rules.test.ts          | 329 ++++++
- src/server/email-watch/rules.ts               | 157 +++
+ src/server/email-watch/rules.test.ts          | 403 ++++++++
+ src/server/email-watch/rules.ts               | 197 ++++
  src/server/email-watch/test-support.ts        | 452 ++++++++
  src/server/email-watch/watch-runner.ts        |  45 +
  src/server/email-watch/watcher.test.ts        | 963 ++++++++++++++++++
@@ -68,7 +74,7 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/server/storage/runtime-store.ts           |   2 +-
  .../storage/sqlite/runtime-store.test.ts      |   1 +
  web/src/model.ts                              |   2 +-
- 32 files changed, 4647 insertions(+), 22 deletions(-)
+ 34 files changed, 5095 insertions(+), 22 deletions(-)
  create mode 100644 migrations/0019_email_watch.sql
  create mode 100644 migrations/postgresql/0019_email_watch.sql
  create mode 100644 src/providers/gmail/executors.metadata-headers.test.ts
@@ -83,6 +89,7 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  create mode 100644 src/server/email-watch/gmail-access.test.ts
  create mode 100644 src/server/email-watch/gmail-access.ts
  create mode 100644 src/server/email-watch/mail-watch-provider.test.ts
+ create mode 100644 src/server/email-watch/mail-watch-scope.test.ts
  create mode 100644 src/server/email-watch/migration.test.ts
  create mode 100644 src/server/email-watch/rules.test.ts
  create mode 100644 src/server/email-watch/rules.ts
@@ -163,6 +170,23 @@ index 00000000..473fd7a4
 +
 +create index email_watch_items_status_received on email_watch_items (status, received_at desc);
 +create index email_watch_items_dedup on email_watch_items (dedup_key, created_at);
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 19e9392b..970be72b 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -388,6 +388,12 @@ export interface ExecutionContext {
+   signal?: AbortSignal;
+   /** Host logger for provider diagnostics, absent when the host supplies none. */
+   logger?: RuntimeLogger;
++  /**
++   * Whether the caller's policy lets it use the Gmail connection with this name. Set by the action runner for every
++   * run; only the mail_watch executors read it, because mail_watch is a no_auth provider and so skips the runner's
++   * own connection check. Absent means every connection is allowed.
++   */
++  isConnectionAllowed?: (connectionName: string) => Promise<boolean>;
+ }
+ 
+ /**
 diff --git a/src/providers/gmail/actions.ts b/src/providers/gmail/actions.ts
 index b62592c0..2118a354 100644
 --- a/src/providers/gmail/actions.ts
@@ -466,12 +490,12 @@ index 00000000..aee1bca8
 +};
 diff --git a/src/providers/mail_watch/executors.ts b/src/providers/mail_watch/executors.ts
 new file mode 100644
-index 00000000..e3073c61
+index 00000000..4f1d911d
 --- /dev/null
 +++ b/src/providers/mail_watch/executors.ts
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,162 @@
 +import type { D1DatabaseBinding } from "../../server/cloudflare/cloudflare-bindings.ts";
-+import type { ProviderExecutors } from "../../core/types.ts";
++import type { ExecutionContext, ProviderExecutors } from "../../core/types.ts";
 +
 +const itemColumns =
 +  "id, connection_name, gmail_message_id, category, rule_id, sender_domain, subject, received_at, occurrences";
@@ -503,7 +527,7 @@ index 00000000..e3073c61
 +export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderExecutors {
 +  const now = deps.now ?? Date.now;
 +  return {
-+    "mail_watch.list_pending_mail": async (input) => {
++    "mail_watch.list_pending_mail": async (input, context) => {
 +      if (!deps.enabled) return { ok: true, output: { enabled: false, items: [] } };
 +      const filters = (input ?? {}) as { category?: string; connectionName?: string; limit?: number };
 +      const clauses = ["status = 'pending'"];
@@ -516,6 +540,11 @@ index 00000000..e3073c61
 +        clauses.push("connection_name = ?");
 +        values.push(filters.connectionName);
 +      }
++      // Connections the caller may not use are filtered out before the limit is applied.
++      const scope = await connectionScope(deps.database, context, clauses, values);
++      if (scope === "none") return { ok: true, output: { enabled: true, items: [] } };
++      clauses.push(...scope.clauses);
++      values.push(...scope.values);
 +      const limit = Math.min(filters.limit ?? defaultLimit, maxLimit);
 +      const { results } = await deps.database
 +        .prepare(
@@ -541,25 +570,39 @@ index 00000000..e3073c61
 +            subject: row.subject,
 +            receivedAt: row.received_at,
 +            occurrences: row.occurrences,
-+            link: gmailLink(emails.get(row.connection_name), row.gmail_message_id),
++            link: gmailLink(emails.get(row.connection_name), row),
 +          })),
 +        },
 +      };
 +    },
-+    "mail_watch.acknowledge_mail": async (input) => {
++    "mail_watch.acknowledge_mail": async (input, context) => {
 +      if (!deps.enabled) return { ok: true, output: { acknowledged: 0 } };
 +      const ids = [...new Set(((input ?? {}) as { ids?: string[] }).ids ?? [])];
 +      if (ids.length === 0) return { ok: true, output: { acknowledged: 0 } };
 +      // D1 allows 100 bound values per statement, so a full list of 100 ids goes in two.
 +      const acknowledgedAt = new Date(now()).toISOString();
++      const allowed = new Map<string, boolean>();
 +      let acknowledged = 0;
 +      for (let start = 0; start < ids.length; start += 50) {
 +        const chunk = ids.slice(start, start + 50);
++        const marks = chunk.map(() => "?").join(", ");
++        const { results } = await deps.database
++          .prepare(`select id, connection_name from email_watch_items where status = 'pending' and id in (${marks})`)
++          .bind(...chunk)
++          .all<{ id: string; connection_name: string }>();
++        const permitted: string[] = [];
++        for (const row of results) {
++          if (!allowed.has(row.connection_name)) {
++            allowed.set(row.connection_name, (await context.isConnectionAllowed?.(row.connection_name)) ?? true);
++          }
++          if (allowed.get(row.connection_name)) permitted.push(row.id);
++        }
++        if (permitted.length === 0) continue;
 +        const result = await deps.database
 +          .prepare(
-+            `update email_watch_items set status = 'acknowledged', acknowledged_at = ? where status = 'pending' and id in (${chunk.map(() => "?").join(", ")})`,
++            `update email_watch_items set status = 'acknowledged', acknowledged_at = ? where status = 'pending' and id in (${permitted.map(() => "?").join(", ")})`,
 +          )
-+          .bind(acknowledgedAt, ...chunk)
++          .bind(acknowledgedAt, ...permitted)
 +          .run();
 +        acknowledged += result.meta.changes ?? 0;
 +      }
@@ -568,10 +611,39 @@ index 00000000..e3073c61
 +  };
 +}
 +
-+function gmailLink(email: string | undefined, messageId: string): string {
++/**
++ * The extra WHERE clause that keeps only the connections the caller may use, or "none" when it may use none of the
++ * connections that have matching items. Without a predicate on the context every connection is allowed.
++ */
++async function connectionScope(
++  database: D1DatabaseBinding,
++  context: ExecutionContext,
++  clauses: string[],
++  values: unknown[],
++): Promise<"none" | { clauses: string[]; values: unknown[] }> {
++  const isAllowed = context.isConnectionAllowed;
++  if (!isAllowed) return { clauses: [], values: [] };
++  const { results } = await database
++    .prepare(`select distinct connection_name from email_watch_items where ${clauses.join(" and ")}`)
++    .bind(...values)
++    .all<{ connection_name: string }>();
++  const allowed: string[] = [];
++  const denied: string[] = [];
++  for (const row of results) (await isAllowed(row.connection_name) ? allowed : denied).push(row.connection_name);
++  if (allowed.length === 0 && results.length > 0) return "none";
++  if (denied.length === 0) return { clauses: [], values: [] };
++  // Bind whichever list is shorter; D1 allows 100 bound values per statement.
++  return allowed.length <= denied.length
++    ? { clauses: [`connection_name in (${allowed.map(() => "?").join(", ")})`], values: allowed }
++    : { clauses: [`connection_name not in (${denied.map(() => "?").join(", ")})`], values: denied };
++}
++
++/** A message link, or for a watch_gap item (which has no message) the inbox. */
++function gmailLink(email: string | undefined, row: ItemRow): string {
++  const place = row.category === "watch_gap" ? "#inbox" : `#all/${row.gmail_message_id}`;
 +  return email
-+    ? `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#all/${messageId}`
-+    : `https://mail.google.com/mail/u/0/#all/${messageId}`;
++    ? `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}${place}`
++    : `https://mail.google.com/mail/u/0/${place}`;
 +}
 +
 +/** The module's default executors are unbound: no store, so the feature reads as off. */
@@ -757,7 +829,7 @@ index 00000000..592c7923
 +  });
 +});
 diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
-index f1c5d13a..a23c7a6f 100644
+index f1c5d13a..bf98aff6 100644
 --- a/src/server/actions/action-runner.ts
 +++ b/src/server/actions/action-runner.ts
 @@ -40,6 +40,11 @@ export interface RunActionInput {
@@ -772,7 +844,15 @@ index f1c5d13a..a23c7a6f 100644
  }
  
  export interface ActionRunResult {
-@@ -238,8 +243,8 @@ export class ActionRunner {
+@@ -185,6 +190,7 @@ export class ActionRunner {
+                 this.createExecutionContext(
+                   resolvedConnection.kind === "local" ? resolvedConnection.getCredential : async () => undefined,
+                   input.signal,
++                  input.policy,
+                 ),
+               ),
+             this.options.providerHttpDispatch,
+@@ -238,8 +244,8 @@ export class ActionRunner {
        connectionProfile: connection?.summary?.profile,
        runtimeTokenId: input.runtimeTokenId,
        policy,
@@ -783,6 +863,34 @@ index f1c5d13a..a23c7a6f 100644
        ...auditError,
      };
  
+@@ -290,14 +296,27 @@ export class ActionRunner {
+     return this.options.runs.get(id);
+   }
+ 
++  /** The caller's connection policy for the Gmail connection with this name; a name with no connection has no id. */
++  private async isGmailConnectionAllowed(connectionName: string, policy: ActionPolicySnapshot): Promise<boolean> {
++    let connectionId: string | undefined;
++    try {
++      connectionId = (await this.options.connections.getConnectionSummary("gmail", connectionName))?.id;
++    } catch (error) {
++      if (!(error instanceof ConnectionError)) throw error;
++    }
++    return policy.evaluateConnection(connectionId).allowed;
++  }
++
+   private createExecutionContext(
+     getCredential: ExecutionContext["getCredential"],
+     signal: AbortSignal | undefined,
++    policy: ActionPolicySnapshot,
+   ): ExecutionContext {
+     const context: ExecutionContext = {
+       getCredential,
+       signal,
+       logger: this.options.logger,
++      isConnectionAllowed: (connectionName) => this.isGmailConnectionAllowed(connectionName, policy),
+     };
+     if (this.options.transitFiles) {
+       context.transitFiles = this.options.transitFiles;
 diff --git a/src/server/api/openapi.ts b/src/server/api/openapi.ts
 index c9ad78fe..de000f7f 100644
 --- a/src/server/api/openapi.ts
@@ -2055,10 +2163,10 @@ index 00000000..c46ba93d
 +}
 diff --git a/src/server/email-watch/mail-watch-provider.test.ts b/src/server/email-watch/mail-watch-provider.test.ts
 new file mode 100644
-index 00000000..e60d04ab
+index 00000000..6ca0fcaf
 --- /dev/null
 +++ b/src/server/email-watch/mail-watch-provider.test.ts
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,316 @@
 +// (Lives here, not in src/providers/mail_watch/, so the provider-directory scan in generate:registry never meets a
 +// directory that has a test but no definition.)
 +// Decision 10: the built-in mail_watch provider (authTypes ["no_auth"]) reads and acknowledges the watcher's list.
@@ -2250,6 +2358,18 @@ index 00000000..e60d04ab
 +    expect(accepts(byId.i2, "ops-owner@example.net", "gm2")).toBe(true);
 +  });
 +
++  it("R3.5: a watch_gap item links to the inbox, not to a fake message id", async () => {
++    const s = await seeded();
++    await insertItem(s.db, itemRow({ id: "gap1", connection_name: "work", category: "watch_gap", sender_domain: "", gmail_message_id: "gap-synthetic-123", gmail_thread_id: "", received_at: iso(T0), created_at: iso(T0) }));
++    await insertItem(s.db, itemRow({ id: "gap2", connection_name: "nobody", category: "watch_gap", sender_domain: "", gmail_message_id: "gap-synthetic-456", gmail_thread_id: "", received_at: iso(T0 - 1000), created_at: iso(T0 - 1000) }));
++    const out = output<{ items: Item[] }>(await s.list({ category: "watch_gap" }));
++    const byId = Object.fromEntries(out.items.map((item) => [item.id, item.link]));
++    const email = "owner@example.org";
++    expect([`https://mail.google.com/mail/?authuser=${email}#inbox`, `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#inbox`]).toContain(byId.gap1);
++    expect(byId.gap2).toBe("https://mail.google.com/mail/u/0/#inbox");
++    expect(JSON.stringify(out)).not.toContain("gap-synthetic");
++  });
++
 +  it("falls back to the /u/0/ link when the connection has no profile email", async () => {
 +    const s = setup({ emails: {} });
 +    await insertItem(s.db, itemRow({ id: "x1", gmail_message_id: "gmX" }));
@@ -2361,6 +2481,266 @@ index 00000000..e60d04ab
 +    const byId = Object.fromEntries(provider.actions.map((action) => [action.id, action]));
 +    expect(policy.evaluate(byId["mail_watch.list_pending_mail"]!)).toMatchObject({ allowed: true });
 +    expect(policy.evaluate(byId["mail_watch.acknowledge_mail"]!)).toMatchObject({ allowed: false, code: "action_not_allowed" });
++  });
++});
+diff --git a/src/server/email-watch/mail-watch-scope.test.ts b/src/server/email-watch/mail-watch-scope.test.ts
+new file mode 100644
+index 00000000..c2d58e81
+--- /dev/null
++++ b/src/server/email-watch/mail-watch-scope.test.ts
+@@ -0,0 +1,254 @@
++// R3.1 (blocking): mail_watch is a no_auth provider, so ActionRunner skips policy.evaluateConnection for it. A token
++// scoped to chosen accounts (patch 0004: allowedConnections holds connection ids) must still see and acknowledge only
++// the items of those accounts. Exercised through the real ActionRunner with a scoped ActionPolicySnapshot.
++//
++// SEAM PINNED FOR THE IMPLEMENTER
++//   ExecutionContext (src/core/types.ts) gains one optional, narrow field:
++//     isConnectionAllowed?: (connectionName: string) => Promise<boolean>
++//   ActionRunner fills it on every run: it looks the Gmail connection up by name through its ConnectionService
++//   (getConnectionSummary("gmail", name)), then answers policy.evaluateConnection(summary?.id).allowed. A name with
++//   no stored connection is evaluated with no id, so a scoped token is refused and an unscoped one is allowed.
++//   Only the mail_watch executors read it. When the field is absent (a direct executor call, as the unit tests in
++//   mail-watch-provider.test.ts make) the executors treat every connection as allowed.
++//   Filtering happens before `limit`, and watch_gap items follow the same rule as any other item.
++import type { ExecutionContext, ExecutionResult } from "../../core/types.ts";
++
++import { afterEach, describe, expect, it } from "vitest";
++import { createCatalogStore } from "../../catalog-store.ts";
++import { ConnectionService } from "../../connection-service.ts";
++import { ActionPolicyService } from "../../core/action-policy.ts";
++import { provider as gmail } from "../../providers/gmail/definition.ts";
++import { provider as mailWatch } from "../../providers/mail_watch/definition.ts";
++import { createMailWatchExecutors } from "../../providers/mail_watch/executors.ts";
++import { ProviderLoader } from "../../providers/provider-loader.ts";
++import { ActionRunner } from "../actions/action-runner.ts";
++import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++import { HOUR, T0, insertItem, itemRow, selectAll } from "./test-support.ts";
++
++const EMAILS: Record<string, string> = { a: "a-owner@example.org", b: "b-owner@example.net" };
++const iso = (ms: number) => new Date(ms).toISOString();
++
++const databases: SqliteD1Database[] = [];
++afterEach(() => {
++  for (const database of databases.splice(0)) database.close();
++});
++
++async function setup() {
++  const binding = new SqliteD1Database();
++  databases.push(binding);
++  const database = new D1RuntimeDatabase(binding);
++  const ids: Record<string, string> = {};
++  for (const name of ["a", "b"]) {
++    const stored = await database.connectionStore.set("gmail", name, {
++      authType: "oauth2",
++      accessToken: `token-${name}`,
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: EMAILS[name]!, displayName: EMAILS[name]!, grantedScopes: [] },
++    });
++    ids[name] = stored.id;
++  }
++  const notion = await database.connectionStore.set("notion", "work", {
++    authType: "api_key",
++    apiKey: "notion-key",
++    values: { apiKey: "notion-key" },
++    profile: { accountId: "notion-work", displayName: "Work", grantedScopes: [] },
++    metadata: {},
++  });
++  ids.notion = notion.id;
++
++  // Newest first: b2, a2, b1, a1; plus one watch_gap item per connection and one for a connection that is gone.
++  const at = (hours: number) => iso(T0 - hours * HOUR);
++  const rows = [
++    ["b2", "b", "deploy_failed", 1],
++    ["a2", "a", "github", 2],
++    ["b1", "b", "billing_quota", 3],
++    ["a1", "a", "deploy_failed", 4],
++    ["gap-a", "a", "watch_gap", 5],
++    ["gap-b", "b", "watch_gap", 6],
++    ["ghost", "gone", "deploy_failed", 7],
++  ] as const;
++  for (const [id, connection, category, hours] of rows) {
++    await insertItem(
++      binding,
++      itemRow({
++        id,
++        connection_name: connection,
++        category,
++        gmail_message_id: `gm-${id}`,
++        subject: `Subject of ${id}`,
++        received_at: at(hours),
++        created_at: at(hours),
++      }),
++    );
++  }
++
++  const catalog = createCatalogStore([JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))], {
++    executableActionIds: mailWatch.actions.map((action) => action.id),
++  });
++  const providerLoader = new ProviderLoader({
++    mail_watch: async () => ({
++      executors: createMailWatchExecutors({
++        database: binding,
++        enabled: true,
++        profileEmail: async (name) => EMAILS[name],
++        now: () => T0,
++      }),
++    }),
++  });
++  const runner = new ActionRunner({
++    catalog,
++    providerLoader,
++    connections: new ConnectionService({ catalog, providerLoader, store: database.connectionStore }),
++    runs: database.runLogStore,
++  });
++  const policy = (allowedConnections?: string[]) =>
++    new ActionPolicyService().createSnapshot(undefined, {
++      allowedActions: ["mail_watch.*"],
++      blockedActions: [],
++      allowedProxies: [],
++      ...(allowedConnections === undefined ? {} : { allowedConnections }),
++    });
++  const run = async (actionId: string, input: Record<string, unknown>, allowedConnections?: string[]) => {
++    const result = await runner.run({ actionId: `mail_watch.${actionId}`, input, caller: "mcp", policy: policy(allowedConnections) });
++    expect(result).toBeDefined();
++    return result!.result;
++  };
++  return {
++    binding,
++    ids,
++    list: (allowedConnections?: string[], input: Record<string, unknown> = {}) => run("list_pending_mail", input, allowedConnections),
++    acknowledge: (allowedConnections: string[] | undefined, itemIds: string[]) => run("acknowledge_mail", { ids: itemIds }, allowedConnections),
++  };
++}
++
++function items(result: ExecutionResult): { id: string; connectionName: string; link: string }[] {
++  expect(result).toMatchObject({ ok: true });
++  return (result.output as { items: { id: string; connectionName: string; link: string }[] }).items;
++}
++
++const statusOf = (s: Awaited<ReturnType<typeof setup>>) =>
++  selectAll<{ id: string; status: string; acknowledged_at: string | null }>(
++    s.binding,
++    "select id, status, acknowledged_at from email_watch_items order by id",
++  );
++
++describe("list_pending_mail under a chosen-account token", () => {
++  it("a token scoped to gmail:a sees only a's items, watch_gap included", async () => {
++    const s = await setup();
++    const result = await s.list([s.ids.a!]);
++    expect(items(result).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++    expect(items(result).every((item) => item.connectionName === "a")).toBe(true);
++  });
++
++  it("builds links only for allowed items and leaks nothing of other connections", async () => {
++    const s = await setup();
++    const result = await s.list([s.ids.a!]);
++    const text = JSON.stringify(result);
++    for (const leaked of [EMAILS.b!, "Subject of b1", "Subject of b2", "gm-b1", "gm-gap-b", "ghost"]) {
++      expect(text, leaked).not.toContain(leaked);
++    }
++    for (const item of items(result)) {
++      expect(item.link.includes(EMAILS.a!) || item.link.includes(encodeURIComponent(EMAILS.a!))).toBe(true);
++    }
++  });
++
++  it("a token scoped to gmail:a and gmail:b sees both, but not an item whose connection is gone", async () => {
++    const s = await setup();
++    expect(items(await s.list([s.ids.a!, s.ids.b!])).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b"]);
++  });
++
++  it("a token scoped only to notion:work sees no items", async () => {
++    const s = await setup();
++    const result = await s.list([s.ids.notion!]);
++    expect(result).toMatchObject({ ok: true, output: { enabled: true, items: [] } });
++  });
++
++  it("an unscoped token sees every item, including one whose connection no longer exists", async () => {
++    const s = await setup();
++    const expected = ["b2", "a2", "b1", "a1", "gap-a", "gap-b", "ghost"];
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(expected);
++    expect(items(await s.list([])).map((item) => item.id)).toEqual(expected);
++  });
++
++  it("filters before limit: a scoped token with limit 1 gets its own newest item, not an empty page", async () => {
++    const s = await setup();
++    expect(items(await s.list([s.ids.a!], { limit: 1 })).map((item) => item.id)).toEqual(["a2"]);
++  });
++
++  it("asking for another connection by name returns nothing", async () => {
++    const s = await setup();
++    expect(items(await s.list([s.ids.a!], { connectionName: "b" }))).toEqual([]);
++    expect(items(await s.list([s.ids.a!], { connectionName: "gone" }))).toEqual([]);
++  });
++
++  it("category filters still apply inside the allowed set", async () => {
++    const s = await setup();
++    expect(items(await s.list([s.ids.b!], { category: "billing_quota" })).map((item) => item.id)).toEqual(["b1"]);
++    expect(items(await s.list([s.ids.b!], { category: "github" }))).toEqual([]);
++  });
++});
++
++describe("acknowledge_mail under a chosen-account token", () => {
++  it("acknowledging gmail:b ids with a gmail:a token changes nothing and counts 0", async () => {
++    const s = await setup();
++    const before = await statusOf(s);
++    expect(await s.acknowledge([s.ids.a!], ["b1", "b2", "gap-b", "ghost"])).toMatchObject({ ok: true, output: { acknowledged: 0 } });
++    expect(await statusOf(s)).toEqual(before);
++  });
++
++  it("acknowledges only the allowed ones of a mixed list", async () => {
++    const s = await setup();
++    expect(await s.acknowledge([s.ids.a!], ["a1", "b1", "gap-a", "gap-b"])).toMatchObject({ ok: true, output: { acknowledged: 2 } });
++    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
++    expect(status).toMatchObject({ a1: "acknowledged", "gap-a": "acknowledged", a2: "pending", b1: "pending", "gap-b": "pending", ghost: "pending" });
++  });
++
++  it("a token scoped to notion:work acknowledges nothing", async () => {
++    const s = await setup();
++    const before = await statusOf(s);
++    expect(await s.acknowledge([s.ids.notion!], ["a1", "b1"])).toMatchObject({ ok: true, output: { acknowledged: 0 } });
++    expect(await statusOf(s)).toEqual(before);
++  });
++
++  it("an unscoped token acknowledges any item", async () => {
++    const s = await setup();
++    expect(await s.acknowledge(undefined, ["a1", "b1", "ghost"])).toMatchObject({ ok: true, output: { acknowledged: 3 } });
++    expect(await s.acknowledge([], ["b2"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++  });
++
++  it("acknowledged items disappear from the owning token's list and stay hidden from the other", async () => {
++    const s = await setup();
++    await s.acknowledge([s.ids.a!], ["a2"]);
++    expect(items(await s.list([s.ids.a!])).map((item) => item.id)).toEqual(["a1", "gap-a"]);
++    expect(items(await s.list([s.ids.b!])).map((item) => item.id)).toEqual(["b2", "b1", "gap-b"]);
++  });
++});
++
++describe("the executor seam: ExecutionContext.isConnectionAllowed", () => {
++  function executors(database: SqliteD1Database) {
++    return createMailWatchExecutors({ database, enabled: true, profileEmail: async (name) => EMAILS[name], now: () => T0 });
++  }
++  const context = (allowed: string[]): ExecutionContext & { isConnectionAllowed: (name: string) => Promise<boolean> } => ({
++    getCredential: async () => undefined,
++    isConnectionAllowed: async (name) => allowed.includes(name),
++  });
++
++  it("list returns only items of connections the predicate allows, before applying limit", async () => {
++    const s = await setup();
++    const list = executors(s.binding)["mail_watch.list_pending_mail"]!;
++    const all = await list({}, context(["a"]));
++    expect(items(all).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++    expect(items(await list({ limit: 1 }, context(["a"]))).map((item) => item.id)).toEqual(["a2"]);
++    expect(items(await list({}, context([]))).map((item) => item.id)).toEqual([]);
++  });
++
++  it("acknowledge touches only items of allowed connections", async () => {
++    const s = await setup();
++    const acknowledge = executors(s.binding)["mail_watch.acknowledge_mail"]!;
++    expect(await acknowledge({ ids: ["a1", "b1"] }, context(["a"]))).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
++    expect(status).toMatchObject({ a1: "acknowledged", b1: "pending" });
 +  });
 +});
 diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
@@ -2524,10 +2904,10 @@ index 00000000..3b227a91
 +});
 diff --git a/src/server/email-watch/rules.test.ts b/src/server/email-watch/rules.test.ts
 new file mode 100644
-index 00000000..cd346d69
+index 00000000..eb7427e2
 --- /dev/null
 +++ b/src/server/email-watch/rules.test.ts
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,403 @@
 +import { describe, expect, it } from "vitest";
 +import { classifyMessage, emailWatchRules } from "./rules.ts";
 +import { authResults, buildHeaders, domainOf } from "./test-support.ts";
@@ -2575,9 +2955,6 @@ index 00000000..cd346d69
 +    ["cloudflare.com", "Your Worker build errored", "deploy_failed"],
 +    ["vercel.com", "my-app did not deploy", "deploy_failed"],
 +    ["netlify.com", "We could not deploy your site", "deploy_failed"],
-+    ["github.com", "[acme/app] Dependabot alert: lodash", "github"],
-+    ["github.com", "Security advisory for acme/app", "github"],
-+    ["github.com", "A new security alert on acme/app", "github"],
 +    ["accounts.google.com", "Security alert", "account_security"],
 +    ["google.com", "New sign-in to your account", "account_security"],
 +    ["github.com", "Your password was changed", "account_security"],
@@ -2603,6 +2980,8 @@ index 00000000..cd346d69
 +    ["netlify.com", "Your weekly digest"],
 +    ["github.com", "Re: [acme/app] Fix the thing (#12)"],
 +    ["github.com", "Run succeeded: CI - main"],
++    ["github.com", "[acme/app] Dependabot alert: lodash"],
++    ["github.com", "Security advisory for acme/app"],
 +    ["anthropic.com", "Product update"],
 +    ["google.com", "Your photos from last week"],
 +    ["accounts.google.com", "Welcome to your new account"],
@@ -2857,12 +3236,87 @@ index 00000000..cd346d69
 +    expect(domainOf("Vercel <no-reply@vercel.com>")).toBe("vercel.com");
 +  });
 +});
++
++describe("R3.2: a GitHub subject alone never matches (issue and PR titles are attacker-chosen)", () => {
++  const github = (subject: string, githubReason?: string) =>
++    classify({ from: from("notifications@github.com"), subject, githubReason });
++
++  // NOTE for the implementer: account-security also lists github.com and matches "security alert" in a subject, so
++  // dropping only the github-security-subject rule would still store this one as account_security. The review's
++  // requirement is that nothing is stored, so github.com must not reach any rule through its subject alone here.
++  it("stores nothing for a dmarc-passing github.com mail titled 'Dependabot security alert' with reason mention", () => {
++    expect(github("Dependabot security alert", "mention")).toBeUndefined();
++  });
++
++  it.each(["[acme/app] Dependabot alert: lodash", "Security advisory for acme/app", "Dependabot security advisory"])(
++    "stores nothing for the subject %j with reason mention or no reason",
++    (subject) => {
++      expect(github(subject, "mention")).toBeUndefined();
++      expect(github(subject)).toBeUndefined();
++    },
++  );
++
++  it("still matches on the header alone: security_alert and review_requested with any subject", () => {
++    expect(github("Dependabot security alert", "security_alert")).toMatchObject({ category: "github" });
++    expect(github("Dependabot alert", "review_requested")).toMatchObject({ category: "github" });
++  });
++
++  it("no rule in the table matches on a github.com subject alone", () => {
++    expect(emailWatchRules.some((rule) => rule.id === "github-security-subject")).toBe(false);
++  });
++});
++
++describe("R3.3: Authentication-Results is split on ';' outside quoted strings and comments", () => {
++  const vercel = (auth: string) => classify({ from: from("no-reply@vercel.com"), subject: "Deployment failed", auth });
++
++  it("does not count dmarc=pass header.from=... that sits inside a quoted smtp.mailfrom value", () => {
++    expect(
++      vercel('mx.google.com; spf=pass smtp.mailfrom="x; dmarc=pass header.from=vercel.com"; dmarc=fail (p=REJECT) header.from=vercel.com'),
++    ).toBeUndefined();
++    // No real dmarc result at all: the only "pass" is inside the quoted string, with clean tokens around it.
++    expect(vercel('mx.google.com; spf=pass smtp.mailfrom="x; dmarc=pass header.from=vercel.com ; y"')).toBeUndefined();
++    expect(vercel('mx.google.com; spf=pass smtp.mailfrom="x; dmarc=pass header.from=vercel.com"')).toBeUndefined();
++  });
++
++  it("does not count a dmarc result inside a comment", () => {
++    expect(vercel("mx.google.com; dkim=pass (a; dmarc=pass header.from=vercel.com); dmarc=fail header.from=vercel.com")).toBeUndefined();
++    expect(vercel("mx.google.com; spf=none (note; dmarc=pass header.from=vercel.com )")).toBeUndefined();
++    expect(vercel("mx.google.com; spf=none (note; dmarc=pass header.from=vercel.com ; more) smtp.helo=a")).toBeUndefined();
++  });
++
++  it("still matches when a quoted value holds a ';' and the real dmarc result passes", () => {
++    expect(
++      vercel('mx.google.com; spf=pass smtp.mailfrom="a;b@vercel.com"; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=vercel.com'),
++    ).toMatchObject({ category: "deploy_failed" });
++  });
++
++  it("requires the passing dmarc result and the header.from to belong to the same dmarc result", () => {
++    expect(vercel("mx.google.com; dmarc=pass header.from=evil.example; spf=pass header.from=vercel.com")).toBeUndefined();
++  });
++});
++
++describe("R3.4: a bare From with several addresses stores nothing", () => {
++  const bare = (value: string, authDomain = "vercel.com") =>
++    classify({ from: value, subject: "Deployment failed", auth: authResults(authDomain) });
++
++  it.each(["a@evil.example, b@vercel.com", "a@evil.example b@vercel.com", "a@evil.example,b@vercel.com", "b@vercel.com a@evil.example"])(
++    "stores nothing for the bare From %j",
++    (value) => {
++      expect(bare(value)).toBeUndefined();
++    },
++  );
++
++  it("still matches a single bare address and a display name with brackets", () => {
++    expect(bare("no-reply@vercel.com")).toMatchObject({ category: "deploy_failed" });
++    expect(bare("Vercel Alerts <no-reply@vercel.com>")).toMatchObject({ category: "deploy_failed" });
++  });
++});
 diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
 new file mode 100644
-index 00000000..f857c515
+index 00000000..54379680
 --- /dev/null
 +++ b/src/server/email-watch/rules.ts
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,197 @@
 +export type EmailWatchCategory = "deploy_failed" | "github" | "account_security" | "billing_quota";
 +
 +export interface MailHeader {
@@ -2911,7 +3365,6 @@ index 00000000..f857c515
 +    header: { name: "X-GitHub-Reason", values: ["ci_activity"] },
 +    subject: ciFailure,
 +  },
-+  { id: "github-security-subject", category: "github", domains: ["github.com"], subject: /dependabot|security (alert|advisory)/i },
 +  {
 +    id: "account-security",
 +    category: "account_security",
@@ -2947,13 +3400,21 @@ index 00000000..f857c515
 +  if (!senderDomain || !dmarcPassesFor(firstHeader(headers, "Authentication-Results"), senderDomain)) return undefined;
 +
 +  const fullSubject = stripControlCharacters(firstHeader(headers, "Subject") ?? "");
++  // Mail GitHub sends as a notification (it carries X-GitHub-Reason) is judged by the github rules only. Its subject is
++  // an issue or pull request title, which anyone can write, so it must not reach the subject-only rules below.
++  const notification = isOnDomain(senderDomain, "github.com") && firstHeader(headers, "X-GitHub-Reason") !== undefined;
 +  for (const rule of emailWatchRules) {
-+    if (!rule.domains.some((domain) => senderDomain === domain || senderDomain.endsWith(`.${domain}`))) continue;
++    if (notification && rule.category !== "github") continue;
++    if (!rule.domains.some((domain) => isOnDomain(senderDomain, domain))) continue;
 +    if (rule.subject && !rule.subject.test(fullSubject)) continue;
 +    if (rule.header && !headerHasValue(headers, rule.header.name, rule.header.values)) continue;
 +    return { category: rule.category, ruleId: rule.id, senderDomain, subject: truncate(fullSubject) };
 +  }
 +  return undefined;
++}
++
++function isOnDomain(domain: string, ruleDomain: string): boolean {
++  return domain === ruleDomain || domain.endsWith(`.${ruleDomain}`);
 +}
 +
 +function firstHeader(headers: readonly MailHeader[], name: string): string | undefined {
@@ -2971,7 +3432,9 @@ index 00000000..f857c515
 +  if (!from) return undefined;
 +  const brackets = from.match(/<[^<>]*>/g) ?? [];
 +  if (brackets.length > 1) return undefined;
-+  const address = brackets.length === 1 ? brackets[0]!.slice(1, -1) : from;
++  // Without brackets the whole value must be one address: a comma or a space means several.
++  if (brackets.length === 0 && /[\s,]/.test(from.trim())) return undefined;
++  const address = brackets.length === 1 ? brackets[0]!.slice(1, -1) : from.trim();
 +  const at = address.lastIndexOf("@");
 +  const domain = address
 +    .slice(at + 1)
@@ -2986,12 +3449,7 @@ index 00000000..f857c515
 + */
 +function dmarcPassesFor(value: string | undefined, senderDomain: string): boolean {
 +  if (!value) return false;
-+  let text = value;
-+  for (let previous = ""; previous !== text; ) {
-+    previous = text;
-+    text = text.replace(/\([^()]*\)/g, " ");
-+  }
-+  const [authservId, ...results] = text.split(";");
++  const [authservId, ...results] = splitResults(value);
 +  if (authservId!.trim().split(/\s+/)[0]?.toLowerCase() !== TRUSTED_AUTHSERV_ID) return false;
 +
 +  const dmarcResults = results
@@ -3007,6 +3465,42 @@ index 00000000..f857c515
 +      );
 +    })
 +  );
++}
++
++/**
++ * Split an Authentication-Results value on ";" outside quoted strings and comments. Comments are dropped and a
++ * quoted string is kept as an opaque token, so nothing inside either can look like a result. An unclosed comment or
++ * quote swallows the rest of the value.
++ */
++function splitResults(value: string): string[] {
++  const parts: string[] = [];
++  let current = "";
++  let depth = 0;
++  let quoted = false;
++  for (let i = 0; i < value.length; i += 1) {
++    const char = value[i]!;
++    if (quoted) {
++      if (char === "\\") i += 1;
++      else if (char === '"') quoted = false;
++    } else if (depth > 0) {
++      if (char === "\\") i += 1;
++      else if (char === "(") depth += 1;
++      else if (char === ")") depth -= 1;
++    } else if (char === "(") {
++      depth = 1;
++      current += " ";
++    } else if (char === '"') {
++      quoted = true;
++      current += '"q"';
++    } else if (char === ";") {
++      parts.push(current);
++      current = "";
++    } else {
++      current += char;
++    }
++  }
++  parts.push(current);
++  return parts;
 +}
 +
 +function stripControlCharacters(text: string): string {
