@@ -2,7 +2,7 @@ SplitMind patch 0009 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: none yet (directive #126).
 Replace this line with the upstream issue or pull request link once it exists.
 
-From 8e03107b199e36b2c3949d18e6e7d712b8055aba Mon Sep 17 00:00:00 2001
+From ac19de5dc036294d2600196718b310dbc6351bea Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
 Date: Wed, 11 Nov 2026 08:26:34 -0500
 Subject: [PATCH] feat(email-watch): opt-in Gmail watch on the Worker cron,
@@ -44,7 +44,7 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/providers/mail_watch/actions.ts           |  71 ++
  src/providers/mail_watch/definition.ts        |  18 +
  src/providers/mail_watch/executors.ts         | 114 +++
- .../actions/action-runner-audit.test.ts       | 166 ++++
+ .../actions/action-runner-audit.test.ts       | 166 +++
  src/server/actions/action-runner.ts           |   9 +-
  src/server/api/openapi.ts                     |   2 +-
  src/server/api/run-log-routes.ts              |   2 +-
@@ -60,15 +60,15 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/server/email-watch/migration.test.ts      | 153 +++
  src/server/email-watch/rules.test.ts          | 329 ++++++
  src/server/email-watch/rules.ts               | 157 +++
- src/server/email-watch/test-support.ts        | 450 +++++++++
+ src/server/email-watch/test-support.ts        | 452 ++++++++
  src/server/email-watch/watch-runner.ts        |  45 +
- src/server/email-watch/watcher.test.ts        | 939 ++++++++++++++++++
- src/server/email-watch/watcher.ts             | 506 ++++++++++
+ src/server/email-watch/watcher.test.ts        | 963 ++++++++++++++++++
+ src/server/email-watch/watcher.ts             | 541 ++++++++++
  .../storage/postgres/runtime-store.test.ts    |   2 +
  src/server/storage/runtime-store.ts           |   2 +-
  .../storage/sqlite/runtime-store.test.ts      |   1 +
  web/src/model.ts                              |   2 +-
- 32 files changed, 4586 insertions(+), 22 deletions(-)
+ 32 files changed, 4647 insertions(+), 22 deletions(-)
  create mode 100644 migrations/0019_email_watch.sql
  create mode 100644 migrations/postgresql/0019_email_watch.sql
  create mode 100644 src/providers/gmail/executors.metadata-headers.test.ts
@@ -811,7 +811,7 @@ index df9e6c50..0cd8225e 100644
  function readRunLogListInput(context: Context): RunLogListQuery {
 diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
 new file mode 100644
-index 00000000..6107ce92
+index 00000000..bafbe4b5
 --- /dev/null
 +++ b/src/server/cloudflare-email-watch.test.ts
 @@ -0,0 +1,534 @@
@@ -1218,26 +1218,26 @@ index 00000000..6107ce92
 +    expect(s.fetcher).not.toHaveBeenCalled();
 +  });
 +
-+  it("makes at most 30 Gmail requests per invocation (Free plan: 50 subrequests, token refreshes count)", async () => {
++  it("makes at most 15 Gmail requests per invocation (each costs two external subrequests against the Free plan's 50)", async () => {
 +    const s = await seeded({}, ["a", "b", "c"]);
 +    for (const name of ["a", "b", "c"]) {
-+      for (let index = 0; index < 20; index += 1) {
++      s.mailboxes[name]!.maxPageSize = 5;
++      for (let index = 0; index < 10; index += 1) {
 +        s.mailboxes[name]!.deliver(vercelFailure(`Deployment failed for ${name}-${index}`));
 +      }
 +    }
 +    s.fetcher.mockClear();
 +    await s.tick(M0 + 10);
-+    expect(s.fetcher.mock.calls.length).toBeLessThanOrEqual(30);
-+    expect(s.fetcher.mock.calls.length).toBeGreaterThan(0);
++    expect(s.fetcher.mock.calls.length).toBe(15);
 +    // Catch-up then finishes the job off-interval, one minute at a time.
-+    for (let minuteOffset = 11; minuteOffset < 17; minuteOffset += 1) {
++    for (let minuteOffset = 11; minuteOffset < 31; minuteOffset += 1) {
 +      const cursors = await s.watchRows<{ catch_up: number }>("email_watch_cursors");
 +      if (cursors.every((cursor) => cursor.catch_up === 0)) break;
 +      s.fetcher.mockClear();
 +      await s.tick(M0 + minuteOffset);
-+      expect(s.fetcher.mock.calls.length).toBeLessThanOrEqual(30);
++      expect(s.fetcher.mock.calls.length).toBeLessThanOrEqual(15);
 +    }
-+    expect((await s.watchRows("email_watch_items")).length).toBe(60);
++    expect((await s.watchRows("email_watch_items")).length).toBe(30);
 +  });
 +});
 +
@@ -3022,10 +3022,10 @@ index 00000000..f857c515
 +}
 diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
 new file mode 100644
-index 00000000..10dad865
+index 00000000..9bc6b565
 --- /dev/null
 +++ b/src/server/email-watch/test-support.ts
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,452 @@
 +// Shared test fixtures for the email watch (directive #126). Synthetic data only: every address is on
 +// example.com / example.org or on a rule domain (vercel.com, github.com, ...) that the rules table names.
 +// Not imported by product code.
@@ -3132,6 +3132,8 @@ index 00000000..10dad865
 +  private readonly failures = new Map<string, number>();
 +  /** When true, every history record is listed twice, as overlapping pages and retries can produce. */
 +  duplicateHistoryRecords = false;
++  /** Gmail may return fewer history records than maxResults asks for; cap the page size to model that. */
++  maxPageSize: number | undefined;
 +
 +  constructor(options: { prefix?: string; email?: string; startHistoryId?: number } = {}) {
 +    this.prefix = options.prefix ?? "m";
@@ -3215,7 +3217,7 @@ index 00000000..10dad865
 +    if (!Number.isFinite(start) || start < this.oldestValid) {
 +      return Response.json({ error: { code: 404, message: "Requested entity was not found.", errors: [] } }, { status: 404 });
 +    }
-+    const pageSize = Number(params.get("maxResults") ?? 100);
++    const pageSize = Math.min(Number(params.get("maxResults") ?? 100), this.maxPageSize ?? Infinity);
 +    const offset = params.get("pageToken") ? Number(params.get("pageToken")!.slice(1)) : 0;
 +    const pending = this.entries.filter((entry) => entry.historyId > start);
 +    const page = pending.slice(offset, offset + pageSize);
@@ -3529,10 +3531,10 @@ index 00000000..a7dee6b1
 +}
 diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
 new file mode 100644
-index 00000000..e954e472
+index 00000000..a3b32776
 --- /dev/null
 +++ b/src/server/email-watch/watcher.test.ts
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,963 @@
 +// Email watch (directive #126, patch 0009): behaviour of one watch invocation.
 +//
 +// MODULE INTERFACE PINNED BY THESE TESTS (the implementer builds to this; small on purpose):
@@ -3556,7 +3558,7 @@ index 00000000..e954e472
 +//                        connections: readonly string[],         // gmail connection names, already parsed
 +//                        logger: RuntimeLogger,                  // { info, warn, error }(fields, message)
 +//                        now?: () => number })                   // epoch ms, default Date.now
-+//     .run(): Promise<void>            one invocation: up to 30 Gmail action runs, oldest last_run_at first,
++//     .run(): Promise<void>            one invocation: up to 15 Gmail action runs, oldest last_run_at first,
 +//                                      then the once-a-day retention sweep when it is due. Never throws for a
 +//                                      Gmail or policy failure of one connection.
 +//     .needsCatchUp(): Promise<boolean>   true while any cursor has catch_up = 1
@@ -4095,7 +4097,9 @@ index 00000000..e954e472
 +  });
 +});
 +
-+describe("budget: at most 30 Gmail action runs per invocation", () => {
++// Each Gmail action run costs two external subrequests (the provider's DNS-over-HTTPS lookup plus the call itself),
++// plus up to two more for an OAuth refresh, against the Free plan's 50: so at most 15 runs per invocation.
++describe("budget: at most 15 Gmail action runs per invocation", () => {
 +  function subjectsFor(prefix: string, n: number): FixtureMessage[] {
 +    return Array.from({ length: n }, (_, index) => failed(`Deployment failed for ${prefix}-${index}`));
 +  }
@@ -4103,20 +4107,23 @@ index 00000000..e954e472
 +  it("serves 3 connections with 50 new messages over several invocations, none over budget, no duplicates", async () => {
 +    const r = rig(["acct-a", "acct-b", "acct-c"]);
 +    await seed(r);
++    // Gmail may return fewer records per page than the 20 asked for.
++    for (const mailbox of Object.values(r.mailboxes)) mailbox.maxPageSize = 5;
 +    for (const message of subjectsFor("a", 20)) r.mailboxes["acct-a"]!.deliver(message);
 +    for (const message of subjectsFor("b", 20)) r.mailboxes["acct-b"]!.deliver(message);
 +    for (const message of subjectsFor("c", 10)) r.mailboxes["acct-c"]!.deliver(message);
 +
 +    const first = await r.runCounting();
-+    expect(first).toBeLessThanOrEqual(30);
-+    expect(first).toBeGreaterThan(10);
++    expect(first).toBe(15);
 +    expect(await r.watcher.needsCatchUp()).toBe(true);
++    const savedTokens = await selectAll<{ page_token: string | null }>(r.db, "select page_token from email_watch_cursors where page_token is not null");
++    expect(savedTokens.length).toBeGreaterThan(0);
 +
 +    let invocations = 1;
 +    while (await r.watcher.needsCatchUp()) {
 +      invocations += 1;
-+      expect(invocations).toBeLessThanOrEqual(6);
-+      expect(await r.runCounting()).toBeLessThanOrEqual(30);
++      expect(invocations).toBeLessThanOrEqual(20);
++      expect(await r.runCounting()).toBeLessThanOrEqual(15);
 +    }
 +    const rows = await itemsOf(r);
 +    expect(rows).toHaveLength(50);
@@ -4130,9 +4137,11 @@ index 00000000..e954e472
 +  it("saves the page token and sets catch-up when a connection has more pages than the budget allows", async () => {
 +    const r = rig(["work"]);
 +    await seed(r);
++    r.mailboxes.work!.maxPageSize = 8;
 +    for (const message of subjectsFor("w", 60)) r.mailboxes.work!.deliver(message);
 +
-+    expect(await r.runCounting()).toBeLessThanOrEqual(30);
++    // Off-by-one guard: the run uses exactly 15, not 14 and not 16.
++    expect(await r.runCounting()).toBe(15);
 +    const saved = await cursorOf(r);
 +    expect(saved!.page_token).toMatch(/^p\d+$/);
 +    expect(saved!.catch_up).toBe(1);
@@ -4147,11 +4156,23 @@ index 00000000..e954e472
 +
 +    let guard = 0;
 +    while (await r.watcher.needsCatchUp()) {
-+      expect(++guard).toBeLessThan(6);
-+      expect(await r.runCounting()).toBeLessThanOrEqual(30);
++      expect(++guard).toBeLessThan(12);
++      expect(await r.runCounting()).toBeLessThanOrEqual(15);
 +    }
 +    expect(await itemsOf(r)).toHaveLength(60);
 +    expect(await cursorOf(r)).toMatchObject({ history_id: "1060", page_token: null, catch_up: 0 });
++  });
++
++  it("finishes a single page that is larger than the budget instead of refetching its start forever", async () => {
++    const r = rig(["work"]);
++    await seed(r);
++    for (const message of subjectsFor("big", 20)) r.mailboxes.work!.deliver(message);
++    let guard = 0;
++    do {
++      expect(++guard).toBeLessThan(6);
++      expect(await r.runCounting()).toBeLessThanOrEqual(15);
++    } while ((await r.watcher.needsCatchUp()) || (await cursorOf(r))!.history_id !== "1020");
++    expect(await itemsOf(r)).toHaveLength(20);
 +  });
 +
 +  it("serves connections oldest last_run_at first", async () => {
@@ -4161,20 +4182,21 @@ index 00000000..e954e472
 +    await r.db.prepare("update email_watch_cursors set last_run_at = ? where connection_name = 'mid'").bind(iso(T0 - 2 * HOUR)).run();
 +    await r.db.prepare("update email_watch_cursors set last_run_at = ? where connection_name = 'new'").bind(iso(T0 - HOUR)).run();
 +    for (const name of ["old", "mid", "new"]) {
-+      for (const message of subjectsFor(name, 15)) r.mailboxes[name]!.deliver(message);
++      for (const message of subjectsFor(name, 7)) r.mailboxes[name]!.deliver(message);
 +    }
 +    const callsBefore = r.runner.calls.length;
 +    r.clock.now = T0 + 10 * 60_000;
 +    await r.run();
 +
++    // old costs 8 (one list, seven fetches); mid gets the last 7; new is not reached.
 +    const calls = r.runner.calls.slice(callsBefore);
-+    expect(calls.length).toBeLessThanOrEqual(30);
++    expect(calls.length).toBe(15);
 +    expect(calls[0]!.connectionName).toBe("old");
 +    const order = [...new Set(calls.map((call) => call.connectionName))];
 +    expect(order).toEqual(["old", "mid"]);
-+    expect(await itemsOf(r, "connection_name = 'old'")).toHaveLength(15);
++    expect(await itemsOf(r, "connection_name = 'old'")).toHaveLength(7);
 +    expect(await itemsOf(r, "connection_name = 'new'")).toEqual([]);
-+    expect(await cursorOf(r, "old")).toMatchObject({ history_id: "1015" });
++    expect(await cursorOf(r, "old")).toMatchObject({ history_id: "1007" });
 +    expect(await cursorOf(r, "new")).toMatchObject({ history_id: "1000" });
 +    expect(await r.watcher.needsCatchUp()).toBe(true);
 +  });
@@ -4182,11 +4204,15 @@ index 00000000..e954e472
 +  it("counts first-run get_profile calls in the budget, and never starves a connection that has no cursor yet", async () => {
 +    const names = Array.from({ length: 40 }, (_, index) => `acct-${index}`);
 +    const r = rig(names);
-+    expect(await r.runCounting()).toBeLessThanOrEqual(30);
-+    expect((await selectAll(r.db, "select connection_name from email_watch_cursors where connection_name like 'acct-%'")).length).toBeLessThanOrEqual(30);
-+    expect(await r.runCounting()).toBeLessThanOrEqual(30);
-+    const created = await selectAll<{ connection_name: string }>(r.db, "select connection_name from email_watch_cursors where connection_name like 'acct-%'");
-+    expect(created.map((row) => row.connection_name).sort()).toEqual([...names].sort());
++    const created = () =>
++      selectAll<{ connection_name: string }>(r.db, "select connection_name from email_watch_cursors where connection_name like 'acct-%'");
++    // Off-by-one guard: exactly 15 get_profile runs, not 14 and not 16.
++    expect(await r.runCounting()).toBe(15);
++    expect(await created()).toHaveLength(15);
++    expect(await r.runCounting()).toBe(15);
++    expect(await created()).toHaveLength(30);
++    expect(await r.runCounting()).toBeLessThanOrEqual(15);
++    expect((await created()).map((row) => row.connection_name).sort()).toEqual([...names].sort());
 +  });
 +});
 +
@@ -4474,10 +4500,10 @@ index 00000000..e954e472
 +});
 diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
 new file mode 100644
-index 00000000..5600ebd5
+index 00000000..de8ed051
 --- /dev/null
 +++ b/src/server/email-watch/watcher.ts
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,541 @@
 +import type { ActionPolicySnapshot } from "../../core/action-policy.ts";
 +import type { RuntimeLogger } from "../../core/types.ts";
 +import type { D1DatabaseBinding } from "../cloudflare/cloudflare-bindings.ts";
@@ -4487,9 +4513,12 @@ index 00000000..5600ebd5
 +import { createWatchGmailClient, WATCH_ACTION_IDS } from "./gmail-access.ts";
 +import { classifyMessage } from "./rules.ts";
 +
-+/** Gmail action runs per invocation. The Free plan allows 50 subrequests and a token refresh counts as one. */
-+const MAX_ACTION_RUNS = 30;
-+const PAGE_SIZE = 20;
++/**
++ * Gmail action runs per invocation. The Free plan allows 50 subrequests; each Gmail run costs two (the guarded
++ * fetch's uncached DNS lookup, then the request) and a token refresh costs more, so 15 stays under the cap.
++ */
++const MAX_ACTION_RUNS = 15;
++const MAX_PAGE_SIZE = 20;
 +const DAY_MS = 86_400_000;
 +const PENDING_RETENTION_MS = 14 * DAY_MS;
 +const ACKNOWLEDGED_RETENTION_MS = 7 * DAY_MS;
@@ -4581,7 +4610,7 @@ index 00000000..5600ebd5
 +    this.now = options.now ?? Date.now;
 +  }
 +
-+  /** One invocation: up to 30 Gmail action runs, oldest last run first, then the daily retention sweep if due. */
++  /** One invocation: up to 15 Gmail action runs, oldest last run first, then the daily retention sweep if due. */
 +  async run(): Promise<void> {
 +    const cursors = await loadCursors(this.database);
 +    const sweepDue = this.isSweepDue(cursors);
@@ -4661,21 +4690,27 @@ index 00000000..5600ebd5
 +    budget: Budget,
 +    counts: PageCounts,
 +  ): Promise<PollStep> {
-+    const input: Record<string, unknown> = {
-+      startHistoryId: cursor.historyId,
-+      labelId: "INBOX",
-+      historyTypes: ["messageAdded"],
-+      maxResults: PAGE_SIZE,
-+    };
-+    if (pageToken) input.pageToken = pageToken;
-+    const list = await this.callGmail(budget, name, WATCH_ACTION_IDS.listHistory, input);
++    if (budget.remaining < 2) return { state: "pause", pageToken };
++    let list = await this.listPage(name, cursor, pageToken, budget, MAX_PAGE_SIZE);
 +    if (list.kind === "no_budget") return { state: "pause", pageToken };
 +    if (list.kind === "failed") {
 +      return list.status === 404 ? { state: "reset_expired" } : { state: "abort", code: list.code };
 +    }
 +
-+    for (const message of addedMessages(list.output.history)) {
-+      if (await this.isStored(name, message.id)) continue;
++    let messages = await this.unseen(name, list.output.history);
++    if (messages.length > budget.remaining) {
++      // The page holds more new messages than the budget can fetch. Read it again with a page the budget can
++      // finish (one run for the list, one per message), so it completes however many of its messages are kept.
++      if (budget.remaining < 2) return { state: "pause", pageToken };
++      list = await this.listPage(name, cursor, pageToken, budget, budget.remaining - 1);
++      if (list.kind === "no_budget") return { state: "pause", pageToken };
++      if (list.kind === "failed") {
++        return list.status === 404 ? { state: "reset_expired" } : { state: "abort", code: list.code };
++      }
++      messages = await this.unseen(name, list.output.history);
++    }
++
++    for (const message of messages) {
 +      const fetched = await this.callGmail(budget, name, WATCH_ACTION_IDS.fetchMessage, {
 +        messageId: message.id,
 +        format: "metadata",
@@ -4696,6 +4731,32 @@ index 00000000..5600ebd5
 +    const next = readString(list.output.nextPageToken);
 +    if (next) return { state: "list_page", pageToken: next };
 +    return { state: "finish", historyId: readString(list.output.historyId) ?? cursor.historyId };
++  }
++
++  private listPage(
++    name: string,
++    cursor: Cursor,
++    pageToken: string | null,
++    budget: Budget,
++    maxResults: number,
++  ): Promise<GmailReply> {
++    const input: Record<string, unknown> = {
++      startHistoryId: cursor.historyId,
++      labelId: "INBOX",
++      historyTypes: ["messageAdded"],
++      maxResults,
++    };
++    if (pageToken) input.pageToken = pageToken;
++    return this.callGmail(budget, name, WATCH_ACTION_IDS.listHistory, input);
++  }
++
++  /** The messages on a history page that are not already stored, so a page that is read again is not fetched again. */
++  private async unseen(name: string, history: unknown): Promise<HistoryMessage[]> {
++    const messages: HistoryMessage[] = [];
++    for (const message of addedMessages(history)) {
++      if (!(await this.isStored(name, message.id))) messages.push(message);
++    }
++    return messages;
 +  }
 +
 +  private async settle(name: string, cursor: Cursor, step: PollStep, budget: Budget): Promise<void> {

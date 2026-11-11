@@ -213,7 +213,7 @@ with `format: "metadata"` and five named headers: `From`, `Subject`, `Authentica
 and `List-Id`. It never asks for a body, a snippet, recipients, labels or attachments. Every call goes through the
 normal action runner, so `OOMOL_CONNECT_ALLOWED_ACTIONS`, `OOMOL_CONNECT_BLOCKED_ACTIONS` and the runtime policy
 apply: an account whose policy refuses one of the three is skipped for that run. Do not put those three actions in
-`OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 30 Gmail action runs; more mail than that is read over the next
+`OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 15 Gmail action runs (each can cost two subrequests on Workers Free, which allows 50); more mail than that is read over the next
 minutes.
 
 **What it stores.** Two D1 tables (migration `0019_email_watch.sql`):
