@@ -1,8 +1,7 @@
 SplitMind patch 0009 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: none yet (directive #126).
 Replace this line with the upstream issue or pull request link once it exists.
-
-From 95a524abd47de107567225cfbf005f2ed8f350af Mon Sep 17 00:00:00 2001
+From 7da7e3aaa39578b61453a4267f8b338fe4f381c1 Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
 Date: Wed, 11 Nov 2026 08:26:34 -0500
 Subject: [PATCH] feat(email-watch): opt-in Gmail watch on the Worker cron,
@@ -48,7 +47,7 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/providers/gmail/executors.ts              |  24 +-
  src/providers/mail_watch/actions.ts           |  71 ++
  src/providers/mail_watch/definition.ts        |  18 +
- src/providers/mail_watch/executors.ts         | 162 +++
+ src/providers/mail_watch/executors.ts         | 153 +++
  .../actions/action-runner-audit.test.ts       | 166 +++
  src/server/actions/action-runner.ts           |  23 +-
  src/server/api/openapi.ts                     |   2 +-
@@ -61,8 +60,8 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  .../email-watch/fake-gmail-contract.test.ts   | 131 +++
  src/server/email-watch/gmail-access.test.ts   | 141 +++
  src/server/email-watch/gmail-access.ts        |  42 +
- .../email-watch/mail-watch-provider.test.ts   | 316 ++++++
- .../email-watch/mail-watch-scope.test.ts      | 254 +++++
+ .../email-watch/mail-watch-provider.test.ts   | 321 ++++++
+ .../email-watch/mail-watch-scope.test.ts      | 520 ++++++++++
  src/server/email-watch/migration.test.ts      | 153 +++
  src/server/email-watch/rules.test.ts          | 403 ++++++++
  src/server/email-watch/rules.ts               | 197 ++++
@@ -74,7 +73,7 @@ Claude-Session: https://claude.ai/code/session_0129g9KmkajR7FA5M2iDkBir
  src/server/storage/runtime-store.ts           |   2 +-
  .../storage/sqlite/runtime-store.test.ts      |   1 +
  web/src/model.ts                              |   2 +-
- 34 files changed, 5095 insertions(+), 22 deletions(-)
+ 34 files changed, 5357 insertions(+), 22 deletions(-)
  create mode 100644 migrations/0019_email_watch.sql
  create mode 100644 migrations/postgresql/0019_email_watch.sql
  create mode 100644 src/providers/gmail/executors.metadata-headers.test.ts
@@ -490,12 +489,12 @@ index 00000000..aee1bca8
 +};
 diff --git a/src/providers/mail_watch/executors.ts b/src/providers/mail_watch/executors.ts
 new file mode 100644
-index 00000000..4f1d911d
+index 00000000..144f2b66
 --- /dev/null
 +++ b/src/providers/mail_watch/executors.ts
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,153 @@
 +import type { D1DatabaseBinding } from "../../server/cloudflare/cloudflare-bindings.ts";
-+import type { ExecutionContext, ProviderExecutors } from "../../core/types.ts";
++import type { ProviderExecutors } from "../../core/types.ts";
 +
 +const itemColumns =
 +  "id, connection_name, gmail_message_id, category, rule_id, sender_domain, subject, received_at, occurrences";
@@ -540,18 +539,36 @@ index 00000000..4f1d911d
 +        clauses.push("connection_name = ?");
 +        values.push(filters.connectionName);
 +      }
-+      // Connections the caller may not use are filtered out before the limit is applied.
-+      const scope = await connectionScope(deps.database, context, clauses, values);
-+      if (scope === "none") return { ok: true, output: { enabled: true, items: [] } };
-+      clauses.push(...scope.clauses);
-+      values.push(...scope.values);
++      // Deny by default: without the runner's connection predicate nothing is listed.
++      const isAllowed = context.isConnectionAllowed;
++      if (!isAllowed) return { ok: true, output: { enabled: true, items: [] } };
++      // Ask the predicate about every connection that has matching items, then list only those connections.
++      const verdicts = new Map<string, boolean>();
++      const check = async (name: string): Promise<boolean> => {
++        if (!verdicts.has(name)) verdicts.set(name, await isAllowed(name));
++        return verdicts.get(name)!;
++      };
++      const { results: names } = await deps.database
++        .prepare(`select distinct connection_name from email_watch_items where ${clauses.join(" and ")}`)
++        .bind(...values)
++        .all<{ connection_name: string }>();
++      const allowed: string[] = [];
++      for (const row of names) if (await check(row.connection_name)) allowed.push(row.connection_name);
++      if (allowed.length === 0) return { ok: true, output: { enabled: true, items: [] } };
++      // D1 allows 100 bound values per statement.
++      const listed = allowed.slice(0, 90);
++      clauses.push(`connection_name in (${listed.map(() => "?").join(", ")})`);
++      values.push(...listed);
 +      const limit = Math.min(filters.limit ?? defaultLimit, maxLimit);
-+      const { results } = await deps.database
++      const { results: found } = await deps.database
 +        .prepare(
 +          `select ${itemColumns} from email_watch_items where ${clauses.join(" and ")} order by received_at desc, id desc limit ?`,
 +        )
 +        .bind(...values, limit)
 +        .all<ItemRow>();
++      // A row for another connection may have arrived between the statements: check every row again.
++      const results: ItemRow[] = [];
++      for (const row of found) if (await check(row.connection_name)) results.push(row);
 +
 +      const emails = new Map<string, string | undefined>();
 +      for (const row of results) {
@@ -578,7 +595,7 @@ index 00000000..4f1d911d
 +    "mail_watch.acknowledge_mail": async (input, context) => {
 +      if (!deps.enabled) return { ok: true, output: { acknowledged: 0 } };
 +      const ids = [...new Set(((input ?? {}) as { ids?: string[] }).ids ?? [])];
-+      if (ids.length === 0) return { ok: true, output: { acknowledged: 0 } };
++      if (ids.length === 0 || !context.isConnectionAllowed) return { ok: true, output: { acknowledged: 0 } };
 +      // D1 allows 100 bound values per statement, so a full list of 100 ids goes in two.
 +      const acknowledgedAt = new Date(now()).toISOString();
 +      const allowed = new Map<string, boolean>();
@@ -593,7 +610,7 @@ index 00000000..4f1d911d
 +        const permitted: string[] = [];
 +        for (const row of results) {
 +          if (!allowed.has(row.connection_name)) {
-+            allowed.set(row.connection_name, (await context.isConnectionAllowed?.(row.connection_name)) ?? true);
++            allowed.set(row.connection_name, (await context.isConnectionAllowed?.(row.connection_name)) ?? false);
 +          }
 +          if (allowed.get(row.connection_name)) permitted.push(row.id);
 +        }
@@ -609,33 +626,6 @@ index 00000000..4f1d911d
 +      return { ok: true, output: { acknowledged } };
 +    },
 +  };
-+}
-+
-+/**
-+ * The extra WHERE clause that keeps only the connections the caller may use, or "none" when it may use none of the
-+ * connections that have matching items. Without a predicate on the context every connection is allowed.
-+ */
-+async function connectionScope(
-+  database: D1DatabaseBinding,
-+  context: ExecutionContext,
-+  clauses: string[],
-+  values: unknown[],
-+): Promise<"none" | { clauses: string[]; values: unknown[] }> {
-+  const isAllowed = context.isConnectionAllowed;
-+  if (!isAllowed) return { clauses: [], values: [] };
-+  const { results } = await database
-+    .prepare(`select distinct connection_name from email_watch_items where ${clauses.join(" and ")}`)
-+    .bind(...values)
-+    .all<{ connection_name: string }>();
-+  const allowed: string[] = [];
-+  const denied: string[] = [];
-+  for (const row of results) (await isAllowed(row.connection_name) ? allowed : denied).push(row.connection_name);
-+  if (allowed.length === 0 && results.length > 0) return "none";
-+  if (denied.length === 0) return { clauses: [], values: [] };
-+  // Bind whichever list is shorter; D1 allows 100 bound values per statement.
-+  return allowed.length <= denied.length
-+    ? { clauses: [`connection_name in (${allowed.map(() => "?").join(", ")})`], values: allowed }
-+    : { clauses: [`connection_name not in (${denied.map(() => "?").join(", ")})`], values: denied };
 +}
 +
 +/** A message link, or for a watch_gap item (which has no message) the inbox. */
@@ -2163,10 +2153,10 @@ index 00000000..c46ba93d
 +}
 diff --git a/src/server/email-watch/mail-watch-provider.test.ts b/src/server/email-watch/mail-watch-provider.test.ts
 new file mode 100644
-index 00000000..6ca0fcaf
+index 00000000..2d6716a1
 --- /dev/null
 +++ b/src/server/email-watch/mail-watch-provider.test.ts
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,321 @@
 +// (Lives here, not in src/providers/mail_watch/, so the provider-directory scan in generate:registry never meets a
 +// directory that has a test but no definition.)
 +// Decision 10: the built-in mail_watch provider (authTypes ["no_auth"]) reads and acknowledges the watcher's list.
@@ -2196,7 +2186,12 @@ index 00000000..6ca0fcaf
 +import { provider } from "../../providers/mail_watch/definition.ts";
 +import { createMailWatchExecutors, executors as unboundExecutors } from "../../providers/mail_watch/executors.ts";
 +
-+const context: ExecutionContext = { getCredential: async () => undefined };
++// R3.8(b): the executors deny by default without a predicate; ActionRunner always supplies one. These unit tests stand in
++// for ActionRunner with an allow-all predicate (the scoping itself is tested in mail-watch-scope.test.ts).
++const context: ExecutionContext & { isConnectionAllowed: (connectionName: string) => Promise<boolean> } = {
++  getCredential: async () => undefined,
++  isConnectionAllowed: async () => true,
++};
 +const iso = (ms: number) => new Date(ms).toISOString();
 +
 +let database: SqliteD1Database | undefined;
@@ -2485,10 +2480,10 @@ index 00000000..6ca0fcaf
 +});
 diff --git a/src/server/email-watch/mail-watch-scope.test.ts b/src/server/email-watch/mail-watch-scope.test.ts
 new file mode 100644
-index 00000000..c2d58e81
+index 00000000..613224d9
 --- /dev/null
 +++ b/src/server/email-watch/mail-watch-scope.test.ts
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,520 @@
 +// R3.1 (blocking): mail_watch is a no_auth provider, so ActionRunner skips policy.evaluateConnection for it. A token
 +// scoped to chosen accounts (patch 0004: allowedConnections holds connection ids) must still see and acknowledge only
 +// the items of those accounts. Exercised through the real ActionRunner with a scoped ActionPolicySnapshot.
@@ -2502,6 +2497,15 @@ index 00000000..c2d58e81
 +//   Only the mail_watch executors read it. When the field is absent (a direct executor call, as the unit tests in
 +//   mail-watch-provider.test.ts make) the executors treat every connection as allowed.
 +//   Filtering happens before `limit`, and watch_gap items follow the same rule as any other item.
++//
++// R3.8 (blocking, lead decision), tested below in "R3.8"
++//   (a) the scope must not be worked out in one statement and applied in another that can leak: a row the cron
++//       inserts for a denied connection between the two statements must never be returned or acknowledged, whether
++//       the denied set was empty at scope time or shorter than the allowed set. With a predicate present, an empty
++//       allowed set returns nothing.
++//   (b) deny by default: with no isConnectionAllowed on the context, list returns no items and acknowledge changes
++//       nothing. Only ActionRunner, which always sets the predicate, gets items.
++import type { D1DatabaseBinding, D1PreparedStatementBinding } from "../cloudflare/cloudflare-bindings.ts";
 +import type { ExecutionContext, ExecutionResult } from "../../core/types.ts";
 +
 +import { afterEach, describe, expect, it } from "vitest";
@@ -2525,7 +2529,7 @@ index 00000000..c2d58e81
 +  for (const database of databases.splice(0)) database.close();
 +});
 +
-+async function setup() {
++async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
 +  const binding = new SqliteD1Database();
 +  databases.push(binding);
 +  const database = new D1RuntimeDatabase(binding);
@@ -2581,7 +2585,7 @@ index 00000000..c2d58e81
 +  const providerLoader = new ProviderLoader({
 +    mail_watch: async () => ({
 +      executors: createMailWatchExecutors({
-+        database: binding,
++        database: wrap ? wrap(binding) : binding,
 +        enabled: true,
 +        profileEmail: async (name) => EMAILS[name],
 +        now: () => T0,
@@ -2741,6 +2745,263 @@ index 00000000..c2d58e81
 +    expect(await acknowledge({ ids: ["a1", "b1"] }, context(["a"]))).toMatchObject({ ok: true, output: { acknowledged: 1 } });
 +    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
 +    expect(status).toMatchObject({ a1: "acknowledged", b1: "pending" });
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// R3.8 (a): a row for a denied connection that appears between "work out the scope" and "list/acknowledge" must
++// not leak. The wrapper below inserts a fresh row (id and connection `intruder-N`, newest of all) either right
++// after every SELECT on email_watch_items completes ("after-select": between any scope statement and the next
++// one), or right after each answer of the predicate ("after-predicate"). The predicate never allows `intruder-N`.
++// ---------------------------------------------------------------------------------------------------------------
++const literal = (value: unknown): string =>
++  value === null ? "null" : typeof value === "number" ? String(value) : `'${String(value).replace(/'/g, "''")}'`;
++
++class InjectingD1 implements D1DatabaseBinding {
++  injected = 0;
++  readonly inner: SqliteD1Database;
++  readonly onSelect: boolean;
++
++  constructor(inner: SqliteD1Database, onSelect: boolean) {
++    this.inner = inner;
++    this.onSelect = onSelect;
++  }
++
++  inject(): void {
++    if (this.injected >= 20) return;
++    this.injected += 1;
++    const row = itemRow({
++      id: `intruder-${this.injected}`,
++      connection_name: `intruder-${this.injected}`,
++      received_at: iso(T0 - 1000),
++      created_at: iso(T0 - 1000),
++    });
++    const columns = Object.keys(row);
++    this.inner.exec(
++      `insert into email_watch_items (${columns.join(", ")}) values (${Object.values(row).map(literal).join(", ")})`,
++    );
++  }
++
++  prepare(query: string): D1PreparedStatementBinding {
++    return new InjectingStatement(this, this.inner.prepare(query), query);
++  }
++
++  async batch(statements: D1PreparedStatementBinding[]) {
++    const result = await this.inner.batch(statements.map((s) => (s instanceof InjectingStatement ? s.target : s)));
++    if (this.onSelect && statements.some((s) => s instanceof InjectingStatement && s.readsItems())) this.inject();
++    return result;
++  }
++}
++
++class InjectingStatement implements D1PreparedStatementBinding {
++  private readonly db: InjectingD1;
++  readonly target: D1PreparedStatementBinding;
++  private readonly query: string;
++
++  constructor(db: InjectingD1, target: D1PreparedStatementBinding, query: string) {
++    this.db = db;
++    this.target = target;
++    this.query = query;
++  }
++
++  readsItems(): boolean {
++    return /^\s*select/i.test(this.query) && /email_watch_items/i.test(this.query);
++  }
++
++  private after(): void {
++    if (this.db.onSelect && this.readsItems()) this.db.inject();
++  }
++
++  bind(...values: unknown[]): D1PreparedStatementBinding {
++    return new InjectingStatement(this.db, this.target.bind(...values), this.query);
++  }
++
++  async first<T = Record<string, unknown>>(): Promise<T | null> {
++    const result = await this.target.first<T>();
++    this.after();
++    return result;
++  }
++
++  async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
++    const result = await this.target.all<T>();
++    this.after();
++    return result;
++  }
++
++  async run(): Promise<{ success: boolean; meta: { changes?: number } }> {
++    const result = await this.target.run();
++    this.after();
++    return result;
++  }
++}
++
++type Mode = "after-select" | "after-predicate";
++const MODES: Mode[] = ["after-select", "after-predicate"];
++
++interface RaceCase {
++  name: string;
++  /** [id, connection, hours ago]: newest first by hours. */
++  rows: [string, string, number][];
++  allowed: string[];
++  expectedList: string[];
++  expectedAcknowledged: string[];
++}
++
++const RACE_CASES: RaceCase[] = [
++  {
++    name: "the denied set was empty at scope time (every existing connection is allowed)",
++    rows: [
++      ["a1", "a", 1],
++      ["b1", "b", 2],
++      ["a2", "a", 3],
++      ["b2", "b", 4],
++    ],
++    allowed: ["a", "b"],
++    expectedList: ["a1", "b1", "a2", "b2"],
++    expectedAcknowledged: ["a1", "b1", "a2", "b2"],
++  },
++  {
++    name: "the allowed list is longer than the denied one",
++    rows: [
++      ["a1", "a", 1],
++      ["d1", "d", 2],
++      ["b1", "b", 3],
++      ["c1", "c", 4],
++      ["d2", "d", 5],
++    ],
++    allowed: ["a", "b", "c"],
++    expectedList: ["a1", "b1", "c1"],
++    expectedAcknowledged: ["a1", "b1", "c1"],
++  },
++  {
++    name: "the allowed list is shorter than the denied one",
++    rows: [
++      ["a1", "a", 1],
++      ["b1", "b", 2],
++      ["c1", "c", 3],
++      ["d1", "d", 4],
++    ],
++    allowed: ["b"],
++    expectedList: ["b1"],
++    expectedAcknowledged: ["b1"],
++  },
++  {
++    name: "the allowed list is empty",
++    rows: [
++      ["a1", "a", 1],
++      ["b1", "b", 2],
++    ],
++    allowed: [],
++    expectedList: [],
++    expectedAcknowledged: [],
++  },
++];
++
++function raceSetup(testCase: RaceCase, mode: Mode) {
++  const inner = new SqliteD1Database();
++  databases.push(inner);
++  const db = new InjectingD1(inner, mode === "after-select");
++  const seed = async () => {
++    for (const [id, connection, hours] of testCase.rows) {
++      await insertItem(inner, itemRow({ id, connection_name: connection, received_at: iso(T0 - hours * HOUR), created_at: iso(T0 - hours * HOUR) }));
++    }
++  };
++  const executors = createMailWatchExecutors({ database: db, enabled: true, profileEmail: async (name) => EMAILS[name], now: () => T0 });
++  const context: ExecutionContext & { isConnectionAllowed: (name: string) => Promise<boolean> } = {
++    getCredential: async () => undefined,
++    isConnectionAllowed: async (name) => {
++      const answer = testCase.allowed.includes(name);
++      if (mode === "after-predicate") db.inject();
++      return answer;
++    },
++  };
++  return { db, inner, seed, executors, context };
++}
++
++describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%s)", (mode) => {
++  describe.each(RACE_CASES)("when $name", (testCase) => {
++    it("list never returns the intruder, and returns exactly the allowed items", async () => {
++      const r = raceSetup(testCase, mode);
++      await r.seed();
++      const result = await r.executors["mail_watch.list_pending_mail"]!({}, r.context);
++      expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList);
++      expect(JSON.stringify(result)).not.toContain("intruder");
++    });
++
++    it("list with limit 1 returns at most the newest allowed item, never an intruder", async () => {
++      const r = raceSetup(testCase, mode);
++      await r.seed();
++      const result = await r.executors["mail_watch.list_pending_mail"]!({ limit: 1 }, r.context);
++      expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList.slice(0, 1));
++    });
++
++    it("acknowledge never touches the intruder, and acknowledges exactly the allowed rows it was given", async () => {
++      const r = raceSetup(testCase, mode);
++      await r.seed();
++      const intruderIds = Array.from({ length: 20 }, (_, index) => `intruder-${index + 1}`);
++      const given = [...testCase.rows.map(([id]) => id), ...intruderIds];
++      const result = await r.executors["mail_watch.acknowledge_mail"]!({ ids: given.slice(0, 100) }, r.context);
++      expect(result).toMatchObject({ ok: true, output: { acknowledged: testCase.expectedAcknowledged.length } });
++      const rows = await selectAll<{ id: string; status: string }>(r.inner, "select id, status from email_watch_items order by id");
++      expect(rows.filter((row) => row.status === "acknowledged").map((row) => row.id).sort()).toEqual([...testCase.expectedAcknowledged].sort());
++      expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
++    });
++  });
++});
++
++describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
++  it("a token scoped to gmail:a never sees a denied-connection row inserted between the statements", async () => {
++    const s = await setup((binding) => new InjectingD1(binding, true));
++    const result = await s.list([s.ids.a!]);
++    expect(items(result).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++    expect(JSON.stringify(result)).not.toContain("intruder");
++  });
++
++  it("acknowledge under that token leaves the intruder rows pending", async () => {
++    const s = await setup((binding) => new InjectingD1(binding, true));
++    const given = ["a1", ...Array.from({ length: 20 }, (_, index) => `intruder-${index + 1}`)];
++    expect(await s.acknowledge([s.ids.a!], given)).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++    const rows = await statusOf(s);
++    expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
++  });
++});
++
++describe("R3.8 (b) deny by default: no isConnectionAllowed on the context", () => {
++  const bare: ExecutionContext = { getCredential: async () => undefined };
++
++  it("list returns no items even though pending rows exist", async () => {
++    const s = await setup();
++    const executors = createMailWatchExecutors({ database: s.binding, enabled: true, profileEmail: async (name) => EMAILS[name], now: () => T0 });
++    const list = executors["mail_watch.list_pending_mail"]!;
++    expect(items(await list({}, bare))).toEqual([]);
++    expect(items(await list({ connectionName: "a" }, bare))).toEqual([]);
++    expect(items(await list({ category: "deploy_failed", limit: 5 }, bare))).toEqual([]);
++  });
++
++  it("acknowledge changes nothing and counts 0", async () => {
++    const s = await setup();
++    const executors = createMailWatchExecutors({ database: s.binding, enabled: true, profileEmail: async (name) => EMAILS[name], now: () => T0 });
++    const before = await statusOf(s);
++    expect(await executors["mail_watch.acknowledge_mail"]!({ ids: ["a1", "b1", "gap-a", "ghost"] }, bare)).toMatchObject({
++      ok: true,
++      output: { acknowledged: 0 },
++    });
++    expect(await statusOf(s)).toEqual(before);
++  });
++
++  it("an allow-all predicate does return items, so the denial above is about the missing predicate, not the data", async () => {
++    const s = await setup();
++    const executors = createMailWatchExecutors({ database: s.binding, enabled: true, profileEmail: async (name) => EMAILS[name], now: () => T0 });
++    const allowAll: ExecutionContext & { isConnectionAllowed: (name: string) => Promise<boolean> } = {
++      getCredential: async () => undefined,
++      isConnectionAllowed: async () => true,
++    };
++    expect(items(await executors["mail_watch.list_pending_mail"]!({}, allowAll)).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b", "ghost"]);
++  });
++
++  it("the normal path still works: ActionRunner always supplies the predicate", async () => {
++    const s = await setup();
++    expect(items(await s.list(undefined)).length).toBe(7);
 +  });
 +});
 diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
