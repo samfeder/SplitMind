@@ -199,7 +199,7 @@ Until then, pick one of these:
 4. **Deployment-wide:** put explicit read action ids in `OOMOL_CONNECT_ALLOWED_ACTIONS` instead of `slack.*`.
    That makes the provider read-only for every account.
 
-## 6. Email watch (patch 0009, #126)
+## 6. Email watch (patches 0009 and 0011, #126, #104 to #107)
 
 The Worker's existing once-a-minute cron can check named Gmail accounts for new inbox mail and keep a short list of
 machine mail that needs action: a failed deploy or build, a GitHub failure or review request, a billing or quota
@@ -209,8 +209,9 @@ by default**; neither setting below is in `wrangler.template.jsonc`.
 **What it reads.** Only three Gmail reads, hard-coded in the watcher (any other action is refused before it reaches
 the action runner): `gmail.get_profile` (once per account, for the starting point), `gmail.list_history` (new inbox
 messages since the last check; drafts, sent mail, spam and trash are skipped) and `gmail.fetch_message_by_message_id`
-with `format: "metadata"` and five named headers: `From`, `Subject`, `Authentication-Results`, `X-GitHub-Reason`
-and `List-Id`. It never asks for a body, a snippet, recipients, labels or attachments. Every call goes through the
+with `format: "metadata"` and four named headers: `From`, `Subject`, `Authentication-Results` and
+`X-GitHub-Reason`. It never asks for a body, recipients, labels or attachments. Gmail's `format=metadata` response
+still includes a short snippet; the watcher discards it without storing or logging it. Every call goes through the
 normal action runner, so `OOMOL_CONNECT_ALLOWED_ACTIONS`, `OOMOL_CONNECT_BLOCKED_ACTIONS` and the runtime policy
 apply: an account whose policy refuses one of the three is skipped for that run. Do not put those three actions in
 `OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 15 Gmail action runs (each can cost two subrequests on Workers Free, which allows 50); more mail than that is read over the next
@@ -238,8 +239,13 @@ request titles are written by anyone. Mail from github.com that carries that hea
 only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
 
 **Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
-contain a verification code. Treat `email_watch_items` like the run log: private, and kept only for the retention
-period below.
+contain a verification code. Before a subject is stored, and before its duplicate key is computed, every run of 4 or
+more digits (single spaces or hyphens may split the digits: `123456`, `123 456`, `123-456`) is replaced with
+`[redacted]`, in every category. Years and invoice numbers are redacted too, and two code mails with different codes
+count as one item. **Residual:** these are not redacted: codes that mix letters and digits or have fewer than 4
+digits; non-ASCII digits (fullwidth, Arabic-Indic); and digits split by anything other than a single space or hyphen
+(a dot, a no-break space, an en dash, a zero-width character). Widening the rule is #110.
+Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
 message has the authserv-id `mx.google.com` (Gmail's own mail server stamps it, above anything the sender wrote), says
@@ -251,10 +257,17 @@ rule domain does not appear in the list.
 **Logs.** Watcher log lines carry only the account alias, counts, rule ids, categories and error codes: never a
 subject, an address, a header value or a Gmail id. Its run-log entries (Runs page, `caller` = `cron`) record the
 outcome and policy decision but no `inputSummary` or `outputSummary`, so nothing from a message reaches the run log,
-unlike the rows in section 4.
+unlike the rows in section 4. Runs of the `mail_watch` actions (`list_pending_mail`, `acknowledge_mail`) are
+outcome-only too, whoever calls them and whatever `audit` value they pass: `ActionRunner` enforces it for the
+`mail_watch` provider, and a failed run keeps its error code but a fixed message.
 
-**Retention.** Once a day, on the first watch run after 00:00 UTC, `pending` items older than 14 days and
-`acknowledged` items older than 7 days are deleted. Cursors stay.
+**Retention.** A sweep runs on every cron invocation whose UTC minute is a multiple of the watch interval, whether
+or not any account is configured. It deletes `pending` items older than 14 days and `acknowledged` items older than 7
+days, then deletes all items and cursors of any account that is not in the current
+`OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS` list (an empty or unset list purges everything; malformed entries count as
+not watched). So removing an account, or turning the watch off, purges what was stored for it within one interval.
+The sweep uses D1 only: no Gmail call, no KV write, no run-log row. If the tables do not exist yet it does nothing;
+any other failure is logged once by error name and the other cron work still runs.
 
 **Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)
 returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
