@@ -242,7 +242,9 @@ only. GitHub account mail without it (a new sign-in, say) can still match `accou
 contain a verification code. Before a subject is stored, and before its duplicate key is computed, every run of 4 or
 more digits (single spaces or hyphens may split the digits: `123456`, `123 456`, `123-456`) is replaced with
 `[redacted]`, in every category. Years and invoice numbers are redacted too, and two code mails with different codes
-count as one item. **Residual:** codes that mix letters and digits, or have fewer than 4 digits, are not redacted.
+count as one item. **Residual:** these are not redacted: codes that mix letters and digits or have fewer than 4
+digits; non-ASCII digits (fullwidth, Arabic-Indic); and digits split by anything other than a single space or hyphen
+(a dot, a no-break space, an en dash, a zero-width character). Widening the rule is #110.
 Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
