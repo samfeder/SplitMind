@@ -1,0 +1,46 @@
+SplitMind patch 0010 for OpenConnector v1.9.2.
+The oauth-flow-service test "stores the token returned by a provider OAuth runtime"
+hard-codes expiresAt 2026-10-30, a date that has expired, so the test fails on any
+run after it. This makes the expiry one hour from now. Candidate for upstream.
+Upstream issue: not filed yet.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: [PATCH] test(oauth): use a relative expiry in the provider runtime token test
+
+The fixture's expiresAt was the fixed date 2026-10-30T00:00:00.000Z. Once that date
+passed, the stored credential counted as expired and the test failed. The expiry is
+now computed as one hour from Date.now(), and the assertion uses the same value.
+
+---
+diff --git a/src/oauth/oauth-flow-service.test.ts b/src/oauth/oauth-flow-service.test.ts
+index 6b7366e6..435f2ffb 100644
+--- a/src/oauth/oauth-flow-service.test.ts
++++ b/src/oauth/oauth-flow-service.test.ts
+@@ -1262,6 +1262,7 @@ describe("OAuthFlowService", () => {
+   });
+ 
+   it("stores the token returned by a provider OAuth runtime", async () => {
++    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+     let callbackParameters: Record<string, string> | undefined;
+     let callbackQuery: string | undefined;
+     let callbackState: string | undefined;
+@@ -1275,7 +1276,7 @@ describe("OAuthFlowService", () => {
+             accessToken: "provider-access-token",
+             refreshToken: "provider-access-token",
+             tokenType: "Bearer",
+-            expiresAt: "2026-10-30T00:00:00.000Z",
++            expiresAt,
+             providerSecret: { inventory: "provider-owned" },
+             metadata: { permissions: "read,write" },
+           };
+@@ -1301,7 +1302,7 @@ describe("OAuthFlowService", () => {
+       authType: "oauth2",
+       accessToken: "provider-access-token",
+       refreshToken: "provider-access-token",
+-      expiresAt: "2026-10-30T00:00:00.000Z",
++      expiresAt,
+       providerSecret: { inventory: "provider-owned" },
+       metadata: { permissions: "read,write" },
+     });
