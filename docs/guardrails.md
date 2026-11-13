@@ -246,7 +246,8 @@ digits may be separated by nothing or by exactly one separator: whitespace (incl
 hyphen, a dash (U+2010 to U+2015) or a minus (U+2212), so `123456`, `123 456`, `482.913` and `482–913` are all
 redacted. Years, invoice numbers, decimals such as `1.234` and IP-like strings with 4 or more digits are redacted too,
 and two code mails with different codes count as one item. **Residual:** these are not redacted: codes that mix
-letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`).
+letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`), and digits split by
+invisible characters other than the zero-width ones removed (a soft hyphen or a directional mark, for example; #114).
 Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
