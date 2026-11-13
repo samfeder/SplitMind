@@ -42,7 +42,7 @@ index 1c44daf..c38df35 100644
 +    });
 +
 +    await expect(service.resolveForExecution("uptimerobot")).rejects.toMatchObject({
-+      code: "connection_required_BROKEN",
++      code: "connection_required",
 +      message: "uptimerobot has no default connection. Pass connectionName; list_connections shows the uptimerobot accounts.",
 +    });
 +    await expect(service.resolveForExecution("uptimerobot", "work")).resolves.toMatchObject({ kind: "local" });
