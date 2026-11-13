@@ -1,0 +1,1171 @@
+SplitMind patch 0012 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0011).
+Upstream issue: not filed yet.
+Email watch hardening: #110 wider code redaction, #111 retention sweep limits.
+From 3dd0a261bccb8b312cc9e3e920a7ad281ed06c7a Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Fri, 13 Nov 2026 10:22:54 -0500
+Subject: [PATCH] fix(email-watch): harden redaction and retention sweep for
+ #110, #111
+
+#110: code redaction removes zero-width characters and covers any Unicode
+decimal digit with one separator (whitespace incl. no-break spaces, dot,
+hyphens and dashes, minus) between digits.
+#111: the sweep purges unwatched connections with no bound-parameter cap (read
+names, delete in chunks of 50), handles each table on its own, and migration
+0020 adds indexes for the sweep scans. Also moves MAIL_WATCH_SERVICE above the
+ActionRunner JSDoc.
+---
+ migrations/0020_email_watch_indexes.sql       |   4 +
+ .../postgresql/0020_email_watch_indexes.sql   |   4 +
+ src/server/actions/action-runner.ts           |   4 +-
+ src/server/cloudflare-email-watch.test.ts     |  93 ++-
+ src/server/email-watch/migration.test.ts      | 116 ++++
+ src/server/email-watch/rules.ts               |  11 +-
+ src/server/email-watch/test-support.ts        |  51 +-
+ src/server/email-watch/watcher.test.ts        | 542 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             |  46 +-
+ .../storage/postgres/runtime-store.test.ts    |  55 ++
+ .../storage/sqlite/runtime-store.test.ts      |   1 +
+ 11 files changed, 906 insertions(+), 21 deletions(-)
+ create mode 100644 migrations/0020_email_watch_indexes.sql
+ create mode 100644 migrations/postgresql/0020_email_watch_indexes.sql
+
+diff --git a/migrations/0020_email_watch_indexes.sql b/migrations/0020_email_watch_indexes.sql
+new file mode 100644
+index 00000000..a4a736e7
+--- /dev/null
++++ b/migrations/0020_email_watch_indexes.sql
+@@ -0,0 +1,4 @@
++-- Email watch (patch 0012). The retention sweep scans by status and age, and the purge by connection.
++create index email_watch_items_status_created on email_watch_items (status, created_at);
++create index email_watch_items_status_acknowledged on email_watch_items (status, acknowledged_at);
++create index email_watch_items_connection on email_watch_items (connection_name);
+diff --git a/migrations/postgresql/0020_email_watch_indexes.sql b/migrations/postgresql/0020_email_watch_indexes.sql
+new file mode 100644
+index 00000000..a4a736e7
+--- /dev/null
++++ b/migrations/postgresql/0020_email_watch_indexes.sql
+@@ -0,0 +1,4 @@
++-- Email watch (patch 0012). The retention sweep scans by status and age, and the purge by connection.
++create index email_watch_items_status_created on email_watch_items (status, created_at);
++create index email_watch_items_status_acknowledged on email_watch_items (status, acknowledged_at);
++create index email_watch_items_connection on email_watch_items (connection_name);
+diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
+index efa27ec8..6931981e 100644
+--- a/src/server/actions/action-runner.ts
++++ b/src/server/actions/action-runner.ts
+@@ -57,11 +57,11 @@ export interface ActionRunResult {
+   connection?: ConnectionSummary;
+ }
+ 
++const MAIL_WATCH_SERVICE = "mail_watch";
++
+ /**
+  * Shared execution boundary for HTTP, MCP, and future local callers.
+  */
+-const MAIL_WATCH_SERVICE = "mail_watch";
+-
+ export class ActionRunner {
+   private readonly options: ActionRunnerOptions;
+ 
+diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
+index 04198670..ccb1d38d 100644
+--- a/src/server/cloudflare-email-watch.test.ts
++++ b/src/server/cloudflare-email-watch.test.ts
+@@ -9,7 +9,7 @@ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/cli
+ import { provider as gmail } from "../providers/gmail/definition.ts";
+ import { provider as mailWatch } from "../providers/mail_watch/definition.ts";
+ import worker from "./cloudflare.ts";
+-import { DAY, FakeMailbox, HOUR, OWNER_EMAIL, T0, fakeGmailFetch, insertCursor, insertItem, itemRow } from "./email-watch/test-support.ts";
++import { BindLimitedD1, DAY, FakeMailbox, HOUR, OWNER_EMAIL, T0, fakeGmailFetch, insertCursor, insertItem, itemRow } from "./email-watch/test-support.ts";
+ import type { FixtureMessage } from "./email-watch/test-support.ts";
+ import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
+ import { D1RuntimeDatabase } from "./storage/d1/runtime-store.ts";
+@@ -37,16 +37,18 @@ const assets: AssetsBinding = {
+ class RecordingD1 implements D1DatabaseBinding {
+   readonly queries: string[] = [];
+   readonly inner = new SqliteD1Database();
++  /** Real D1 refuses a statement with more than 100 bound parameters; SQLite alone would not (patch 0012, #111). */
++  private readonly limited = new BindLimitedD1(this.inner);
+   failWhen?: (query: string) => boolean;
+ 
+   batch(statements: D1PreparedStatementBinding[]) {
+-    return this.inner.batch(statements);
++    return this.limited.batch(statements);
+   }
+ 
+   prepare(query: string): D1PreparedStatementBinding {
+     this.queries.push(query);
+     if (this.failWhen?.(query)) throw new Error("fixture D1 failure");
+-    return this.inner.prepare(query);
++    return this.limited.prepare(query);
+   }
+ 
+   watchQueries(): string[] {
+@@ -593,6 +595,32 @@ describe("retention sweep (patch 0011, #106)", () => {
+       expect(await cursorNames(s)).toEqual(["a"]);
+     });
+ 
++    it("with 120 watched connections (D1 binds at most 100 parameters per statement) a due invocation purges the 3 unwatched ones, keeps the watched ones' rows and logs no error", async () => {
++      const error = vi.spyOn(console, "error").mockImplementation(() => {});
++      vi.spyOn(console, "warn").mockImplementation(() => {});
++      vi.spyOn(console, "info").mockImplementation(() => {});
++      const watched = Array.from({ length: 120 }, (_, index) => `conn-${String(index).padStart(3, "0")}`);
++      const s = await atMinute(M0, { names: watched, vars: { [CONNECTIONS]: watched.map((name) => `gmail:${name}`).join(" ") } });
++      const now = at(M0);
++      const kept = ["conn-000", "conn-060", "conn-119"];
++      for (const name of [...kept, "gone-1", "gone-2", "gone-3"]) {
++        await insertCursor(s.db, { connection_name: name, history_id: "1000", last_run_at: iso(now - HOUR) });
++        await insertItem(s.db, itemRow({ id: `${name}-pending`, connection_name: name, created_at: iso(now - HOUR), received_at: iso(now - HOUR) }));
++        await insertItem(
++          s.db,
++          itemRow({ id: `${name}-acked`, connection_name: name, status: "acknowledged", acknowledged_at: iso(now - HOUR), created_at: iso(now - 2 * HOUR) }),
++        );
++      }
++      await insertItem(s.db, itemRow({ id: "conn-060-expired", connection_name: "conn-060", created_at: iso(now - 30 * DAY), received_at: iso(now - 30 * DAY) }));
++      const results = await s.tick(M0);
++      expect(results).toEqual([{ status: "fulfilled", value: undefined }]);
++      expect(error.mock.calls).toEqual([]);
++      expect(await itemIds(s)).toEqual(kept.flatMap((name) => [`${name}-acked`, `${name}-pending`]));
++      const cursors = await cursorNames(s);
++      for (const name of kept) expect(cursors).toContain(name);
++      expect(cursors.filter((name) => name.startsWith("gone-"))).toEqual([]);
++    });
++
+     it("with both configured nothing is purged", async () => {
+       const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a gmail:b" } });
+       await seedFresh(s, at(M0));
+@@ -819,6 +847,24 @@ describe("retention sweep (patch 0011, #106)", () => {
+       expect(await database.saasProjectStore.getCleanupStats()).toMatchObject({ pending: 0, manual: 0 });
+     });
+ 
++    it.each([
++      ["email_watch_items", "email_watch_cursors"],
++      ["email_watch_cursors", "email_watch_items"],
++    ])("with only %s missing (patch 0012, #111) the rows of %s are still purged, and nothing is logged", async (missing, present) => {
++      const logged = [vi.spyOn(console, "error"), vi.spyOn(console, "warn"), vi.spyOn(console, "info")].map((spy) =>
++        spy.mockImplementation(() => {}),
++      );
++      const { s } = await withLeaseAndNoWatch();
++      await seedFresh(s, at(M0));
++      await insertItem(s.db, itemRow({ id: "a-expired", connection_name: "a", created_at: iso(at(M0) - 30 * DAY), received_at: iso(at(M0) - 30 * DAY) }));
++      s.db.inner.exec(`drop table ${missing}`);
++      const results = await s.tick(M0);
++      expect(results).toEqual([{ status: "fulfilled", value: undefined }]);
++      for (const spy of logged) expect(spy.mock.calls).toEqual([]);
++      const left = await s.db.inner.prepare(`select count(*) as n from ${present}`).all();
++      expect(left).toMatchObject({ results: [{ n: 0 }] });
++    });
++
+     it("any other failure is logged once with the error name only, and cleanup still runs and settles", async () => {
+       class FixtureSweepFailure extends Error {
+         override name = "FixtureSweepFailure";
+@@ -1047,4 +1093,45 @@ describe("one-time codes through the cron and the list action (patch 0011, #105)
+     expect(text).toContain("Your verification code is [redacted]");
+     for (const digits of ["482913", "771 204", "771204"]) expect(text, digits).not.toContain(digits);
+   });
++
++  // Patch 0012, #110 end to end: Unicode digits, wider separators and zero-width characters.
++  it("stores and lists Unicode-digit, wide-separator and zero-width codes as [redacted], merged into one item (patch 0012, #110)", async () => {
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    await s.tick(M0);
++    const mailbox = s.mailboxes.work!;
++    const google = (subject: string): FixtureMessage => ({ from: "Google <no-reply@accounts.google.com>", subject });
++    const codes = [
++      "\uff14\uff18\uff12\uff19\uff11\uff13",
++      "\u0664\u0668\u0662\u0669\u0661\u0663",
++      "482.913",
++      "482\u00a0913",
++      "482\u2013913",
++      "4\u200b8\u200b2\u200b9",
++      "482\u2212913",
++    ];
++    for (const code of codes) mailbox.deliver(google(`Your verification code is ${code}`));
++    mailbox.deliver(google("Your verification code is 123 - 456"));
++    mailbox.deliver(google("Your verification code is 482"));
++    await s.tick(M0 + 10);
++
++    const rows = await s.watchRows<{ subject: string; occurrences: number }>("email_watch_items");
++    expect(rows.map((row) => [row.subject, row.occurrences]).sort()).toEqual([
++      ["Your verification code is 123 - 456", 1],
++      ["Your verification code is 482", 1],
++      ["Your verification code is [redacted]", codes.length],
++    ]);
++
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/mail_watch.list_pending_mail`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input: {} }),
++      }),
++      s.env,
++      { waitUntil() {}, passThroughOnException() {} },
++    );
++    const text = JSON.stringify(await response.json());
++    expect(text).toContain("Your verification code is [redacted]");
++    for (const code of codes) expect(text, JSON.stringify(code)).not.toContain(code);
++  });
+ });
+diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
+index 3b227a91..44900481 100644
+--- a/src/server/email-watch/migration.test.ts
++++ b/src/server/email-watch/migration.test.ts
+@@ -1,3 +1,4 @@
++import { DatabaseSync } from "node:sqlite";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { defaultMigrationSource } from "../storage/migration-source.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+@@ -107,6 +108,121 @@ describe("0019_email_watch migration (sqlite and D1)", () => {
+   });
+ });
+ 
++// Patch 0012, #111: the sweep deletes by status and age, and by connection name. These indexes keep each sweep to
++// about the rows it deletes. Index names are not pinned; the columns, their order and non-uniqueness are.
++describe("0020_email_watch_indexes migration (patch 0012, #111)", () => {
++  const NAME = "0020_email_watch_indexes.sql";
++
++  interface IndexRow {
++    name: string;
++    unique: number;
++    origin: string;
++  }
++  interface Index {
++    columns: string[];
++    unique: boolean;
++    origin: string;
++  }
++
++  /** Every index on a table, with its columns in index order, read through SQLite's own pragmas. */
++  function indexesOf(connection: { prepare(sql: string): { all(): unknown[] } }, table: string): Index[] {
++    return (connection.prepare(`pragma index_list(${table})`).all() as IndexRow[]).map((row) => ({
++      columns: (connection.prepare(`pragma index_xinfo("${row.name}")`).all() as { seqno: number; name: string | null; key: number }[])
++        .filter((column) => column.key === 1)
++        .sort((a, b) => a.seqno - b.seqno)
++        .map((column) => String(column.name)),
++      unique: row.unique === 1,
++      origin: row.origin,
++    }));
++  }
++
++  const hasIndex = (indexes: Index[], columns: string[]) =>
++    indexes.some((index) => index.origin === "c" && !index.unique && index.columns.join(",") === columns.join(","));
++
++  it("comes right after 0019_email_watch, in both the D1/SQLite and the Postgres directory", () => {
++    for (const dialect of ["sqlite", "postgresql"] as const) {
++      const names = defaultMigrationSource.readMigrations(dialect).map((migration) => migration.name);
++      expect(names, dialect).toContain(NAME);
++      expect(names.indexOf(NAME), dialect).toBe(names.indexOf("0019_email_watch.sql") + 1);
++    }
++  });
++
++  it("creates plain indexes on email_watch_items (status, created_at), (status, acknowledged_at) and (connection_name)", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(hasIndex(indexes, ["status", "created_at"])).toBe(true);
++      expect(hasIndex(indexes, ["status", "acknowledged_at"])).toBe(true);
++      expect(hasIndex(indexes, ["connection_name"])).toBe(true);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("is visible through the D1 test database too: sqlite_master lists the three indexes on email_watch_items", async () => {
++    const rows = await selectAll<{ name: string; sql: string | null }>(
++      open(),
++      "select name, sql from sqlite_master where type = 'index' and tbl_name = 'email_watch_items' and sql is not null",
++    );
++    const normalised = rows.map((row) => String(row.sql).replace(/\s+/g, " ").toLowerCase());
++    for (const columns of ["(status, created_at)", "(status, acknowledged_at)", "(connection_name)"]) {
++      expect(normalised.filter((sql) => sql.includes(columns)).length, columns).toBeGreaterThanOrEqual(1);
++    }
++  });
++
++  it("keeps the indexes and the unique constraint 0019 made", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(hasIndex(indexes, ["status", "received_at"])).toBe(true);
++      expect(hasIndex(indexes, ["dedup_key", "created_at"])).toBe(true);
++      expect(indexes.some((index) => index.unique && index.columns.join(",") === "connection_name,gmail_message_id")).toBe(true);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("adds no explicit index to email_watch_cursors: its primary key already is connection_name", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      expect(indexesOf(connection, "email_watch_cursors").filter((index) => index.origin === "c")).toEqual([]);
++      const primaryKey = (connection.prepare("pragma table_info(email_watch_cursors)").all() as { name: string; pk: number }[]).filter(
++        (column) => column.pk > 0,
++      );
++      expect(primaryKey.map((column) => column.name)).toEqual(["connection_name"]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("applies on top of a database that already has 0019 and rows, keeping every row", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      const migrations = defaultMigrationSource.readMigrations("sqlite");
++      for (const migration of migrations.filter((entry) => entry.name < NAME)) connection.exec(migration.sql);
++      expect(hasIndex(indexesOf(connection, "email_watch_items"), ["status", "created_at"])).toBe(false);
++      connection.exec(`
++        insert into email_watch_cursors values ('work', '1', null, '2026-11-11T12:00:00.000Z', 0);
++        insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1'),
++                 ('a', 'work', 'g2', 't2', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-10T12:00:00.000Z', 'acknowledged', '2026-11-11T12:00:00.000Z', 'k2');
++      `);
++      connection.exec(migrations.find((entry) => entry.name === NAME)!.sql);
++      expect(connection.prepare("select id from email_watch_items order by id").all()).toEqual([{ id: "a" }, { id: "p" }]);
++      expect(connection.prepare("select connection_name from email_watch_cursors").all()).toEqual([{ connection_name: "work" }]);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(hasIndex(indexes, ["status", "created_at"])).toBe(true);
++      expect(hasIndex(indexes, ["status", "acknowledged_at"])).toBe(true);
++      expect(hasIndex(indexes, ["connection_name"])).toBe(true);
++    } finally {
++      connection.close();
++    }
++  });
++});
++
+ describe("Postgres parity", () => {
+   it("has the same 0019 file name as the D1 migration", () => {
+     const names = defaultMigrationSource.readMigrations("postgresql").map((migration) => migration.name);
+diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
+index 20347713..a5581063 100644
+--- a/src/server/email-watch/rules.ts
++++ b/src/server/email-watch/rules.ts
+@@ -189,12 +189,17 @@ function stripControlCharacters(text: string): string {
+   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+ }
+ 
++const ZERO_WIDTH = /\u200b|\u200c|\u200d|\u2060|\ufeff/g;
++// One separator at most between digits: whitespace (incl. no-break spaces), ".", "-", U+2010-U+2015 and U+2212.
++const CODE_RUN = /\p{Nd}(?:[\s.\u002d\u2010-\u2015\u2212]?\p{Nd}){3,}/gu;
++
+ /**
+- * Replace every run of 4 or more digits, where single spaces or hyphens may split the digits, so a one-time code is
+- * never stored. Codes that mix letters and digits, or have fewer than 4 digits, are left alone (documented residual).
++ * Remove zero-width characters, then replace every run of 4 or more Unicode decimal digits, where one separator
++ * character may sit between neighbouring digits, so a one-time code is never stored. Codes that mix letters and
++ * digits, have fewer than 4 digits or use a multi-character separator are left alone (documented residual).
+  */
+ export function redactCodes(subject: string): string {
+-  return subject.replace(/\d(?:[ -]?\d){3,}/g, "[redacted]");
++  return subject.replace(ZERO_WIDTH, "").replace(CODE_RUN, "[redacted]");
+ }
+ 
+ function truncate(subject: string): string {
+diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
+index 9bc6b565..025d5d56 100644
+--- a/src/server/email-watch/test-support.ts
++++ b/src/server/email-watch/test-support.ts
+@@ -2,7 +2,7 @@
+ // example.com / example.org or on a rule domain (vercel.com, github.com, ...) that the rules table names.
+ // Not imported by product code.
+ import type { ActionRunResult, RunActionInput } from "../actions/action-runner.ts";
+-import type { D1DatabaseBinding } from "../cloudflare/cloudflare-bindings.ts";
++import type { D1DatabaseBinding, D1PreparedStatementBinding } from "../cloudflare/cloudflare-bindings.ts";
+ 
+ export const T0: number = Date.UTC(2026, 10, 11, 12, 0, 0);
+ export const HOUR = 3_600_000;
+@@ -450,3 +450,52 @@ export async function insertCursor(
+ export async function selectAll<T = Record<string, unknown>>(database: SqlDatabase, query: string): Promise<T[]> {
+   return (await database.prepare(query).all<T>()).results;
+ }
++
++/** What Cloudflare D1 allows: a statement may bind at most 100 parameters. */
++export const D1_MAX_BOUND_PARAMETERS = 100;
++
++export interface ExecutedStatement {
++  query: string;
++  /** Number of values bound when the statement was executed (run, all or first). */
++  bound: number;
++}
++
++/**
++ * A D1 database that behaves like the real one in the one way SQLite does not: binding more than `limit` values
++ * to one statement throws, as D1 does ("too many SQL variables"). Records every statement that gets executed.
++ */
++export class BindLimitedD1 implements D1DatabaseBinding {
++  readonly executed: ExecutedStatement[] = [];
++
++  private readonly inner: D1DatabaseBinding;
++  private readonly limit: number;
++  private readonly originals = new WeakMap<object, D1PreparedStatementBinding>();
++
++  constructor(inner: D1DatabaseBinding, limit: number = D1_MAX_BOUND_PARAMETERS) {
++    this.inner = inner;
++    this.limit = limit;
++  }
++
++  batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null }[]> {
++    return this.inner.batch(statements.map((statement) => this.originals.get(statement) ?? statement));
++  }
++
++  prepare(query: string): D1PreparedStatementBinding {
++    return this.wrap(this.inner.prepare(query), query, 0);
++  }
++
++  private wrap(statement: D1PreparedStatementBinding, query: string, bound: number): D1PreparedStatementBinding {
++    const record = () => this.executed.push({ query, bound });
++    const wrapped = {
++      bind: (...values: unknown[]) => {
++        if (values.length > this.limit) throw new Error(`D1_ERROR: too many SQL variables (${values.length} bound, limit ${this.limit})`);
++        return this.wrap(statement.bind(...values), query, values.length);
++      },
++      first: (...args: []) => (record(), statement.first(...args)),
++      all: (...args: []) => (record(), statement.all(...args)),
++      run: () => (record(), statement.run()),
++    } as D1PreparedStatementBinding;
++    this.originals.set(wrapped, statement);
++    return wrapped;
++  }
++}
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index 36ed2c0a..79e11fb2 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -39,8 +39,10 @@
+ import { createHash } from "node:crypto";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { ActionPolicyService } from "../../core/action-policy.ts";
++import type { D1DatabaseBinding } from "../cloudflare/cloudflare-bindings.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+ import {
++  BindLimitedD1,
+   DAY,
+   FakeGmailRunner,
+   FakeMailbox,
+@@ -55,7 +57,7 @@ import {
+   selectAll,
+ } from "./test-support.ts";
+ import type { FixtureMessage } from "./test-support.ts";
+-import { EmailWatcher } from "./watcher.ts";
++import { EmailWatcher, sweepEmailWatchRetention } from "./watcher.ts";
+ 
+ const policy = new ActionPolicyService().createSnapshot();
+ const HEADER_NAMES = ["Authentication-Results", "From", "Subject", "X-GitHub-Reason"];
+@@ -1067,6 +1069,276 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+     await r.run();
+     expect((await itemsOf(r))[0]!.subject).toBe("Mail between 2026-11-11 12:00 UTC and now was not checked");
+   });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // Patch 0012, #110: Unicode digits, wider separators, zero-width characters. Every expected value below is a
++  // literal, or comes from the character-scan oracle further down; none restates the implementation's pattern.
++  // -------------------------------------------------------------------------------------------------------------
++  const REDACTED = "Your verification code is [redacted]";
++  const codeMail = (code: string) => `Your verification code is ${code}`;
++  const ZERO_WIDTH = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"];
++  const DASHES = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015"];
++
++  it.each([
++    ["fullwidth digits", "\uff14\uff18\uff12\uff19\uff11\uff13"],
++    ["Arabic-Indic digits", "\u0664\u0668\u0662\u0669\u0661\u0663"],
++    ["Devanagari digits", "\u096a\u096e\u0968\u096f\u0967\u0969"],
++    ["digits of four different scripts in one run", "4\uff18\u0662\u09ef\u0661\u0969"],
++    ["fullwidth digits, 4 only", "\uff14\uff18\uff12\uff19"],
++    ["a dot", "482.913"],
++    ["a no-break space U+00A0", "482\u00a0913"],
++    ["a narrow no-break space U+202F", "482\u202f913"],
++    ["a figure space U+2007", "482\u2007913"],
++    ["a thin space U+2009", "482\u2009913"],
++    ["an ideographic space U+3000", "482\u3000913"],
++    ["a minus sign U+2212", "482\u2212913"],
++    ["an en dash", "482\u2013913"],
++    ["a dot between fullwidth digits", "\uff14\uff18\uff12.\uff19\uff11\uff13"],
++    ["a no-break space between Arabic-Indic digits", "\u0664\u0668\u0662\u00a0\u0669\u0661\u0663"],
++    ["a separator after every digit", "4\u00a08.2\u22129\u20131"],
++  ])("redacts a code written with %s", async (_name, code) => {
++    expect(await storedSubject(google(codeMail(code)))).toBe(REDACTED);
++  });
++
++  it.each(DASHES.map((dash) => [`U+${dash.codePointAt(0)!.toString(16).toUpperCase()}`, dash]))(
++    "treats the dash %s between digits as one separator",
++    async (_name, dash) => {
++      expect(await storedSubject(google(codeMail(`482${dash}913`)))).toBe(REDACTED);
++    },
++  );
++
++  it.each(ZERO_WIDTH.map((char) => [`U+${char.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`, char]))(
++    "removes the zero-width character %s before matching, so digits split by it are one run",
++    async (_name, zero) => {
++      expect(await storedSubject(google(codeMail(`4${zero}8${zero}2${zero}9`)))).toBe(REDACTED);
++      expect(await storedSubject(google(codeMail(`482${zero}-${zero}913`)))).toBe(REDACTED);
++      expect(await storedSubject(google(codeMail(`482${zero}${zero}913`)))).toBe(REDACTED);
++    },
++  );
++
++  it("keeps the sentence around a redacted code and the text after it", async () => {
++    expect(await storedSubject(google("Your verification code is 4829. Do not share it."))).toBe(
++      "Your verification code is [redacted]. Do not share it.",
++    );
++    expect(await storedSubject(google("Your verification code is \u0664\u0668\u0662\u0669, then 77\u00a0310 (expires)"))).toBe(
++      "Your verification code is [redacted], then [redacted] (expires)",
++    );
++  });
++
++  it("does not treat a separator at either end of a run as part of it", async () => {
++    expect(await storedSubject(google("Your verification code is -4829-"))).toBe("Your verification code is -[redacted]-");
++    expect(await storedSubject(google("Your verification code\u00a04829\u00a0today"))).toBe("Your verification code\u00a0[redacted]\u00a0today");
++  });
++
++  it("applies redaction after control characters are stripped", async () => {
++    expect(await storedSubject(google(codeMail("4\u00078\u00072\u00079")))).toBe(REDACTED);
++  });
++
++  it("decimal numbers and IP-like strings with 4 or more digits are redacted too (accepted)", async () => {
++    expect(await storedSubject(failed("Usage 1.234 over limit for my-app"))).toBe("Usage [redacted] over limit for my-app");
++    expect(await storedSubject(failed("Deployment failed on 192.168.1.10"))).toBe("Deployment failed on [redacted]");
++  });
++
++  it.each([
++    ["a multi-character separator (space, hyphen, space)", "123 - 456"],
++    ["two spaces", "123  456"],
++    ["a no-break space and a space", "123\u00a0 456"],
++    ["two dots", "123..456"],
++    ["a dot and a space", "123. 456"],
++    ["an en dash with spaces", "123 \u2013 456"],
++    ["a minus sign with spaces", "123 \u2212 456"],
++    ["three Arabic-Indic digits", "\u0664\u0668\u0662"],
++    ["three fullwidth digits, a space, then two letters", "\uff14\uff18\uff12 ab"],
++    ["two runs of three Arabic-Indic digits split by a dot-space pair", "\u0664\u0668\u0662. \u0669\u0661\u0663"],
++    ["a slash", "482/913"],
++    ["a comma", "482,913"],
++    ["an underscore", "482_913"],
++    ["a colon", "482:913"],
++    ["a plus sign", "482+913"],
++    ["a soft hyphen U+00AD", "482\u00ad913"],
++    ["a double vertical line U+2016, just outside the dash range", "482\u2016913"],
++    ["a right-to-left mark U+200F", "482\u200f913"],
++    ["an inverse plus-minus U+2213, just after the minus sign", "482\u2213913"],
++    ["a fullwidth hyphen-minus U+FF0D", "\uff14\uff18\uff12\uff0d\uff19\uff11\uff13"],
++    ["superscript digits, which are not decimal digits", "\u00b9\u00b2\u00b3\u2074\u2075"],
++    ["circled digits, which are not decimal digits", "\u2460\u2461\u2462\u2463"],
++    ["letters mixed with digits", "A1B2C3D4"],
++    ["a version number", "1.2.3"],
++  ])("leaves a code written with %s unchanged", async (_name, code) => {
++    expect(await storedSubject(google(codeMail(code)))).toBe(codeMail(code));
++  });
++
++  it("stored subjects keep zero-width characters removed even when there is no code to redact", async () => {
++    for (const zero of ZERO_WIDTH) {
++      expect(await storedSubject(failed(`Deployment${zero} failed for my${zero}-app`))).toBe("Deployment failed for my-app");
++    }
++  });
++
++  it("a subject with zero-width characters and the same subject without them merge into one item", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(failed("Deployment failed for my-app"));
++    r.mailboxes.work!.deliver(failed("Deployment\u200b failed for my\u2060-app"));
++    r.clock.now += 600_000;
++    await r.run();
++    const rows = await itemsOf(r);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ subject: "Deployment failed for my-app", occurrences: 2 });
++    expect(rows[0]!.dedup_key).toBe(hash("deploy_failed", "vercel.com", "Deployment failed for my-app"));
++  });
++
++  it("redaction happens before the 200-character cut: a code that straddles the cut leaves no digit behind", async () => {
++    const prefix = "Deployment failed ";
++    const padding = "x".repeat(196 - prefix.length);
++    expect(prefix.length + padding.length).toBe(196);
++    // The redacted subject is 206 characters long; the cut keeps 200 of them, ending inside "[redacted]".
++    expect(await storedSubject(failed(`${prefix}${padding}\u0664\u0668\u0662\u0669\u0661\u0663`))).toBe(`${prefix}${padding}[red`);
++    expect(await storedSubject(failed(`${prefix}${padding}4\u00a08\u00a02\u00a09\u00a01 tail`))).toBe(`${prefix}${padding}[red`);
++  });
++
++  it("the verification code rule still matches: every form is stored as account_security from accounts.google.com", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(google(codeMail("\uff14\uff18\uff12\uff19\uff11\uff13")));
++    r.clock.now += 600_000;
++    await r.run();
++    expect(await itemsOf(r)).toMatchObject([{ category: "account_security", rule_id: "account-security", sender_domain: "accounts.google.com" }]);
++  });
++
++  it("codes in different forms and with different digits merge into one item, and no digit of any code is stored or logged", async () => {
++    const codes = [
++      "482913",
++      "\uff14\uff18\uff12\uff19\uff11\uff13",
++      "\u0664\u0668\u0662\u0669\u0661\u0663",
++      "771.204",
++      "553\u00a0018",
++      "660\u2013127",
++      "905\u2212331",
++      "4\u200b8\u200b2\u200b9",
++    ];
++    const r = rig();
++    await seed(r);
++    for (const code of codes) r.mailboxes.work!.deliver(google(codeMail(code)));
++    r.clock.now += 600_000;
++    await r.run();
++    const rows = await itemsOf(r);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ subject: REDACTED, occurrences: codes.length });
++    expect(rows[0]!.dedup_key).toBe(hash("account_security", "accounts.google.com", REDACTED));
++    for (const column of ["subject", "sender_domain", "category", "rule_id"]) {
++      expect(String(rows[0]![column]), column).not.toMatch(/\p{Nd}/u);
++    }
++    expect(r.log.text()).not.toMatch(/482|913|771|204|553|660|127|905|331|４８２|٤٨٢/u);
++  });
++
++  describe("brute-force oracle over Unicode digits and separators", () => {
++    // A character scan, not a regular expression. Digits are the four scripts the alphabet below draws from
++    // (ASCII, fullwidth, Arabic-Indic, Devanagari), identified by code point range.
++    const DIGIT_BASES = [0x30, 0xff10, 0x660, 0x966];
++    const isDigit = (char: string | undefined) => {
++      if (char === undefined) return false;
++      const point = char.codePointAt(0)!;
++      return DIGIT_BASES.some((base) => point >= base && point <= base + 9);
++    };
++    const SEPARATORS = new Set([" ", "\u00a0", "\u202f", "\u2007", "\u3000", ".", "-", "\u2010", "\u2013", "\u2015", "\u2212"]);
++    const REMOVED = new Set(ZERO_WIDTH);
++
++    function unicodeOracle(raw: string): string {
++      const text = [...raw].filter((char) => !REMOVED.has(char));
++      let out = "";
++      let i = 0;
++      while (i < text.length) {
++        if (!isDigit(text[i])) {
++          out += text[i];
++          i += 1;
++          continue;
++        }
++        let end = i;
++        let digits = 0;
++        for (;;) {
++          if (isDigit(text[end])) {
++            digits += 1;
++            end += 1;
++          } else if (end < text.length && SEPARATORS.has(text[end]!) && isDigit(text[end + 1])) {
++            end += 1;
++          } else {
++            break;
++          }
++        }
++        out += digits >= 4 ? "[redacted]" : text.slice(i, end).join("");
++        i = end;
++      }
++      return out;
++    }
++
++    it("matches the oracle on 120 random subjects mixing scripts, separators, zero-width characters and near-miss characters", async () => {
++      let state = 110111;
++      const next = (bound: number) => {
++        state = (state * 1103515245 + 12345) % 2147483648;
++        return Math.floor(state / 65536) % bound;
++      };
++      const alphabet = [
++        ..."0123456789",
++        ..."0123456789".split("").map((d) => String.fromCodePoint(0xff10 + Number(d))),
++        ..."0123456789".split("").map((d) => String.fromCodePoint(0x660 + Number(d))),
++        "\u0966",
++        "\u096f",
++        " ",
++        " ",
++        "\u00a0",
++        "\u202f",
++        ".",
++        "-",
++        "\u2013",
++        "\u2212",
++        "  ",
++        "\u200b",
++        "\u2060",
++        "\ufeff",
++        "a",
++        "/",
++        ",",
++        "\u00b2",
++        "\u200f",
++        "\uff0d",
++        "\u00ad",
++      ];
++      const cases: string[] = [];
++      for (let index = 0; index < 120; index += 1) {
++        let tail = "";
++        for (let step = 0, length = 4 + next(14); step < length; step += 1) tail += alphabet[next(alphabet.length)];
++        const id = String.fromCharCode(97 + (index % 26)) + String.fromCharCode(97 + Math.floor(index / 26));
++        cases.push(`Deployment failed ${id}x${tail}x`);
++      }
++      const r = rig();
++      await seed(r);
++      const byMessage = new Map<string, string>();
++      for (let batch = 0; batch < 10; batch += 1) {
++        for (const subject of cases.slice(batch * 12, batch * 12 + 12)) byMessage.set(r.mailboxes.work!.deliver(failed(subject)), subject);
++        r.clock.now += 600_000;
++        await r.run();
++      }
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(120);
++      for (const row of rows) {
++        const original = byMessage.get(row.gmail_message_id)!;
++        expect(row.subject, JSON.stringify(original)).toBe(unicodeOracle(original));
++      }
++      // The oracle is not the identity, not a constant, and it exercises every part of the rule.
++      expect(cases.filter((subject) => unicodeOracle(subject) !== subject).length).toBeGreaterThan(40);
++      expect(cases.filter((subject) => unicodeOracle(subject).includes("[redacted]")).length).toBeGreaterThan(40);
++      expect(cases.filter((subject) => !unicodeOracle(subject).includes("[redacted]")).length).toBeGreaterThan(5);
++    });
++
++    it("the oracle agrees with hand-written literals (guards the oracle itself)", () => {
++      expect(unicodeOracle("a 482\u00a0913 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 123 - 456 b")).toBe("a 123 - 456 b");
++      expect(unicodeOracle("a 4\u200b8\u200b2 b")).toBe("a 482 b");
++      expect(unicodeOracle("a \u0664\u0668\u0662\u0669 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 1.234 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 1.2.3 b")).toBe("a 1.2.3 b");
++    });
++  });
+ });
+ 
+ describe("logs carry no mail content (decision 11)", () => {
+@@ -1121,3 +1393,271 @@ describe("logs carry no mail content (decision 11)", () => {
+     }
+   });
+ });
++
++// Patch 0012, #111: the retention sweep has no cap on watched connections, handles each table on its own, and reads
++// through indexes. The database is a real SQLite behind a D1-shaped wrapper that refuses more than 100 bound
++// parameters per statement, as D1 does.
++describe("retention sweep limits (patch 0012, #111)", () => {
++  const NOW = Date.UTC(2026, 10, 13, 0, 5, 0);
++  const stamp = (ms: number) => new Date(ms).toISOString();
++  const recent = stamp(NOW - HOUR);
++  const old = stamp(NOW - 20 * DAY);
++  const numbered = (prefix: string, count: number) => Array.from({ length: count }, (_, index) => `${prefix}${String(index).padStart(3, "0")}`);
++
++  function open() {
++    const sqlite = new SqliteD1Database();
++    databases.push(sqlite);
++    return { sqlite, db: new BindLimitedD1(sqlite), log: createLogCapture() };
++  }
++
++  /** One cursor, one fresh pending item and one fresh acknowledged item for each connection. */
++  async function seedConnections(sqlite: SqliteD1Database, connections: readonly string[]) {
++    for (const name of connections) {
++      await insertCursor(sqlite, { connection_name: name, history_id: "1", last_run_at: recent });
++      await insertItem(sqlite, itemRow({ id: `${name}#p`, connection_name: name, created_at: recent, received_at: recent }));
++      await insertItem(
++        sqlite,
++        itemRow({ id: `${name}#a`, connection_name: name, status: "acknowledged", acknowledged_at: recent, created_at: recent }),
++      );
++    }
++  }
++
++  const distinct = (rows: { connection_name: string }[]) => [...new Set(rows.map((row) => row.connection_name))].sort();
++  const itemConnections = async (sqlite: SqliteD1Database) =>
++    distinct(await selectAll<{ connection_name: string }>(sqlite, "select connection_name from email_watch_items"));
++  const cursorConnections = async (sqlite: SqliteD1Database) =>
++    distinct(await selectAll<{ connection_name: string }>(sqlite, "select connection_name from email_watch_cursors"));
++
++  describe("no limit on the number of watched connections", () => {
++    it("with 120 watched connections, removes the rows of 3 unwatched ones, keeps the watched ones' fresh rows, logs nothing", async () => {
++      const { sqlite, db, log } = open();
++      const watched = numbered("conn-", 120);
++      const kept = ["conn-000", "conn-060", "conn-119"];
++      const unwatched = ["gone-1", "gone-2", "gone-3"];
++      await seedConnections(sqlite, [...kept, ...unwatched]);
++      await insertItem(sqlite, itemRow({ id: "conn-060#expired", connection_name: "conn-060", created_at: old, received_at: old }));
++      await sweepEmailWatchRetention(db, watched, log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect(await itemConnections(sqlite)).toEqual(kept);
++      expect(await cursorConnections(sqlite)).toEqual(kept);
++      expect((await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id)).toEqual([
++        "conn-000#a",
++        "conn-000#p",
++        "conn-060#a",
++        "conn-060#p",
++        "conn-119#a",
++        "conn-119#p",
++      ]);
++    });
++
++    it("never binds more than 50 values to one statement", async () => {
++      const { sqlite, db, log } = open();
++      await seedConnections(sqlite, [...numbered("conn-", 120).filter((_, index) => index % 7 === 0), ...numbered("gone-", 130)]);
++      await sweepEmailWatchRetention(db, numbered("conn-", 120), log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect(db.executed.length).toBeGreaterThan(0);
++      expect(Math.max(...db.executed.map((statement) => statement.bound))).toBeLessThanOrEqual(50);
++    });
++
++    // Awkward names: quotes, LIKE wildcards, spaces and non-ASCII, and unwatched names that differ from a watched
++    // one only where a wildcard or a prefix match would blur them.
++    const awkwardWatched = ["x_y", "50%", "it's", "semi;colon", "caf\u00e9", "with space", "dash-name", "UPPER"];
++    const awkwardUnwatched = ["xzy", "50 percent", "5000", "its", "semi", "cafe", "with", "dash", "upper", "x_y2", "'; drop table email_watch_items; --"];
++
++    it.each([0, 1, 49, 50, 51, 99, 100, 101, 160, 250])(
++      "with 120 watched connections and %i unwatched ones stored, exactly the unwatched rows go",
++      async (unwatchedCount) => {
++        const { sqlite, db, log } = open();
++        const watched = [...numbered("conn-", 112), ...awkwardWatched];
++        const stored = [
++          ...watched.filter((_, index) => index % 3 === 0 || index >= 112),
++          ...Array.from({ length: unwatchedCount }, (_, index) => awkwardUnwatched[index % awkwardUnwatched.length]! + (index < awkwardUnwatched.length ? "" : `~${index}`)),
++        ];
++        expect(new Set(stored).size).toBe(stored.length);
++        await seedConnections(sqlite, stored);
++        // Brute-force oracle: a stored connection survives if and only if the watched list contains it, character for character.
++        const watchedSet = new Set(watched);
++        const expected = stored.filter((name) => watchedSet.has(name)).sort();
++        await sweepEmailWatchRetention(db, watched, log.logger, NOW);
++        expect(log.entries).toEqual([]);
++        expect(await itemConnections(sqlite)).toEqual(expected);
++        expect(await cursorConnections(sqlite)).toEqual(expected);
++        expect((await selectAll<{ n: number }>(sqlite, "select count(*) as n from email_watch_items"))[0]!.n).toBe(expected.length * 2);
++        expect(Math.max(0, ...db.executed.map((statement) => statement.bound))).toBeLessThanOrEqual(50);
++      },
++    );
++
++    it("with an empty watched list everything goes, however many connections are stored", async () => {
++      const { sqlite, db, log } = open();
++      await seedConnections(sqlite, numbered("gone-", 300));
++      await sweepEmailWatchRetention(db, [], log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect(await itemConnections(sqlite)).toEqual([]);
++      expect(await cursorConnections(sqlite)).toEqual([]);
++    });
++
++    it("with 300 watched connections and nothing unwatched, nothing is deleted and nothing is logged", async () => {
++      const { sqlite, db, log } = open();
++      const watched = numbered("conn-", 300);
++      await seedConnections(sqlite, watched);
++      await sweepEmailWatchRetention(db, watched, log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect(await itemConnections(sqlite)).toEqual(watched);
++      expect(await cursorConnections(sqlite)).toEqual(watched);
++    });
++
++    it("still expires old rows of watched connections when there are 120 of them", async () => {
++      const { sqlite, db, log } = open();
++      const watched = numbered("conn-", 120);
++      await seedConnections(sqlite, ["conn-005"]);
++      await insertItem(sqlite, itemRow({ id: "pending-old", connection_name: "conn-005", created_at: old, received_at: old }));
++      await insertItem(
++        sqlite,
++        itemRow({ id: "ack-old", connection_name: "conn-005", status: "acknowledged", acknowledged_at: stamp(NOW - 8 * DAY), created_at: old }),
++      );
++      await sweepEmailWatchRetention(db, watched, log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect((await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id)).toEqual(["conn-005#a", "conn-005#p"]);
++    });
++  });
++
++  describe("each table is handled on its own", () => {
++    const secret = "Quarterly numbers for pat@example.com, code 482913";
++
++    class FixtureSweepFailure extends Error {
++      override name = "FixtureSweepFailure";
++    }
++
++    /** A database whose statements throw when their text matches, as a failing D1 call does. */
++    function failingOn(inner: SqliteD1Database, pattern: RegExp): D1DatabaseBinding {
++      return {
++        batch: (statements) => inner.batch(statements),
++        prepare(query: string) {
++          if (pattern.test(query)) throw new FixtureSweepFailure(secret);
++          return inner.prepare(query);
++        },
++      };
++    }
++
++    async function seed(sqlite: SqliteD1Database) {
++      await seedConnections(sqlite, ["a", "gone"]);
++      await insertItem(sqlite, itemRow({ id: "a#expired", connection_name: "a", created_at: old, received_at: old }));
++    }
++
++    it("a missing email_watch_items table does not stop the purge of unwatched cursors, and nothing is logged", async () => {
++      const { sqlite, db, log } = open();
++      await seed(sqlite);
++      sqlite.exec("drop table email_watch_items");
++      await sweepEmailWatchRetention(db, ["a"], log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect(await cursorConnections(sqlite)).toEqual(["a"]);
++    });
++
++    it("a missing email_watch_cursors table does not stop the purge and expiry of items, and nothing is logged", async () => {
++      const { sqlite, db, log } = open();
++      await seed(sqlite);
++      sqlite.exec("drop table email_watch_cursors");
++      await sweepEmailWatchRetention(db, ["a"], log.logger, NOW);
++      expect(log.entries).toEqual([]);
++      expect((await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id)).toEqual(["a#a", "a#p"]);
++    });
++
++    it.each([[[]], [["a"]]])("with watched list %j, a missing table is still silent and the other table is purged", async (watched) => {
++      const dropped = await Promise.all(
++        ["email_watch_items", "email_watch_cursors"].map(async (table) => {
++          const { sqlite, db, log } = open();
++          await seed(sqlite);
++          sqlite.exec(`drop table ${table}`);
++          await sweepEmailWatchRetention(db, watched, log.logger, NOW);
++          return { table, log: log.entries, items: await itemConnections(sqlite).catch(() => "missing"), cursors: await cursorConnections(sqlite).catch(() => "missing") };
++        }),
++      );
++      const expected = watched.length === 0 ? [] : ["a"];
++      expect(dropped).toEqual([
++        { table: "email_watch_items", log: [], items: "missing", cursors: expected },
++        { table: "email_watch_cursors", log: [], items: expected, cursors: "missing" },
++      ]);
++    });
++
++    it("with both tables missing the sweep is a silent no-op", async () => {
++      const { sqlite, db, log } = open();
++      sqlite.exec("drop table email_watch_items");
++      sqlite.exec("drop table email_watch_cursors");
++      await expect(sweepEmailWatchRetention(db, ["a"], log.logger, NOW)).resolves.toBeUndefined();
++      expect(log.entries).toEqual([]);
++    });
++
++    it("another failure in the items table is logged once by error name, and the cursors are still purged", async () => {
++      const { sqlite, log } = open();
++      await seed(sqlite);
++      await sweepEmailWatchRetention(failingOn(sqlite, /email_watch_items/), ["a"], log.logger, NOW);
++      expect(log.entries).toHaveLength(1);
++      expect(log.entries[0]!.level).toBe("error");
++      expect(log.text()).toContain("FixtureSweepFailure");
++      for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
++      expect(await cursorConnections(sqlite)).toEqual(["a"]);
++    });
++
++    it("another failure in the cursors table is logged once by error name, and the items are still purged and expired", async () => {
++      const { sqlite, log } = open();
++      await seed(sqlite);
++      await sweepEmailWatchRetention(failingOn(sqlite, /email_watch_cursors/), ["a"], log.logger, NOW);
++      expect(log.entries).toHaveLength(1);
++      expect(log.entries[0]!.level).toBe("error");
++      expect(log.text()).toContain("FixtureSweepFailure");
++      for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
++      expect((await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id)).toEqual(["a#a", "a#p"]);
++    });
++
++    it("failures in both tables are logged once per sweep, not once per table", async () => {
++      const { sqlite, log } = open();
++      await seed(sqlite);
++      await sweepEmailWatchRetention(failingOn(sqlite, /email_watch/), ["a"], log.logger, NOW);
++      expect(log.entries).toHaveLength(1);
++      expect(log.entries[0]!.level).toBe("error");
++    });
++
++    it("a failure in one table next to a missing other table is logged once", async () => {
++      const first = open();
++      await seed(first.sqlite);
++      first.sqlite.exec("drop table email_watch_cursors");
++      await sweepEmailWatchRetention(failingOn(first.sqlite, /email_watch_items/), ["a"], first.log.logger, NOW);
++      expect(first.log.entries).toHaveLength(1);
++
++      const second = open();
++      await seed(second.sqlite);
++      second.sqlite.exec("drop table email_watch_items");
++      await sweepEmailWatchRetention(failingOn(second.sqlite, /email_watch_cursors/), ["a"], second.log.logger, NOW);
++      expect(second.log.entries).toHaveLength(1);
++    });
++  });
++
++  describe("expiry reads through indexes", () => {
++    // The sweep's own statements are captured and handed to SQLite's query planner, so the test does not depend on
++    // how the implementation words them. The scans that cost rows read are the two expiry deletes: each must be an
++    // index search bounded on the timestamp column, not a read of every pending or acknowledged row.
++    async function planOf(sqlite: SqliteD1Database, statement: { query: string; bound: number }): Promise<string> {
++      const dummy = Array.from({ length: statement.bound }, () => "2026-01-01T00:00:00.000Z");
++      const rows = await sqlite.prepare(`explain query plan ${statement.query}`).bind(...dummy).all<{ detail: string }>();
++      return rows.results.map((row) => row.detail).join("\n");
++    }
++
++    it("deleting expired pending items searches an index on (status, created_at)", async () => {
++      const { sqlite, db, log } = open();
++      await seedConnections(sqlite, ["a"]);
++      await sweepEmailWatchRetention(db, ["a"], log.logger, NOW);
++      const expiry = db.executed.filter((statement) => /^\s*delete\s+from\s+email_watch_items/i.test(statement.query) && /created_at/.test(statement.query));
++      expect(expiry).toHaveLength(1);
++      expect(await planOf(sqlite, expiry[0]!)).toMatch(/SEARCH email_watch_items USING (COVERING )?INDEX \S+ \(status=\? AND created_at<\?\)/);
++    });
++
++    it("deleting expired acknowledged items searches an index on (status, acknowledged_at)", async () => {
++      const { sqlite, db, log } = open();
++      await seedConnections(sqlite, ["a"]);
++      await sweepEmailWatchRetention(db, ["a"], log.logger, NOW);
++      const expiry = db.executed.filter((statement) => /^\s*delete\s+from\s+email_watch_items/i.test(statement.query) && /acknowledged_at/.test(statement.query));
++      expect(expiry).toHaveLength(1);
++      expect(await planOf(sqlite, expiry[0]!)).toMatch(/SEARCH email_watch_items USING (COVERING )?INDEX \S+ \(status=\? AND acknowledged_at<\?\)/);
++    });
++  });
++});
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index 544cfad5..414a8a0d 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -433,10 +433,13 @@ export class EmailWatcher {
+   }
+ }
+ 
++const PURGE_CHUNK_SIZE = 50;
++const WATCH_TABLES = ["email_watch_items", "email_watch_cursors"] as const;
++
+ /**
+  * Retention sweep, independent of the watch: D1 only, no Gmail, no KV. Deletes expired items, then everything for
+- * connections that are not in the watched list (an empty list purges all). Tables that do not exist yet make it a
+- * silent no-op; any other failure is logged once by error name and rethrown to nobody.
++ * connections that are not in the watched list (an empty list purges all). Each table is handled on its own. A table
++ * that does not exist yet is skipped silently; any other failure is logged once per sweep by error name.
+  */
+ export async function sweepEmailWatchRetention(
+   database: D1DatabaseBinding,
+@@ -444,7 +447,16 @@ export async function sweepEmailWatchRetention(
+   logger: RuntimeLogger,
+   now: number = Date.now(),
+ ): Promise<void> {
+-  try {
++  let failure: unknown;
++  const attempt = async (work: () => Promise<void>): Promise<void> => {
++    try {
++      await work();
++    } catch (error) {
++      if (!isMissingTable(error) && failure === undefined) failure = error;
++    }
++  };
++
++  await attempt(async () => {
+     await database
+       .prepare("delete from email_watch_items where status = 'pending' and created_at < ?")
+       .bind(new Date(now - PENDING_RETENTION_MS).toISOString())
+@@ -453,14 +465,26 @@ export async function sweepEmailWatchRetention(
+       .prepare("delete from email_watch_items where status = 'acknowledged' and acknowledged_at < ?")
+       .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
+       .run();
+-    for (const table of ["email_watch_items", "email_watch_cursors"]) {
+-      const marks = watched.map(() => "?").join(", ");
+-      const where = watched.length > 0 ? ` where connection_name not in (${marks})` : "";
+-      await database.prepare(`delete from ${table}${where}`).bind(...watched).run();
+-    }
+-  } catch (error) {
+-    if (isMissingTable(error)) return;
+-    logger.error({ errorName: errorName(error) }, "email watch retention sweep failed");
++  });
++  for (const table of WATCH_TABLES) {
++    await attempt(() => purgeUnwatched(database, table, watched));
++  }
++  if (failure !== undefined) logger.error({ errorName: errorName(failure) }, "email watch retention sweep failed");
++}
++
++/** Delete rows of connections not in `watched`, in statements that bind at most PURGE_CHUNK_SIZE names each. */
++async function purgeUnwatched(database: D1DatabaseBinding, table: (typeof WATCH_TABLES)[number], watched: readonly string[]): Promise<void> {
++  if (watched.length === 0) {
++    await database.prepare(`delete from ${table}`).run();
++    return;
++  }
++  const { results } = await database.prepare(`select distinct connection_name from ${table}`).all<{ connection_name: string }>();
++  const keep = new Set(watched);
++  const unwatched = results.map((row) => row.connection_name).filter((name) => !keep.has(name));
++  for (let start = 0; start < unwatched.length; start += PURGE_CHUNK_SIZE) {
++    const chunk = unwatched.slice(start, start + PURGE_CHUNK_SIZE);
++    const marks = chunk.map(() => "?").join(", ");
++    await database.prepare(`delete from ${table} where connection_name in (${marks})`).bind(...chunk).run();
+   }
+ }
+ 
+diff --git a/src/server/storage/postgres/runtime-store.test.ts b/src/server/storage/postgres/runtime-store.test.ts
+index 8802004c..3b7e2ad3 100644
+--- a/src/server/storage/postgres/runtime-store.test.ts
++++ b/src/server/storage/postgres/runtime-store.test.ts
+@@ -166,6 +166,7 @@ describe("PostgreSQL migrations with PGlite", () => {
+           { name: "0017_trigger_subscriptions.sql" },
+           { name: "0018_connection_retirement.sql" },
+           { name: "0019_email_watch.sql" },
++          { name: "0020_email_watch_indexes.sql" },
+         ],
+       });
+ 
+@@ -186,6 +187,59 @@ describe("PostgreSQL migrations with PGlite", () => {
+   });
+ });
+ 
++describe("PostgreSQL email watch indexes (patch 0012, #111)", () => {
++  let testServer: PGliteTestServer;
++
++  beforeAll(async () => {
++    testServer = await startPGliteTestServer();
++  });
++
++  afterAll(async () => {
++    await testServer.close();
++  });
++
++  const NAME = "0020_email_watch_indexes.sql";
++  const indexDefinitions = async (pool: Pool, table: string) =>
++    (await pool.query("select indexdef from pg_indexes where tablename = $1", [table])).rows.map((row: { indexdef: string }) =>
++      row.indexdef.replace(/\s+/g, " "),
++    );
++
++  it("0020 applies after 0019 on a database that already holds rows, and creates the three indexes", async () => {
++    const pool = new Pool({ connectionString: testServer.url, max: 1 });
++    try {
++      const before: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name < NAME),
++      };
++      await migratePostgresDatabase({ pool, migrations: before });
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).at(-1)).toBe(
++        "0019_email_watch.sql",
++      );
++      expect((await indexDefinitions(pool, "email_watch_items")).some((definition) => definition.includes("(status, created_at)"))).toBe(false);
++      await pool.query(
++        `insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++         values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1')`,
++      );
++
++      await migratePostgresDatabase({ pool });
++      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).at(-1)).toBe(NAME);
++      expect((await pool.query("select id from email_watch_items")).rows).toEqual([{ id: "p" }]);
++
++      const definitions = await indexDefinitions(pool, "email_watch_items");
++      for (const columns of ["(status, created_at)", "(status, acknowledged_at)", "(connection_name)"]) {
++        expect(
++          definitions.filter((definition) => definition.startsWith("CREATE INDEX") && definition.endsWith(columns)),
++          columns,
++        ).toHaveLength(1);
++      }
++      // email_watch_cursors is keyed by connection_name already: no explicit index is added.
++      expect((await indexDefinitions(pool, "email_watch_cursors")).filter((definition) => !definition.startsWith("CREATE UNIQUE INDEX"))).toEqual([]);
++    } finally {
++      await pool.end();
++    }
++  });
++});
++
+ describe("PostgreSQL migrations with a custom migration source", () => {
+   let testServer: PGliteTestServer;
+ 
+@@ -230,6 +284,7 @@ describe("PostgreSQL migrations with a custom migration source", () => {
+           { name: "0017_trigger_subscriptions.sql" },
+           { name: "0018_connection_retirement.sql" },
+           { name: "0019_email_watch.sql" },
++          { name: "0020_email_watch_indexes.sql" },
+           { name: "9998_custom.sql" },
+         ],
+       });
+diff --git a/src/server/storage/sqlite/runtime-store.test.ts b/src/server/storage/sqlite/runtime-store.test.ts
+index 06140d97..151d9f01 100644
+--- a/src/server/storage/sqlite/runtime-store.test.ts
++++ b/src/server/storage/sqlite/runtime-store.test.ts
+@@ -62,6 +62,7 @@ describe("SqliteRuntimeDatabase", () => {
+       "0017_trigger_subscriptions.sql",
+       "0018_connection_retirement.sql",
+       "0019_email_watch.sql",
++      "0020_email_watch_indexes.sql",
+     ];
+     expect(entries.filter((entry) => entry.message === "sqlite migration started")).toEqual(
+       migrations.map((migration) => ({ fields: { migration }, message: "sqlite migration started" })),
+-- 
+2.34.1
+
