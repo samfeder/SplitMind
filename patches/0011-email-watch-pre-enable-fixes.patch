@@ -1,0 +1,1392 @@
+SplitMind patch 0011 for OpenConnector v1.9.2 (after 0001-0005 and 0009).
+Upstream issue: not filed yet.
+Email watch pre-enable fixes: #104 outcome-only mail_watch runs, #105 redact codes in subjects, #106 standalone retention sweep, #107 drop List-Id.
+From 6dfd3847552eb25eebe1e47064ca46d3b8a12eea Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Fri, 13 Nov 2026 06:22:48 -0500
+Subject: [PATCH] fix(email-watch): pre-enable fixes for #104, #105, #106, #107
+
+#104: every mail_watch run is recorded outcome-only by ActionRunner, whatever
+the caller or audit value.
+#105: runs of 4 or more digits (split by single spaces or hyphens) are
+replaced with [redacted] in stored subjects and the dedup key.
+#106: the retention sweep is a standalone function the cron calls on every due
+minute, with or without a configured connection. It also deletes items and
+cursors of connections that are no longer watched, and is a silent no-op when
+the tables are missing. The once-a-day sweep is removed.
+#107: List-Id is no longer requested; four metadata headers remain.
+---
+ src/server/actions/action-runner.ts           |   8 +-
+ src/server/cloudflare-email-watch.test.ts     | 586 ++++++++++++++++--
+ src/server/cloudflare.ts                      |  15 +-
+ .../email-watch/mail-watch-audit.test.ts      | 208 +++++++
+ src/server/email-watch/rules.ts               |  10 +-
+ src/server/email-watch/watcher.test.ts        | 250 ++++++--
+ src/server/email-watch/watcher.ts             |  60 +-
+ 7 files changed, 1027 insertions(+), 110 deletions(-)
+ create mode 100644 src/server/email-watch/mail-watch-audit.test.ts
+
+diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
+index bf98aff6..efa27ec8 100644
+--- a/src/server/actions/action-runner.ts
++++ b/src/server/actions/action-runner.ts
+@@ -60,6 +60,8 @@ export interface ActionRunResult {
+ /**
+  * Shared execution boundary for HTTP, MCP, and future local callers.
+  */
++const MAIL_WATCH_SERVICE = "mail_watch";
++
+ export class ActionRunner {
+   private readonly options: ActionRunnerOptions;
+ 
+@@ -230,6 +232,8 @@ export class ActionRunner {
+     const completedAtMs = Date.now();
+     const durationMs = completedAtMs - startedAtMs;
+     const auditError = safeRunLogError(result.error);
++    // Mail-watch runs carry subjects and senders, so they are always recorded outcome-only (patch 0011, #104).
++    const outcomeOnly = input.audit === "outcome" || action.service === MAIL_WATCH_SERVICE;
+     const runLog: RunLog = {
+       id: executionId,
+       remoteExecutionId,
+@@ -244,8 +248,8 @@ export class ActionRunner {
+       connectionProfile: connection?.summary?.profile,
+       runtimeTokenId: input.runtimeTokenId,
+       policy,
+-      inputSummary: input.audit === "outcome" ? undefined : summarizeForRunLog(input.input),
+-      outputSummary: input.audit === "outcome" || !result.ok ? undefined : summarizeForRunLog(result.output),
++      inputSummary: outcomeOnly ? undefined : summarizeForRunLog(input.input),
++      outputSummary: outcomeOnly || !result.ok ? undefined : summarizeForRunLog(result.output),
+       ...auditError,
+     };
+ 
+diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
+index bafbe4b5..04198670 100644
+--- a/src/server/cloudflare-email-watch.test.ts
++++ b/src/server/cloudflare-email-watch.test.ts
+@@ -5,9 +5,11 @@ import type { AssetsBinding, D1DatabaseBinding, D1PreparedStatementBinding, R2Bu
+ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+ 
+ import { afterEach, describe, expect, it, vi } from "vitest";
++import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+ import { provider as gmail } from "../providers/gmail/definition.ts";
++import { provider as mailWatch } from "../providers/mail_watch/definition.ts";
+ import worker from "./cloudflare.ts";
+-import { FakeMailbox, OWNER_EMAIL, T0, fakeGmailFetch } from "./email-watch/test-support.ts";
++import { DAY, FakeMailbox, HOUR, OWNER_EMAIL, T0, fakeGmailFetch, insertCursor, insertItem, itemRow } from "./email-watch/test-support.ts";
+ import type { FixtureMessage } from "./email-watch/test-support.ts";
+ import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
+ import { D1RuntimeDatabase } from "./storage/d1/runtime-store.ts";
+@@ -21,8 +23,8 @@ const M0 = Math.ceil(T0 / minute / 60) * 60;
+ const at = (epochMinute: number) => epochMinute * minute + 30_000;
+ 
+ const catalog: Record<string, unknown> = {
+-  "/catalog/index.json": { version: 1, providerCount: 1, chunks: ["apps-0000.json"] },
+-  "/catalog/apps-0000.json": [JSON.parse(JSON.stringify(gmail))],
++  "/catalog/index.json": { version: 1, providerCount: 2, chunks: ["apps-0000.json"] },
++  "/catalog/apps-0000.json": [JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))],
+ };
+ 
+ const assets: AssetsBinding = {
+@@ -143,12 +145,42 @@ function vercelFailure(subject: string): FixtureMessage {
+   return { from: "Vercel <no-reply@vercel.com>", subject, snippet: "Snippet that must never be stored or logged" };
+ }
+ 
++async function withSaasLease(s: Setup) {
++  const key = s.env.OOMOL_CONNECT_ENCRYPTION_KEY!;
++  const database = new D1RuntimeDatabase(s.db, { secretCodec: await createWorkerSecretCodec(key) });
++  await database.saasProjectStore.saveProject({ id: "managed", projectId: "project", baseUrl: "https://saas.example", apiKey: "project-key" });
++  const now = new Date().toISOString();
++  const lease = await database.connectionRequestStore.createSaas({
++    connectionRequestId: crypto.randomUUID(),
++    connectionId: crypto.randomUUID(),
++    connectionName: "scheduled",
++    owner: "admin",
++    service: "example",
++    managedProjectId: "managed",
++    providerConfigId: "config",
++    externalUserId: "user",
++    createdAt: now,
++    expiresAt: new Date(Date.now() + 600_000).toISOString(),
++  });
++  await database.connectionRequestStore.saveSaasRequest(lease, "remote");
++  await database.connectionRequestStore.saveSaasCandidate(lease, {
++    connectedAccountId: "account",
++    status: "active",
++    comment: null,
++    profile: { accountId: "user", displayName: "User", grantedScopes: [] },
++  });
++  await database.connectionRequestStore.cancelSaas(lease.pending.connectionRequestId, "admin");
++  return database;
++}
++
+ describe("off by default", () => {
+   it.each([undefined, "", "   ", "\n"])("does no watch D1 query and no Gmail call when the connection list is %j", async (value) => {
+     const s = await setup({ vars: { [CONNECTIONS]: value }, withAssets: false });
+     const results = await s.tick(M0);
+     expect(results).toEqual([{ status: "fulfilled", value: undefined }]);
+-    expect(s.db.watchQueries()).toEqual([]);
++    // Patch 0011 (#106): the retention sweep runs on due minutes with no connection configured, so watch tables
++    // are touched; but the watch itself reads and writes nothing (no insert, update or select of cursors).
++    expect(s.db.watchQueries().filter((query) => !/^\s*delete\s+from\s+email_watch_/i.test(query))).toEqual([]);
+     expect(s.fetcher).not.toHaveBeenCalled();
+     expect(Object.values(s.mailboxes).flatMap((mailbox) => mailbox.requests)).toEqual([]);
+   });
+@@ -242,7 +274,7 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+     return s;
+   }
+ 
+-  it("stores a matching alert, skips personal mail and spoofed mail, and asks Gmail only for metadata headers", async () => {
++  it("stores a matching alert, skips personal mail and spoofed mail, and asks Gmail only for metadata and four headers (no List-Id)", async () => {
+     const s = await seeded();
+     expect((await s.watchRows("email_watch_items"))).toEqual([]);
+     const mailbox = s.mailboxes.work!;
+@@ -269,7 +301,7 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+     for (const request of fetches) {
+       expect(request.params.get("format")).toBe("metadata");
+       expect(request.params.getAll("metadataHeaders").sort()).toEqual(
+-        ["Authentication-Results", "From", "List-Id", "Subject", "X-GitHub-Reason"].sort(),
++        ["Authentication-Results", "From", "Subject", "X-GitHub-Reason"].sort(),
+       );
+     }
+     const history = mailbox.requests.find((request) => request.kind === "history")!;
+@@ -448,34 +480,6 @@ describe("run log listing", () => {
+ });
+ 
+ describe("watch and cleanup do not break each other", () => {
+-  async function withSaasLease(s: Setup) {
+-    const key = s.env.OOMOL_CONNECT_ENCRYPTION_KEY!;
+-    const database = new D1RuntimeDatabase(s.db, { secretCodec: await createWorkerSecretCodec(key) });
+-    await database.saasProjectStore.saveProject({ id: "managed", projectId: "project", baseUrl: "https://saas.example", apiKey: "project-key" });
+-    const now = new Date().toISOString();
+-    const lease = await database.connectionRequestStore.createSaas({
+-      connectionRequestId: crypto.randomUUID(),
+-      connectionId: crypto.randomUUID(),
+-      connectionName: "scheduled",
+-      owner: "admin",
+-      service: "example",
+-      managedProjectId: "managed",
+-      providerConfigId: "config",
+-      externalUserId: "user",
+-      createdAt: now,
+-      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+-    });
+-    await database.connectionRequestStore.saveSaasRequest(lease, "remote");
+-    await database.connectionRequestStore.saveSaasCandidate(lease, {
+-      connectedAccountId: "account",
+-      status: "active",
+-      comment: null,
+-      profile: { accountId: "user", displayName: "User", grantedScopes: [] },
+-    });
+-    await database.connectionRequestStore.cancelSaas(lease.pending.connectionRequestId, "admin");
+-    return database;
+-  }
+-
+   it("still runs SaaS cleanup, and still settles, when the watch fails", async () => {
+     vi.spyOn(console, "error").mockImplementation(() => {});
+     vi.spyOn(console, "warn").mockImplementation(() => {});
+@@ -529,6 +533,518 @@ describe("watch and cleanup do not break each other", () => {
+     expect(saasDelete).toHaveBeenCalledTimes(1);
+     expect(saasDelete).toHaveBeenCalledWith("saas.example", "DELETE");
+     expect(await database.saasProjectStore.getCleanupStats()).toMatchObject({ pending: 0, manual: 0 });
+-    expect(s.db.watchQueries()).toEqual([]);
++    // Only the retention sweep (patch 0011) touches the watch tables with the feature off.
++    expect(s.db.watchQueries().filter((query) => !/^\s*delete\s+from\s+email_watch_/i.test(query))).toEqual([]);
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0011, #106: the retention sweep is a standalone step of every scheduled invocation whose UTC minute is a
++// multiple of the watch interval, with or without any connection configured. Driven only through worker.scheduled
++// and read back from the D1 rows. `Date` is faked (and nothing else) so the cutoffs are exact whether the sweep
++// reads the clock or the event's scheduledTime: both are `at(minute)`.
++// ---------------------------------------------------------------------------------------------------------------
++describe("retention sweep (patch 0011, #106)", () => {
++  const iso = (ms: number) => new Date(ms).toISOString();
++  const quiet = () => {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    return vi.spyOn(console, "error").mockImplementation(() => {});
++  };
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  /** A setup whose clock stands at `epochMinute` for the whole test. */
++  async function atMinute(epochMinute: number, options: Parameters<typeof setup>[0]) {
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(at(epochMinute));
++    return setup(options);
++  }
++
++  const itemIds = async (s: Setup) =>
++    (await s.watchRows<{ id: string }>("email_watch_items")).map((row) => row.id).sort();
++  const cursorNames = async (s: Setup) =>
++    (await s.watchRows<{ connection_name: string }>("email_watch_cursors")).map((row) => row.connection_name).sort();
++
++  /** Fresh items and one cursor for each of the connections a and b. */
++  async function seedFresh(s: Setup, now: number) {
++    for (const name of ["a", "b"]) {
++      await insertCursor(s.db, { connection_name: name, history_id: "1000", last_run_at: iso(now - HOUR) });
++      await insertItem(s.db, itemRow({ id: `${name}-pending`, connection_name: name, created_at: iso(now - HOUR), received_at: iso(now - HOUR) }));
++      await insertItem(
++        s.db,
++        itemRow({ id: `${name}-acked`, connection_name: name, status: "acknowledged", acknowledged_at: iso(now - HOUR), created_at: iso(now - 2 * HOUR) }),
++      );
++      await insertItem(
++        s.db,
++        itemRow({ id: `${name}-gap`, connection_name: name, category: "watch_gap", sender_domain: "", rule_id: "watch-gap", created_at: iso(now - HOUR), received_at: iso(now - HOUR) }),
++      );
++    }
++  }
++
++  describe("what is purged: connections that are not in the configured list", () => {
++    it("with only gmail:a configured, a due invocation removes every item and the cursor of b and keeps a's fresh ones", async () => {
++      const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a" } });
++      await seedFresh(s, at(M0));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual(["a-acked", "a-gap", "a-pending"]);
++      expect(await cursorNames(s)).toEqual(["a"]);
++    });
++
++    it("with both configured nothing is purged", async () => {
++      const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a gmail:b" } });
++      await seedFresh(s, at(M0));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual(["a-acked", "a-gap", "a-pending", "b-acked", "b-gap", "b-pending"]);
++      expect(await cursorNames(s)).toEqual(["a", "b"]);
++    });
++
++    it.each([undefined, "", "   ", "\n"])(
++      "with the connection list %j a due invocation removes everything, makes no Gmail request and creates no run row",
++      async (value) => {
++        const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: value }, withAssets: false });
++        await seedFresh(s, at(M0));
++        await s.tick(M0);
++        expect(await itemIds(s)).toEqual([]);
++        expect(await cursorNames(s)).toEqual([]);
++        expect(s.fetcher).not.toHaveBeenCalled();
++        expect(Object.values(s.mailboxes).flatMap((mailbox) => mailbox.requests)).toEqual([]);
++        expect(await s.db.inner.prepare("select count(*) as n from runs").all()).toMatchObject({ results: [{ n: 0 }] });
++      },
++    );
++
++    it.each([
++      ["slack:a"],
++      ["a"],
++      ["gmail:"],
++      [":a"],
++      ["gmail:a:extra"],
++      ["slack:a nocolon gmail: :a"],
++    ])("a list with only malformed or non-Gmail entries (%j) watches nothing, so everything is purged", async (value) => {
++      quiet();
++      const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: value } });
++      await seedFresh(s, at(M0));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual([]);
++      expect(await cursorNames(s)).toEqual([]);
++      expect(s.fetcher).not.toHaveBeenCalled();
++    });
++
++    it("a malformed entry next to a valid one counts as not watched: gmail:a stays, bare b and slack:b go", async () => {
++      quiet();
++      const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a, slack:b b gmail:" } });
++      await seedFresh(s, at(M0));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual(["a-acked", "a-gap", "a-pending"]);
++      expect(await cursorNames(s)).toEqual(["a"]);
++    });
++
++    it("also purges a connection that was removed from the list long ago, whatever the age of its rows", async () => {
++      const s = await atMinute(M0, { names: ["a"], vars: { [CONNECTIONS]: "gmail:a" } });
++      await insertCursor(s.db, { connection_name: "gone", history_id: "7", last_run_at: iso(at(M0) - 90 * DAY) });
++      await insertItem(s.db, itemRow({ id: "gone-new", connection_name: "gone", created_at: iso(at(M0) - 1000), received_at: iso(at(M0) - 1000) }));
++      await insertItem(s.db, itemRow({ id: "gone-old", connection_name: "gone", created_at: iso(at(M0) - 90 * DAY), received_at: iso(at(M0) - 90 * DAY) }));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual([]);
++      expect(await cursorNames(s)).not.toContain("gone");
++    });
++  });
++
++  describe("what is purged: expired rows of a watched connection", () => {
++    it("deletes pending items older than 14 days and acknowledged items acknowledged over 7 days ago, keeping the rest", async () => {
++      const s = await atMinute(M0, { names: ["a"], vars: { [CONNECTIONS]: "gmail:a" } });
++      const now = at(M0);
++      const ago = (ms: number) => iso(now - ms);
++      await insertCursor(s.db, { connection_name: "a", history_id: "1000", last_run_at: ago(HOUR) });
++      const pending = (id: string, age: number) =>
++        insertItem(s.db, itemRow({ id, connection_name: "a", created_at: ago(age), received_at: ago(age) }));
++      const acknowledged = (id: string, acknowledgedAge: number) =>
++        insertItem(s.db, itemRow({ id, connection_name: "a", status: "acknowledged", acknowledged_at: ago(acknowledgedAge), created_at: ago(acknowledgedAge + 3 * DAY) }));
++      await pending("pending-old", 14 * DAY + 1000);
++      await pending("pending-ancient", 60 * DAY);
++      await pending("pending-edge-keep", 14 * DAY - 1000);
++      await pending("pending-10d", 10 * DAY);
++      await pending("pending-new", HOUR);
++      await acknowledged("ack-old", 7 * DAY + 1000);
++      await acknowledged("ack-edge-keep", 7 * DAY - 1000);
++      await acknowledged("ack-new", HOUR);
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual(["ack-edge-keep", "ack-new", "pending-10d", "pending-edge-keep", "pending-new"]);
++      expect(await cursorNames(s)).toEqual(["a"]);
++    });
++
++    it("sweeps on every due minute, not once a day: an item that expires between two due minutes of one UTC day goes at the second", async () => {
++      const s = await atMinute(M0, { names: ["a"], vars: { [CONNECTIONS]: "gmail:a" } });
++      await insertCursor(s.db, { connection_name: "a", history_id: "1000", last_run_at: iso(at(M0) - HOUR) });
++      await s.tick(M0);
++      for (const [index, minuteOffset] of [10, 20, 30].entries()) {
++        const now = at(M0 + minuteOffset);
++        vi.setSystemTime(now);
++        await insertItem(
++          s.db,
++          itemRow({ id: `late-${index}`, connection_name: "a", created_at: iso(now - 20 * DAY), received_at: iso(now - 20 * DAY) }),
++        );
++        await s.tick(M0 + minuteOffset);
++        expect(await itemIds(s), `after the due minute +${minuteOffset}`).toEqual([]);
++      }
++    });
++  });
++
++  describe("when it runs", () => {
++    // [interval variable, minutes after M0, due?]. M0 is a multiple of 60, so every divisor of 60 is due at it.
++    const cases: [string | undefined, number, boolean][] = [
++      [undefined, 0, true],
++      [undefined, 1, false],
++      [undefined, 5, false],
++      [undefined, 9, false],
++      [undefined, 10, true],
++      [undefined, 20, true],
++      ["5", 5, true],
++      ["5", 3, false],
++      ["1", 3, true],
++      ["60", 30, false],
++      ["60", 60, true],
++      ["abc", 5, false],
++      ["abc", 10, true],
++    ];
++
++    it.each(cases.flatMap(([interval, offset, due]) => [[interval, offset, "gmail:a", due] as const, [interval, offset, undefined, due] as const]))(
++      "interval %j, %i minutes into the hour, connections %j: sweeps = %j",
++      async (interval, offset, connections, due) => {
++        const s = await atMinute(M0 + offset, {
++          names: ["a", "b"],
++          vars: { [CONNECTIONS]: connections, ...(interval === undefined ? {} : { [INTERVAL]: interval }) },
++          withAssets: false,
++        });
++        quiet();
++        await seedFresh(s, at(M0 + offset));
++        await insertItem(
++          s.db,
++          itemRow({ id: "a-expired", connection_name: "a", created_at: iso(at(M0 + offset) - 30 * DAY), received_at: iso(at(M0 + offset) - 30 * DAY) }),
++        );
++        await s.tick(M0 + offset);
++        const left = await itemIds(s);
++        if (due) {
++          expect(left).toEqual(connections ? ["a-acked", "a-gap", "a-pending"] : []);
++        } else {
++          expect(left).toEqual(["a-acked", "a-expired", "a-gap", "a-pending", "b-acked", "b-gap", "b-pending"]);
++          expect(await cursorNames(s)).toEqual(["a", "b"]);
++        }
++      },
++    );
++
++    it("an off-interval catch-up run of the watch does not sweep", async () => {
++      const s = await atMinute(M0 + 3, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a" } });
++      await seedFresh(s, at(M0 + 3));
++      await s.db.inner.exec("update email_watch_cursors set catch_up = 1 where connection_name = 'a'");
++      await s.tick(M0 + 3);
++      // The catch-up ran (a Gmail request was made) and left b's rows alone.
++      expect(s.mailboxes.a!.requests.length).toBeGreaterThan(0);
++      expect(await itemIds(s)).toEqual(["a-acked", "a-gap", "a-pending", "b-acked", "b-gap", "b-pending"]);
++      expect(await cursorNames(s)).toEqual(["a", "b"]);
++    });
++
++    it("does not depend on the watch: the purge and expiry still happen when the watch itself fails", async () => {
++      quiet();
++      // No ASSETS binding: the watch cannot build its Gmail runner and fails, which it logs.
++      const s = await atMinute(M0, { names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a" }, withAssets: false });
++      await seedFresh(s, at(M0));
++      await insertItem(s.db, itemRow({ id: "a-expired", connection_name: "a", created_at: iso(at(M0) - 30 * DAY), received_at: iso(at(M0) - 30 * DAY) }));
++      const results = await s.tick(M0);
++      expect(results[0]!.status).toBe("fulfilled");
++      expect(await itemIds(s)).toEqual(["a-acked", "a-gap", "a-pending"]);
++      expect(await cursorNames(s)).toEqual(["a"]);
++    });
++  });
++
++  describe("what it touches", () => {
++    it("does D1 only: no Gmail request, no KV read or write, no action run, no run-log row", async () => {
++      const kvCalls: string[] = [];
++      const kv = new Proxy(
++        {},
++        {
++          get: (_target, property) => (...args: unknown[]) => {
++            kvCalls.push(`${String(property)}(${args.length})`);
++            return Promise.resolve(null);
++          },
++        },
++      );
++      const s = await atMinute(M0, {
++        names: ["a", "b"],
++        vars: { [CONNECTIONS]: undefined, OAUTH_KV: kv as unknown as CloudflareEnv["OAUTH_KV"] },
++        withAssets: false,
++      });
++      await seedFresh(s, at(M0));
++      await s.tick(M0);
++      expect(await itemIds(s)).toEqual([]);
++      expect(kvCalls).toEqual([]);
++      expect(s.fetcher).not.toHaveBeenCalled();
++      expect(await s.db.inner.prepare("select count(*) as n from runs").all()).toMatchObject({ results: [{ n: 0 }] });
++    });
++  });
++
++  describe("when it cannot run", () => {
++    async function withLeaseAndNoWatch(vars: Partial<CloudflareEnv> = {}) {
++      const saasDelete = vi.fn();
++      const s = await atMinute(M0, {
++        withAssets: false,
++        vars: { [CONNECTIONS]: undefined, ...vars },
++        fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
++          const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
++          saasDelete(url.hostname, init?.method);
++          return Response.json({ success: true, data: { connectedAccountId: "account", deleted: true } });
++        }) as typeof fetch,
++      });
++      const database = await withSaasLease(s);
++      return { s, saasDelete, database };
++    }
++
++    it.each([
++      ["both watch tables", ["email_watch_items", "email_watch_cursors"]],
++      ["the cursors table", ["email_watch_cursors"]],
++      ["the items table", ["email_watch_items"]],
++    ])("without %s (migration not applied) it is a silent no-op: no throw, nothing logged, the other cron work still runs", async (_name, tables) => {
++      const logged = [vi.spyOn(console, "error"), vi.spyOn(console, "warn"), vi.spyOn(console, "info")].map((spy) =>
++        spy.mockImplementation(() => {}),
++      );
++      const { s, saasDelete, database } = await withLeaseAndNoWatch();
++      for (const table of tables) s.db.inner.exec(`drop table ${table}`);
++      const results = await s.tick(M0);
++      expect(results).toEqual([{ status: "fulfilled", value: undefined }]);
++      for (const spy of logged) expect(spy.mock.calls).toEqual([]);
++      expect(saasDelete).toHaveBeenCalledTimes(1);
++      expect(saasDelete).toHaveBeenCalledWith("saas.example", "DELETE");
++      expect(await database.saasProjectStore.getCleanupStats()).toMatchObject({ pending: 0, manual: 0 });
++    });
++
++    it("any other failure is logged once with the error name only, and cleanup still runs and settles", async () => {
++      class FixtureSweepFailure extends Error {
++        override name = "FixtureSweepFailure";
++      }
++      const error = vi.spyOn(console, "error").mockImplementation(() => {});
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++      vi.spyOn(console, "info").mockImplementation(() => {});
++      const { s, saasDelete, database } = await withLeaseAndNoWatch();
++      s.db.failWhen = (query) => {
++        if (/email_watch/i.test(query)) throw new FixtureSweepFailure("Quarterly numbers for pat@example.com, code 482913");
++        return false;
++      };
++      const results = await s.tick(M0);
++      expect(results).toEqual([{ status: "fulfilled", value: undefined }]);
++      expect(error).toHaveBeenCalledTimes(1);
++      const text = JSON.stringify([...error.mock.calls, ...warn.mock.calls], (_key, value) =>
++        value instanceof Error ? { name: value.name, message: value.message, stack: value.stack } : value,
++      );
++      expect(text).toContain("FixtureSweepFailure");
++      for (const secret of ["Quarterly numbers", "pat@example.com", "482913"]) expect(text, secret).not.toContain(secret);
++      expect(saasDelete).toHaveBeenCalledWith("saas.example", "DELETE");
++      expect(await database.saasProjectStore.getCleanupStats()).toMatchObject({ pending: 0, manual: 0 });
++    });
++
++    it("a failing sweep does not stop trigger maintenance either (it still looks for due triggers)", async () => {
++      vi.spyOn(console, "error").mockImplementation(() => {});
++      vi.spyOn(console, "warn").mockImplementation(() => {});
++      vi.spyOn(console, "info").mockImplementation(() => {});
++      const s = await atMinute(M0, { withAssets: false, vars: { [CONNECTIONS]: undefined } });
++      s.db.failWhen = (query) => {
++        if (/email_watch/i.test(query)) throw new Error("fixture sweep failure");
++        return false;
++      };
++      await s.tick(M0);
++      // Trigger maintenance asks D1 whether a flow trigger is due (the only query of triggerCleanup).
++      expect(s.db.queries.some((query) => /maintenance_at/.test(query))).toBe(true);
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0011, #104: mail_watch runs are outcome-only in the run log, through both public routes of the Worker.
++// The same rule at ActionRunner level, with every caller and audit value, is in email-watch/mail-watch-audit.test.ts.
++// ---------------------------------------------------------------------------------------------------------------
++describe("mail_watch runs in run logs (patch 0011, #104)", () => {
++  const SUBJECT = "Deployment failed for ledger-9QX";
++  const SECRETS = [SUBJECT, "ledger-9QX", "mail.google.com", "no-reply@vercel.com", "gm-"];
++  const ctx = { waitUntil() {}, passThroughOnException() {} };
++
++  async function watching() {
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    for (const id of ["i1", "i2", "i3", "i4"]) {
++      await insertItem(
++        s.db,
++        itemRow({ id, connection_name: "work", subject: SUBJECT, created_at: new Date(T0 - HOUR).toISOString(), dedup_key: `key-${id}` }),
++      );
++    }
++    return s;
++  }
++
++  type Route = "mcp" | "http";
++
++  /** Runs one action through the Worker the way a client would, and returns the action's data and success flag. */
++  async function call(s: Setup, route: Route, actionId: string, input: Record<string, unknown>, connectionName?: string) {
++    if (route === "http") {
++      const response = await worker.fetch(
++        new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/${actionId}`, {
++          method: "POST",
++          headers: { "content-type": "application/json" },
++          body: JSON.stringify({ input, ...(connectionName ? { connectionName } : {}) }),
++        }),
++        s.env,
++        ctx,
++      );
++      const body = (await response.json()) as Record<string, any>;
++      return { ok: response.status === 200, text: JSON.stringify(body) };
++    }
++    const transport = new StreamableHTTPClientTransport(new URL(`${s.env.OOMOL_CONNECT_ORIGIN}/mcp`), {
++      fetch: (async (request: RequestInfo | URL, init?: RequestInit) =>
++        worker.fetch(new Request(request, init), s.env, ctx)) as typeof fetch,
++    });
++    const client = new Client({ name: "email-watch-test", version: "0.0.0" });
++    await client.connect(transport);
++    try {
++      const result = await client.callTool({
++        name: "execute_action",
++        arguments: { actionId, input, ...(connectionName ? { connectionName } : {}) },
++      });
++      return { ok: !result.isError, text: JSON.stringify(result) };
++    } finally {
++      await client.close();
++    }
++  }
++
++  interface RunRow {
++    action_id: string;
++    caller: string;
++    ok: number;
++    value: string;
++  }
++
++  async function runsOf(s: Setup, prefix: string): Promise<{ row: RunRow; value: Record<string, any> }[]> {
++    const rows = (await s.db.inner.prepare("select * from runs order by started_at, id").all<RunRow>()).results;
++    return rows.filter((row) => row.action_id.startsWith(prefix)).map((row) => ({ row, value: JSON.parse(row.value) }));
++  }
++
++  function expectOutcomeOnly(entry: { row: RunRow; value: Record<string, any> }, actionId: string, ok: boolean) {
++    expect(entry.row).toMatchObject({ action_id: actionId, ok: ok ? 1 : 0 });
++    expect(entry.value).toMatchObject({ actionId, ok });
++    expect(typeof entry.value.durationMs).toBe("number");
++    expect(entry.value.inputSummary ?? null).toBeNull();
++    expect(entry.value.outputSummary ?? null).toBeNull();
++    expect("inputSummary" in entry.value).toBe(false);
++    expect("outputSummary" in entry.value).toBe(false);
++    const dump = JSON.stringify(entry);
++    for (const secret of SECRETS) expect(dump, secret).not.toContain(secret);
++  }
++
++  describe.each(["mcp", "http"] as const)("through %s", (route) => {
++    it("list_pending_mail returns the subjects to the caller and stores a row with no summaries and no subject text", async () => {
++      const s = await watching();
++      const response = await call(s, route, "mail_watch.list_pending_mail", { category: "deploy_failed" });
++      expect(response.ok).toBe(true);
++      expect(response.text).toContain(SUBJECT);
++      const runs = await runsOf(s, "mail_watch.");
++      expect(runs).toHaveLength(1);
++      expectOutcomeOnly(runs[0]!, "mail_watch.list_pending_mail", true);
++    });
++
++    it("acknowledge_mail stores a row with no summaries", async () => {
++      const s = await watching();
++      const response = await call(s, route, "mail_watch.acknowledge_mail", { ids: ["i1", "i2"] });
++      expect(response.ok).toBe(true);
++      expect((await s.watchRows<{ status: string }>("email_watch_items")).filter((row) => row.status === "acknowledged")).toHaveLength(2);
++      const runs = await runsOf(s, "mail_watch.");
++      expect(runs).toHaveLength(1);
++      expectOutcomeOnly(runs[0]!, "mail_watch.acknowledge_mail", true);
++    });
++
++    it("a list followed by an acknowledge leaves two outcome-only rows and nothing else about the mail", async () => {
++      const s = await watching();
++      await call(s, route, "mail_watch.list_pending_mail", {});
++      await call(s, route, "mail_watch.acknowledge_mail", { ids: ["i3"] });
++      const runs = await runsOf(s, "mail_watch.");
++      expect(runs.map((entry) => entry.row.action_id).sort()).toEqual(["mail_watch.acknowledge_mail", "mail_watch.list_pending_mail"]);
++      for (const entry of runs) expectOutcomeOnly(entry, entry.row.action_id, true);
++      expect(JSON.stringify(await s.db.inner.prepare("select * from runs").all())).not.toContain("ledger-9QX");
++    });
++
++    it("the run-log listing API shows the run without summaries", async () => {
++      const s = await watching();
++      await call(s, route, "mail_watch.list_pending_mail", {});
++      const response = await worker.fetch(new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/api/runs?limit=20`), s.env, ctx);
++      const page = (await response.json()) as { items: { actionId: string; inputSummary?: unknown; outputSummary?: unknown }[] };
++      const mine = page.items.filter((item) => item.actionId.startsWith("mail_watch."));
++      expect(mine).toHaveLength(1);
++      expect(mine[0]!.inputSummary).toBeUndefined();
++      expect(mine[0]!.outputSummary).toBeUndefined();
++      expect(JSON.stringify(page)).not.toContain("ledger-9QX");
++    });
++
++    it("a failing run stores the error code and no summaries, and nothing from the mail in its message", async () => {
++      vi.spyOn(console, "warn").mockImplementation(() => {});
++      vi.spyOn(console, "info").mockImplementation(() => {});
++      const s = await watching();
++      s.db.failWhen = (query) => {
++        if (/from email_watch_items/i.test(query)) {
++          throw new Error(`cannot read "${SUBJECT}" at https://mail.google.com/mail/u/${OWNER_EMAIL}/#inbox/gm-i1 from no-reply@vercel.com`);
++        }
++        return false;
++      };
++      await call(s, route, "mail_watch.list_pending_mail", { category: "deploy_failed" });
++      const runs = await runsOf(s, "mail_watch.");
++      expect(runs).toHaveLength(1);
++      expectOutcomeOnly(runs[0]!, "mail_watch.list_pending_mail", false);
++      expect(typeof runs[0]!.value.errorCode).toBe("string");
++      expect(runs[0]!.value.errorCode.length).toBeGreaterThan(0);
++      for (const secret of [...SECRETS, OWNER_EMAIL, "cannot read"]) {
++        expect(runs[0]!.value.errorMessage ?? "", secret).not.toContain(secret);
++      }
++    });
++
++    it("a read action of another provider still stores its summaries (control)", async () => {
++      const s = await watching();
++      const response = await call(s, route, "gmail.get_profile", {}, "work");
++      expect(response.ok).toBe(true);
++      const runs = await runsOf(s, "gmail.");
++      expect(runs).toHaveLength(1);
++      expect(runs[0]!.value).toMatchObject({ actionId: "gmail.get_profile", ok: true });
++      expect(runs[0]!.value.inputSummary).toBeDefined();
++      expect(runs[0]!.value.outputSummary).toBeDefined();
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0011, #105 end to end: a code mail seen by the cron is stored and then listed with the code redacted.
++// ---------------------------------------------------------------------------------------------------------------
++describe("one-time codes through the cron and the list action (patch 0011, #105)", () => {
++  it("stores and lists the subject with [redacted] and no digit of the code, and merges two codes into one item", async () => {
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    await s.tick(M0);
++    const mailbox = s.mailboxes.work!;
++    const google = (subject: string): FixtureMessage => ({ from: "Google <no-reply@accounts.google.com>", subject });
++    mailbox.deliver(google("Your verification code is 482913"));
++    mailbox.deliver(google("Your verification code is 771 204"));
++    mailbox.deliver(google("Your verification code is 482"));
++    await s.tick(M0 + 10);
++
++    const rows = await s.watchRows<{ subject: string; occurrences: number }>("email_watch_items");
++    expect(rows.map((row) => [row.subject, row.occurrences]).sort()).toEqual([
++      ["Your verification code is 482", 1],
++      ["Your verification code is [redacted]", 2],
++    ]);
++
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/mail_watch.list_pending_mail`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input: {} }),
++      }),
++      s.env,
++      { waitUntil() {}, passThroughOnException() {} },
++    );
++    const text = JSON.stringify(await response.json());
++    expect(text).toContain("Your verification code is [redacted]");
++    for (const digits of ["482913", "771 204", "771204"]) expect(text, digits).not.toContain(digits);
+   });
+ });
+diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
+index eb2a3ac7..c7baa194 100644
+--- a/src/server/cloudflare.ts
++++ b/src/server/cloudflare.ts
+@@ -27,7 +27,7 @@ import { createConnectApp } from "./connect-app.ts";
+ import { preloadOptionalServerModules } from "./connect-server.ts";
+ import { isWatchDue, parseEmailWatchConfig } from "./email-watch/config.ts";
+ import { createWatchActionRunner } from "./email-watch/watch-runner.ts";
+-import { EmailWatcher, hasCatchUp } from "./email-watch/watcher.ts";
++import { EmailWatcher, hasCatchUp, sweepEmailWatchRetention } from "./email-watch/watcher.ts";
+ import { KVTransitFileService } from "./files/kv-transit-files.ts";
+ import { R2TransitFileService } from "./files/r2-transit-files.ts";
+ import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
+@@ -71,7 +71,7 @@ export default {
+       await triggerMaintenance.run();
+     };
+     ctx.waitUntil(
+-      Promise.all([cleanup.run(), triggerCleanup(), runEmailWatch(event, env)]).then(() => undefined),
++      Promise.all([cleanup.run(), triggerCleanup(), runEmailWatchSweep(event, env), runEmailWatch(event, env)]).then(() => undefined),
+     );
+   },
+   async fetch(request: Request, env: CloudflareEnv, ctx: CloudflareExecutionContext): Promise<Response> {
+@@ -139,6 +139,17 @@ async function fetchRuntime(request: Request, env: CloudflareEnv): Promise<Respo
+   return response;
+ }
+ 
++/**
++ * The retention sweep runs on every due minute whether or not any connection is configured, so removing a
++ * connection from the list purges what was stored for it. It never throws.
++ */
++async function runEmailWatchSweep(event: ScheduledEventLike, env: CloudflareEnv): Promise<void> {
++  const settings = parseEmailWatchConfig(env);
++  const now = event.scheduledTime ?? Date.now();
++  if (!isWatchDue(now, settings.intervalMinutes)) return;
++  await sweepEmailWatchRetention(env.DB, settings.connections, workerLogger, now);
++}
++
+ /**
+  * The email watch rides on the existing every-minute cron. It does nothing, with no D1 query and no Gmail call,
+  * unless OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS names a connection. Its failures are logged by error name only and
+diff --git a/src/server/email-watch/mail-watch-audit.test.ts b/src/server/email-watch/mail-watch-audit.test.ts
+new file mode 100644
+index 00000000..53644dbe
+--- /dev/null
++++ b/src/server/email-watch/mail-watch-audit.test.ts
+@@ -0,0 +1,208 @@
++// Patch 0011, #104: every run of a mail_watch action is recorded with outcome-only audit, whatever the caller and
++// whatever `audit` value it passed. Exercised through the real ActionRunner, so the rule is enforced in one place
++// (keyed on the provider id) and not at each call site. The Worker-level MCP and HTTP routes are in
++// cloudflare-email-watch.test.ts ("mail_watch runs in run logs").
++import type { ProviderExecutors } from "../../core/types.ts";
++import type { RunLog, RunLogCaller } from "../storage/runtime-store.ts";
++
++import { afterEach, describe, expect, it } from "vitest";
++import { createCatalogStore } from "../../catalog-store.ts";
++import { ConnectionService } from "../../connection-service.ts";
++import { ActionPolicyService } from "../../core/action-policy.ts";
++import { provider as gmail } from "../../providers/gmail/definition.ts";
++import { provider as mailWatch } from "../../providers/mail_watch/definition.ts";
++import { createMailWatchExecutors } from "../../providers/mail_watch/executors.ts";
++import { ProviderLoader } from "../../providers/provider-loader.ts";
++import { ActionRunner } from "../actions/action-runner.ts";
++import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++import { HOUR, T0, insertItem, itemRow } from "./test-support.ts";
++
++const SUBJECT = "Deployment failed for ledger-9QX";
++const LEAK = `Could not read "${SUBJECT}" at https://mail.google.com/mail/u/owner@example.org/#inbox/18c0ffee from owner@example.org`;
++const SECRETS = [SUBJECT, "ledger-9QX", "mail.google.com", "owner@example.org", "18c0ffee", "no-reply@vercel.com"];
++const iso = (ms: number) => new Date(ms).toISOString();
++
++const databases: SqliteD1Database[] = [];
++afterEach(() => {
++  for (const database of databases.splice(0)) database.close();
++});
++
++async function setup(mailWatchExecutors?: ProviderExecutors) {
++  const binding = new SqliteD1Database();
++  databases.push(binding);
++  const database = new D1RuntimeDatabase(binding);
++  await database.connectionStore.set("gmail", "work", {
++    authType: "oauth2",
++    accessToken: "token-work",
++    tokenType: "Bearer",
++    metadata: {},
++    profile: { accountId: "owner@example.org", displayName: "owner@example.org", grantedScopes: [] },
++  });
++  for (const id of ["i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8"]) {
++    await insertItem(
++      binding,
++      itemRow({
++        id,
++        connection_name: "work",
++        subject: SUBJECT,
++        received_at: iso(T0 - HOUR),
++        created_at: iso(T0 - HOUR),
++        dedup_key: `key-${id}`,
++      }),
++    );
++  }
++  const catalog = createCatalogStore([JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))], {
++    executableActionIds: [...mailWatch.actions.map((action) => action.id), "gmail.get_profile"],
++  });
++  const providerLoader = new ProviderLoader({
++    mail_watch: async () => ({
++      executors:
++        mailWatchExecutors ??
++        createMailWatchExecutors({
++          database: binding,
++          enabled: true,
++          profileEmail: async () => "owner@example.org",
++          now: () => T0,
++        }),
++    }),
++    gmail: async () => ({
++      executors: {
++        "gmail.get_profile": async () => ({
++          ok: true,
++          output: { emailAddress: "owner@example.org", messagesTotal: 7, historyId: "1234" },
++        }),
++      },
++    }),
++  });
++  const runner = new ActionRunner({
++    catalog,
++    providerLoader,
++    connections: new ConnectionService({ catalog, providerLoader, store: database.connectionStore }),
++    runs: database.runLogStore,
++  });
++  const policy = new ActionPolicyService().createSnapshot();
++  return {
++    binding,
++    async run(
++      actionId: string,
++      input: Record<string, unknown>,
++      options: { caller?: RunLogCaller; audit?: "outcome"; connectionName?: string } = {},
++    ): Promise<{ log: RunLog; ok: boolean; output: unknown }> {
++      const result = await runner.run({
++        actionId,
++        input,
++        caller: options.caller ?? "mcp",
++        policy,
++        ...(options.audit ? { audit: options.audit } : {}),
++        ...(options.connectionName ? { connectionName: options.connectionName } : {}),
++      });
++      expect(result).toBeDefined();
++      const log = await runner.getRun(result!.executionId);
++      expect(log).toBeDefined();
++      return { log: log!, ok: result!.result.ok, output: result!.result.output };
++    },
++  };
++}
++
++function expectOutcomeOnly(log: RunLog, expected: { actionId: string; caller: RunLogCaller; ok: boolean }): void {
++  expect(log).toMatchObject({ service: "mail_watch", actionId: expected.actionId, caller: expected.caller, ok: expected.ok });
++  expect(typeof log.durationMs).toBe("number");
++  expect(typeof log.startedAt).toBe("string");
++  expect(typeof log.completedAt).toBe("string");
++  expect(log.inputSummary).toBeUndefined();
++  expect(log.outputSummary).toBeUndefined();
++  expect("inputSummary" in JSON.parse(JSON.stringify(log))).toBe(false);
++  expect("outputSummary" in JSON.parse(JSON.stringify(log))).toBe(false);
++  const dump = JSON.stringify(log);
++  for (const secret of SECRETS) expect(dump, secret).not.toContain(secret);
++}
++
++describe("mail_watch runs are outcome-only whatever the caller and audit value", () => {
++  const callers: RunLogCaller[] = ["mcp", "http", "web", "cron"];
++  const audits: ("outcome" | undefined)[] = [undefined, "outcome"];
++
++  describe.each(callers)("caller %s", (caller) => {
++    it.each(audits)("list_pending_mail with audit %s", async (audit) => {
++      const s = await setup();
++      const { log, ok } = await s.run("mail_watch.list_pending_mail", { category: "deploy_failed", limit: 5 }, { caller, audit });
++      expect(ok).toBe(true);
++      expectOutcomeOnly(log, { actionId: "mail_watch.list_pending_mail", caller, ok: true });
++    });
++
++    it.each(audits)("acknowledge_mail with audit %s", async (audit) => {
++      const s = await setup();
++      const { log, ok } = await s.run("mail_watch.acknowledge_mail", { ids: ["i1", "i2"] }, { caller, audit });
++      expect(ok).toBe(true);
++      expectOutcomeOnly(log, { actionId: "mail_watch.acknowledge_mail", caller, ok: true });
++    });
++  });
++
++  it("the caller still gets the subjects in the run's output: only the stored row loses them", async () => {
++    const s = await setup();
++    const { output } = await s.run("mail_watch.list_pending_mail", {});
++    expect(JSON.stringify(output)).toContain(SUBJECT);
++    const ack = await s.run("mail_watch.acknowledge_mail", { ids: ["i3"] });
++    expect(ack.output).toEqual({ acknowledged: 1 });
++  });
++
++  it("a read action of another provider keeps its input and output summaries (control)", async () => {
++    const s = await setup();
++    const { log, ok } = await s.run("gmail.get_profile", {}, { connectionName: "work" });
++    expect(ok).toBe(true);
++    expect(log).toMatchObject({ service: "gmail", actionId: "gmail.get_profile", ok: true });
++    expect(log.inputSummary).toEqual({});
++    expect(log.outputSummary).toMatchObject({ messagesTotal: 7, historyId: "1234" });
++  });
++
++  it("audit: outcome on another provider's action still drops both summaries (existing behaviour)", async () => {
++    const s = await setup();
++    const { log } = await s.run("gmail.get_profile", {}, { connectionName: "work", audit: "outcome" });
++    expect(log.inputSummary).toBeUndefined();
++    expect(log.outputSummary).toBeUndefined();
++  });
++});
++
++describe("a failed mail_watch run stores no subject, link or address", () => {
++  const failures: [string, ProviderExecutors][] = [
++    [
++      "an executor that reports provider_error with the mail in its message",
++      {
++        "mail_watch.list_pending_mail": async () => ({ ok: false, error: { code: "provider_error", message: LEAK } }),
++        "mail_watch.acknowledge_mail": async () => ({ ok: false, error: { code: "provider_error", message: LEAK } }),
++      },
++    ],
++    [
++      "an executor that reports an unknown error code with the mail in its message",
++      {
++        "mail_watch.list_pending_mail": async () => ({ ok: false, error: { code: "mail_read_failed", message: LEAK } }),
++        "mail_watch.acknowledge_mail": async () => ({ ok: false, error: { code: "mail_read_failed", message: LEAK } }),
++      },
++    ],
++    [
++      "an executor that throws with the mail in its message",
++      {
++        "mail_watch.list_pending_mail": async () => {
++          throw new Error(LEAK);
++        },
++        "mail_watch.acknowledge_mail": async () => {
++          throw new Error(LEAK);
++        },
++      },
++    ],
++  ];
++
++  describe.each(failures)("%s", (_name, executors) => {
++    it.each(["mail_watch.list_pending_mail", "mail_watch.acknowledge_mail"])("%s", async (actionId) => {
++      const s = await setup(executors);
++      const input = actionId.endsWith("acknowledge_mail") ? { ids: ["i1"] } : { category: "deploy_failed" };
++      const { log, ok } = await s.run(actionId, input);
++      expect(ok).toBe(false);
++      expectOutcomeOnly(log, { actionId, caller: "mcp", ok: false });
++      // The error code is kept (the run row's reason for failing); the message is dropped or generic.
++      expect(typeof log.errorCode).toBe("string");
++      expect(log.errorCode!.length).toBeGreaterThan(0);
++      for (const secret of [...SECRETS, "Could not read"]) expect(log.errorMessage ?? "", secret).not.toContain(secret);
++    });
++  });
++});
+diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
+index 54379680..20347713 100644
+--- a/src/server/email-watch/rules.ts
++++ b/src/server/email-watch/rules.ts
+@@ -89,7 +89,7 @@ export function classifyMessage(headers: readonly MailHeader[]): EmailWatchMatch
+     if (!rule.domains.some((domain) => isOnDomain(senderDomain, domain))) continue;
+     if (rule.subject && !rule.subject.test(fullSubject)) continue;
+     if (rule.header && !headerHasValue(headers, rule.header.name, rule.header.values)) continue;
+-    return { category: rule.category, ruleId: rule.id, senderDomain, subject: truncate(fullSubject) };
++    return { category: rule.category, ruleId: rule.id, senderDomain, subject: truncate(redactCodes(fullSubject)) };
+   }
+   return undefined;
+ }
+@@ -189,6 +189,14 @@ function stripControlCharacters(text: string): string {
+   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+ }
+ 
++/**
++ * Replace every run of 4 or more digits, where single spaces or hyphens may split the digits, so a one-time code is
++ * never stored. Codes that mix letters and digits, or have fewer than 4 digits, are left alone (documented residual).
++ */
++export function redactCodes(subject: string): string {
++  return subject.replace(/\d(?:[ -]?\d){3,}/g, "[redacted]");
++}
++
+ function truncate(subject: string): string {
+   if (subject.length <= MAX_SUBJECT_LENGTH) return subject;
+   const cut = subject.slice(0, MAX_SUBJECT_LENGTH);
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index a3b32776..36ed2c0a 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -21,8 +21,8 @@
+ //                        connections: readonly string[],         // gmail connection names, already parsed
+ //                        logger: RuntimeLogger,                  // { info, warn, error }(fields, message)
+ //                        now?: () => number })                   // epoch ms, default Date.now
+-//     .run(): Promise<void>            one invocation: up to 15 Gmail action runs, oldest last_run_at first,
+-//                                      then the once-a-day retention sweep when it is due. Never throws for a
++//     .run(): Promise<void>            one invocation: up to 15 Gmail action runs, oldest last_run_at first.
++//                                      (Patch 0011: the retention sweep is no longer part of it.) Never throws for a
+ //                                      Gmail or policy failure of one connection.
+ //     .needsCatchUp(): Promise<boolean>   true while any cursor has catch_up = 1
+ //   src/server/actions/action-runner.ts
+@@ -58,7 +58,7 @@ import type { FixtureMessage } from "./test-support.ts";
+ import { EmailWatcher } from "./watcher.ts";
+ 
+ const policy = new ActionPolicyService().createSnapshot();
+-const HEADER_NAMES = ["Authentication-Results", "From", "List-Id", "Subject", "X-GitHub-Reason"];
++const HEADER_NAMES = ["Authentication-Results", "From", "Subject", "X-GitHub-Reason"];
+ 
+ let databases: SqliteD1Database[] = [];
+ afterEach(() => {
+@@ -220,7 +220,7 @@ describe("what a run asks Gmail for", () => {
+     expect(Object.keys(list!.input)).not.toContain("pageToken");
+   });
+ 
+-  it("fetches metadata only, with exactly the five headers it needs", async () => {
++  it("fetches metadata only, with exactly the four headers it needs (no List-Id)", async () => {
+     const r = rig();
+     await seed(r);
+     const id = r.mailboxes.work!.deliver(failed("Deployment failed for a"));
+@@ -845,67 +845,227 @@ describe("overlapping invocations", () => {
+   });
+ });
+ 
+-describe("retention sweep", () => {
+-  async function swept() {
++describe("retention sweep is not part of a watch run (patch 0011, #106)", () => {
++  // The sweep is a standalone function called by the cron handler; its behaviour is tested through
++  // worker.scheduled in cloudflare-email-watch.test.ts ("retention sweep").
++  it("run() deletes nothing: expired pending and acknowledged items stay, on any day", async () => {
+     const r = rig();
+     await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - HOUR) });
+-    return r;
+-  }
+-
+-  const day1 = Date.UTC(2026, 10, 12, 0, 5, 0);
+-
+-  it("deletes pending items older than 14 days and acknowledged items older than 7 days, keeping the rest", async () => {
+-    const r = await swept();
++    const day1 = Date.UTC(2026, 10, 12, 0, 5, 0);
+     r.clock.now = day1;
+-    const ago = (ms: number) => iso(day1 - ms);
+-    await insertItem(r.db, itemRow({ id: "pending-old", created_at: ago(14 * DAY + 1000), received_at: ago(14 * DAY + 1000) }));
+-    await insertItem(r.db, itemRow({ id: "pending-edge-keep", created_at: ago(14 * DAY - 1000), received_at: ago(14 * DAY - 1000) }));
+-    await insertItem(r.db, itemRow({ id: "pending-ancient", created_at: ago(60 * DAY), received_at: ago(60 * DAY) }));
+-    await insertItem(r.db, itemRow({ id: "pending-new", created_at: ago(HOUR), received_at: ago(HOUR) }));
++    await insertItem(r.db, itemRow({ id: "pending-old", created_at: iso(day1 - 20 * DAY), received_at: iso(day1 - 20 * DAY) }));
+     await insertItem(
+       r.db,
+-      itemRow({ id: "ack-old", status: "acknowledged", acknowledged_at: ago(7 * DAY + 1000), created_at: ago(7 * DAY + HOUR) }),
++      itemRow({ id: "ack-old", status: "acknowledged", acknowledged_at: iso(day1 - 9 * DAY), created_at: iso(day1 - 10 * DAY) }),
+     );
+-    await insertItem(
+-      r.db,
+-      itemRow({ id: "ack-edge-keep", status: "acknowledged", acknowledged_at: ago(7 * DAY - 1000), created_at: ago(7 * DAY + HOUR) }),
++    await insertItem(r.db, itemRow({ id: "other-connection", connection_name: "gone" }));
++    // The first run after 00:00 UTC used to sweep; so did a run on a connection-less day.
++    await r.run();
++    r.clock.now = Date.UTC(2026, 10, 13, 0, 1, 0);
++    await r.run();
++    const left = (await selectAll<{ id: string }>(r.db, "select id from email_watch_items order by id")).map((row) => row.id);
++    expect(left).toEqual(["ack-old", "other-connection", "pending-old"]);
++    expect(await selectAll(r.db, "select connection_name from email_watch_cursors")).toEqual([{ connection_name: "work" }]);
++  });
++
++  it("does not touch watch_gap items that are fresh", async () => {
++    const r = rig();
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - HOUR) });
++    r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++    r.mailboxes.work!.expireHistory();
++    r.clock.now = Date.UTC(2026, 10, 12, 0, 5, 0);
++    await r.run();
++    expect((await itemsOf(r)).map((row) => row.category)).toEqual(["watch_gap"]);
++  });
++});
++
++describe("one-time codes in subjects are never stored (patch 0011, #105)", () => {
++  const google = (subject: string): FixtureMessage => ({ from: "Google <no-reply@accounts.google.com>", subject });
++
++  /**
++   * Brute-force oracle, written as a character scan and not as a regular expression: a run starts at a digit and
++   * continues over digits and over one space or hyphen that has a digit right after it. A run of 4 or more digits
++   * becomes "[redacted]"; separators belong to a run only between its digits.
++   */
++  function oracle(text: string): string {
++    const isDigit = (char: string | undefined) => char !== undefined && char >= "0" && char <= "9";
++    let out = "";
++    let i = 0;
++    while (i < text.length) {
++      if (!isDigit(text[i])) {
++        out += text[i];
++        i += 1;
++        continue;
++      }
++      let end = i;
++      let digits = 0;
++      for (;;) {
++        if (isDigit(text[end])) {
++          digits += 1;
++          end += 1;
++        } else if ((text[end] === " " || text[end] === "-") && isDigit(text[end + 1])) {
++          end += 1;
++        } else {
++          break;
++        }
++      }
++      out += digits >= 4 ? "[redacted]" : text.slice(i, end);
++      i = end;
++    }
++    return out;
++  }
++
++  async function storedSubject(message: FixtureMessage): Promise<string> {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(message);
++    r.clock.now += 600_000;
++    await r.run();
++    const rows = await itemsOf(r);
++    expect(rows).toHaveLength(1);
++    return rows[0]!.subject;
++  }
++
++  it.each([
++    ["Your verification code is 482913", "Your verification code is [redacted]"],
++    ["Your verification code is 482 913", "Your verification code is [redacted]"],
++    ["Your verification code is 482-913", "Your verification code is [redacted]"],
++    ["Your verification code is 4821", "Your verification code is [redacted]"],
++    ["Your verification code is 4-8-2-1", "Your verification code is [redacted]"],
++    ["Your verification code is 12 34", "Your verification code is [redacted]"],
++    ["482913 is your verification code", "[redacted] is your verification code"],
++    ["verification code 482913 or 7731", "verification code [redacted] or [redacted]"],
++    ["Your verification code is 48291374650", "Your verification code is [redacted]"],
++  ])("account_security: %j is stored as %j", async (subject, expected) => {
++    expect(await storedSubject(google(subject))).toBe(expected);
++  });
++
++  it("keeps the verification code pattern working: the message is still matched as account_security", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(google("Your verification code is 482913"));
++    r.clock.now += 600_000;
++    await r.run();
++    expect(await itemsOf(r)).toMatchObject([{ category: "account_security", rule_id: "account-security", sender_domain: "accounts.google.com" }]);
++  });
++
++  it("redacts in every category, not only account_security", async () => {
++    expect(await storedSubject(failed("Deployment 4821 failed for my-app"))).toBe("Deployment [redacted] failed for my-app");
++    expect(
++      await storedSubject({
++        from: "GitHub <notifications@github.com>",
++        subject: "Re: Fix flaky test (#12345)",
++        githubReason: "review_requested",
++      }),
++    ).toBe("Re: Fix flaky test (#[redacted])");
++    expect(await storedSubject({ from: "Anthropic <billing@anthropic.com>", subject: "Usage limit reached for org 20481 - 7" })).toBe(
++      "Usage limit reached for org [redacted] - 7",
+     );
+-    await insertItem(
+-      r.db,
+-      itemRow({ id: "ack-new", status: "acknowledged", acknowledged_at: ago(HOUR), created_at: ago(2 * HOUR) }),
++  });
++
++  it("redacts years and invoice numbers too (accepted)", async () => {
++    expect(await storedSubject({ from: "Vercel <billing@vercel.com>", subject: "Payment failed for invoice 2026-0042" })).toBe(
++      "Payment failed for invoice [redacted]",
+     );
+-    // A pending item between 7 and 14 days old is kept: the 7-day rule is for acknowledged items only.
+-    await insertItem(r.db, itemRow({ id: "pending-10d", created_at: ago(10 * DAY), received_at: ago(10 * DAY) }));
++  });
+ 
+-    await r.run();
+-    const left = (await selectAll<{ id: string }>(r.db, "select id from email_watch_items order by id")).map((row) => row.id);
+-    expect(left).toEqual(["ack-edge-keep", "ack-new", "pending-10d", "pending-edge-keep", "pending-new"]);
++  it.each([
++    ["Your verification code is 482"],
++    ["Your verification code is 48 2"],
++    ["Your verification code is 12 and 34"],
++    ["Your verification code is 123  456"],
++    ["Your verification code is 123 - 456"],
++    ["Your verification code is 1 2 and 3"],
++  ])("leaves %j unchanged: fewer than 4 digits in one run", async (subject) => {
++    expect(await storedSubject(google(subject))).toBe(subject);
+   });
+ 
+-  it("sweeps once per UTC day: not again the same day, again after the next 00:00 UTC", async () => {
+-    const r = await swept();
+-    r.clock.now = day1;
++  it("does not redact codes that mix letters and digits (documented residual)", async () => {
++    expect(await storedSubject(google("Your verification code is A1B2C3"))).toBe("Your verification code is A1B2C3");
++  });
++
++  it("the dedup key is computed on the redacted subject, so two code mails with different codes become one item", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(google("Your verification code is 482913"));
++    r.mailboxes.work!.deliver(google("Your verification code is 771 204"));
++    r.mailboxes.work!.deliver(google("Your verification code is 5530"));
++    r.clock.now += 600_000;
+     await r.run();
++    const rows = await itemsOf(r);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ subject: "Your verification code is [redacted]", occurrences: 3 });
++    expect(rows[0]!.dedup_key).toBe(hash("account_security", "accounts.google.com", "Your verification code is [redacted]"));
++  });
+ 
+-    // Same UTC day, later: an item that is now old enough stays.
+-    r.clock.now = day1 + 9 * HOUR;
+-    await insertItem(r.db, itemRow({ id: "late-old", created_at: iso(day1 - 20 * DAY), received_at: iso(day1 - 20 * DAY) }));
++  it("a different non-numeric subject from the same sender stays a separate item", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(google("Your verification code is 482913"));
++    r.mailboxes.work!.deliver(google("Security alert: new sign-in on a device"));
++    r.clock.now += 600_000;
+     await r.run();
+-    expect((await selectAll(r.db, "select id from email_watch_items")).map((row: any) => row.id)).toEqual(["late-old"]);
++    expect(await itemsOf(r)).toHaveLength(2);
++  });
+ 
+-    // First run after the next midnight sweeps it.
+-    r.clock.now = Date.UTC(2026, 10, 13, 0, 1, 0);
++  it("no digit of the code survives in any column of the stored row or in a log line", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(google("Your verification code is 482913"));
++    r.clock.now += 600_000;
+     await r.run();
+-    expect(await selectAll(r.db, "select id from email_watch_items")).toEqual([]);
++    const [row] = await itemsOf(r);
++    for (const column of ["subject", "sender_domain", "category", "rule_id"]) {
++      expect(String(row![column]), column).not.toMatch(/482|913/);
++    }
++    expect(r.log.text()).not.toMatch(/482|913/);
+   });
+ 
+-  it("does not touch watch_gap items that are fresh", async () => {
+-    const r = await swept();
+-    r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++  it("matches a brute-force oracle on 60 random digit/space/hyphen subjects", async () => {
++    // Deterministic pseudo-random subjects: letters, digits, single and double spaces and hyphens.
++    let state = 20260413;
++    const next = (bound: number) => {
++      state = (state * 1103515245 + 12345) % 2147483648;
++      return state % bound;
++    };
++    const alphabet = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "5", " ", "-", " ", "a", "-", "  "];
++    const cases: string[] = [];
++    for (let index = 0; index < 60; index += 1) {
++      let tail = "";
++      for (let step = 0, length = 4 + next(14); step < length; step += 1) tail += alphabet[next(alphabet.length)];
++      // A letter id keeps every subject unique after redaction, so no two merge into one item.
++      const id = String.fromCharCode(97 + (index % 26)) + String.fromCharCode(97 + Math.floor(index / 26));
++      cases.push(`Deployment failed ${id}x${tail}x`);
++    }
++    const r = rig();
++    await seed(r);
++    const byMessage = new Map<string, string>();
++    for (let batch = 0; batch < 5; batch += 1) {
++      for (const subject of cases.slice(batch * 12, batch * 12 + 12)) {
++        byMessage.set(r.mailboxes.work!.deliver(failed(subject)), subject);
++      }
++      r.clock.now += 600_000;
++      await r.run();
++    }
++    const rows = await itemsOf(r);
++    expect(rows).toHaveLength(60);
++    for (const row of rows) {
++      const original = byMessage.get(row.gmail_message_id)!;
++      expect(row.subject, original).toBe(oracle(original));
++    }
++    // The oracle itself is not trivially the identity or the constant.
++    expect(cases.filter((subject) => oracle(subject) !== subject).length).toBeGreaterThan(10);
++    expect(cases.filter((subject) => oracle(subject) === subject).length).toBeGreaterThan(5);
++  });
++
++  it("leaves the watch_gap subject, which carries no mail content, readable", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
+     r.mailboxes.work!.expireHistory();
+-    r.clock.now = day1;
++    r.clock.now += 600_000;
+     await r.run();
+-    expect((await itemsOf(r)).map((row) => row.category)).toEqual(["watch_gap"]);
++    expect((await itemsOf(r))[0]!.subject).toBe("Mail between 2026-11-11 12:00 UTC and now was not checked");
+   });
+ });
+ 
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index de8ed051..544cfad5 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -18,7 +18,7 @@ const PENDING_RETENTION_MS = 14 * DAY_MS;
+ const ACKNOWLEDGED_RETENTION_MS = 7 * DAY_MS;
+ const DEDUP_WINDOW_MS = DAY_MS;
+ const SKIPPED_LABELS = new Set(["DRAFT", "SENT", "SPAM", "TRASH"]);
+-const METADATA_HEADERS = ["From", "Subject", "Authentication-Results", "X-GitHub-Reason", "List-Id"];
++const METADATA_HEADERS = ["From", "Subject", "Authentication-Results", "X-GitHub-Reason"];
+ 
+ export interface EmailWatcherOptions {
+   /** Holds the tables of migration 0019. */
+@@ -104,10 +104,9 @@ export class EmailWatcher {
+     this.now = options.now ?? Date.now;
+   }
+ 
+-  /** One invocation: up to 15 Gmail action runs, oldest last run first, then the daily retention sweep if due. */
++  /** One invocation: up to 15 Gmail action runs, oldest last run first. */
+   async run(): Promise<void> {
+     const cursors = await loadCursors(this.database);
+-    const sweepDue = this.isSweepDue(cursors);
+     const budget: Budget = { remaining: MAX_ACTION_RUNS };
+     const waiting: string[] = [];
+ 
+@@ -129,7 +128,6 @@ export class EmailWatcher {
+         .bind(name)
+         .run();
+     }
+-    if (sweepDue) await this.sweepRetention();
+   }
+ 
+   needsCatchUp(): Promise<boolean> {
+@@ -430,32 +428,44 @@ export class EmailWatcher {
+     this.logger.warn({ connectionName: name, errorCode }, "email watch skipped a connection");
+   }
+ 
+-  /** The first watch run after 00:00 UTC: the last run on record was on an earlier UTC day. */
+-  private isSweepDue(cursors: Map<string, Cursor>): boolean {
+-    let latest = "";
+-    for (const cursor of cursors.values()) if (cursor.lastRunAt > latest) latest = cursor.lastRunAt;
+-    return latest === "" || latest.slice(0, 10) !== this.nowIso().slice(0, 10);
++  private nowIso(): string {
++    return new Date(this.now()).toISOString();
+   }
++}
+ 
+-  private async sweepRetention(): Promise<void> {
+-    const now = this.now();
+-    try {
+-      await this.database
+-        .prepare("delete from email_watch_items where status = 'pending' and created_at < ?")
+-        .bind(new Date(now - PENDING_RETENTION_MS).toISOString())
+-        .run();
+-      await this.database
+-        .prepare("delete from email_watch_items where status = 'acknowledged' and acknowledged_at < ?")
+-        .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
+-        .run();
+-    } catch (error) {
+-      this.logger.error({ errorName: errorName(error) }, "email watch retention sweep failed");
++/**
++ * Retention sweep, independent of the watch: D1 only, no Gmail, no KV. Deletes expired items, then everything for
++ * connections that are not in the watched list (an empty list purges all). Tables that do not exist yet make it a
++ * silent no-op; any other failure is logged once by error name and rethrown to nobody.
++ */
++export async function sweepEmailWatchRetention(
++  database: D1DatabaseBinding,
++  watched: readonly string[],
++  logger: RuntimeLogger,
++  now: number = Date.now(),
++): Promise<void> {
++  try {
++    await database
++      .prepare("delete from email_watch_items where status = 'pending' and created_at < ?")
++      .bind(new Date(now - PENDING_RETENTION_MS).toISOString())
++      .run();
++    await database
++      .prepare("delete from email_watch_items where status = 'acknowledged' and acknowledged_at < ?")
++      .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
++      .run();
++    for (const table of ["email_watch_items", "email_watch_cursors"]) {
++      const marks = watched.map(() => "?").join(", ");
++      const where = watched.length > 0 ? ` where connection_name not in (${marks})` : "";
++      await database.prepare(`delete from ${table}${where}`).bind(...watched).run();
+     }
++  } catch (error) {
++    if (isMissingTable(error)) return;
++    logger.error({ errorName: errorName(error) }, "email watch retention sweep failed");
+   }
++}
+ 
+-  private nowIso(): string {
+-    return new Date(this.now()).toISOString();
+-  }
++function isMissingTable(error: unknown): boolean {
++  return error instanceof Error && /no such table/i.test(error.message);
+ }
+ 
+ /** True while a watched connection has a cursor flagged for an off-interval catch-up run. */
+-- 
+2.34.1
+
