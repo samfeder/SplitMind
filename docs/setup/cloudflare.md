@@ -51,18 +51,20 @@ domain you have already routed to the Worker, pass `-- --origin https://<your-do
 The script prints each step:
 
 1. **Patches.** It checks that the engine has `node_modules` and applies this repo's patches, before any call to
-   your Cloudflare account. If a patch does not apply, it stops here and nothing has been changed.
-2. **Cloudflare resources.** It finds or creates the D1 database and both KV namespaces, and saves their ids to
+   your Cloudflare account. If a patch does not apply, it stops here and nothing in your Cloudflare account has
+   been changed.
+2. **Login check.** `wrangler whoami` confirms wrangler is logged in to your account; it changes nothing.
+3. **Cloudflare resources.** It finds or creates the D1 database and both KV namespaces, and saves their ids to
    `splitmind.local.json` (git-ignored; it holds account-specific ids, not secrets).
-3. **Config.** It renders [`wrangler.template.jsonc`](../../wrangler.template.jsonc) into
+4. **Config.** It renders [`wrangler.template.jsonc`](../../wrangler.template.jsonc) into
    `vendor/open-connector/wrangler.local.jsonc` (git-ignored upstream).
-4. **D1 migrations**, applied remotely. Upstream's deploy does not run them, so the script always does.
-5. **Build.** OpenConnector's catalog and Web Console, then the Worker's catalog assets trimmed to the providers in
+5. **D1 migrations**, applied remotely. Upstream's deploy does not run them, so the script always does.
+6. **Build.** OpenConnector's catalog and Web Console, then the Worker's catalog assets trimmed to the providers in
    `OOMOL_CONNECT_ALLOWED_ACTIONS` (Notion, Slack and Gmail).
-6. **Deploy.** The first time, wrangler may ask to register a `workers.dev` subdomain for the account. The script
+7. **Deploy.** The first time, wrangler may ask to register a `workers.dev` subdomain for the account. The script
    then reads the Worker's URL from wrangler, sets it as `OOMOL_CONNECT_ORIGIN` and deploys again. Until that
    second pass the Worker answers every request with 503, so it is never reachable half-configured.
-7. **Secrets.** If the admin token or encryption key is not set, the script stops at wrangler's prompt for each.
+8. **Secrets.** If the admin token or encryption key is not set, the script stops at wrangler's prompt for each.
    For each one, run this in **another** terminal and paste its output at the prompt:
 
    ```bash
@@ -77,7 +79,7 @@ The script prints each step:
      ([patch 0001](../../patches/README.md)); anything else falls back to slow PBKDF2.
 
    The script never sees, prints or stores either value. Never paste them into a chat, an issue or a commit.
-8. **Health check.** `GET <origin>/health` must return `{"ok":true}`.
+9. **Health check.** `GET <origin>/health` must return `{"ok":true}`.
 
 Then open the printed URL in a browser and sign in with the admin token.
 
