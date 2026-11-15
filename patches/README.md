@@ -26,3 +26,17 @@ Rules:
 | `0010-oauth-flow-test-relative-expiry.patch` | Test-only. The OAuth flow test "stores the token returned by a provider OAuth runtime" hard-coded `expiresAt` 2026-10-30, which has passed, so the test failed. The expiry is now one hour from `Date.now()`. Candidate for upstream. | Not filed yet | #93 |
 | `0011-email-watch-pre-enable-fixes.patch` | Fixes to the email watch (0009) required before enabling it. `mail_watch` runs are always outcome-only in run logs, enforced in `ActionRunner` (#104). Runs of 4 or more digits in a stored subject become `[redacted]`, so one-time codes are not kept (#105). The retention sweep is its own function, run on every due cron minute with or without a configured account, and also deletes items and cursors of accounts no longer in the list (#106). `List-Id` is no longer requested (#107). Apply after 0009. | Not filed yet | #104, #105, #106, #107 |
 | `0012-email-watch-hardening.patch` | Hardens the email watch. Code redaction in stored subjects now removes zero-width characters and covers any Unicode digit, with one separator (whitespace including no-break spaces, dot, hyphen, dash, minus) between digits (#110). The retention sweep purges unwatched accounts with no limit on the number of watched accounts (reads names, deletes in chunks of 50), handles each table on its own, and has indexes for its scans (migration `0020_email_watch_indexes.sql`, Postgres mirror too) (#111). Apply after 0011. | Not filed yet | #110, #111 |
+| `0013-oauth-refresh-test-relative-expiry.patch` | Test-only. The `oauth-credential-refresh-service` tests that have a provider runtime return a refreshed token hard-coded `expiresAt` 2026-12-29, which is about to pass. The expiry is now 45 days from `Date.now()`, in one constant. Candidate for upstream. | Not filed yet | #109 |
+
+## Date guard
+
+A test that hard-codes a date breaks every merge the day that date passes (patch 0010 and 0013 are two cases). The
+`bootstrap` CI job runs `node scripts/check-vendor-dates.ts` after bootstrap. It reads every `*.test.ts` and `*.spec.ts`
+under `vendor/open-connector/src` and fails on any date literal (`"2026-12-28"`, `"2026-12-28T00:00:00Z"`,
+`new Date(2027, 0, 5)`, `Date.UTC(2027, 0, 5)`) from yesterday to 400 days from now. Past dates and far-future sentinels
+such as 2099 are fine. The same job has a 15-minute timeout.
+
+When it fires after an OpenConnector upgrade, the upgrade brought in a fixture that will expire. Make the date relative
+to `Date.now()` in a new patch (see 0010 and 0013) and keep the assertion on the same value. If the date is fixed on
+purpose and harmless, add `// date-guard: ok` to that line in the patch. Run it locally with `scripts/bootstrap.sh`
+then `node scripts/check-vendor-dates.ts`.
