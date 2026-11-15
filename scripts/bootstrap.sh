@@ -5,7 +5,8 @@
 # Usage: scripts/bootstrap.sh [--skip-install]
 #
 # Safe to re-run: patches that are already applied are skipped. A patch that
-# neither applies nor is already applied stops the script with a non-zero exit.
+# neither applies nor is already applied stops the script with a non-zero exit. A patch that is missing from the
+# middle of the stack (a later one is applied but it still applies cleanly) also stops it, with the reset command.
 set -euo pipefail
 
 usage() {
@@ -54,6 +55,16 @@ for ((i = ${#patches[@]} - 1; i >= 0; i--)); do
   if git -C "$engine" apply --reverse --check "${patches[$i]}" 2>/dev/null; then
     applied=$i
     break
+  fi
+done
+# A patch inside the prefix that still applies forward was never applied. Applying it now could break later patches
+# that depend on it, so stop and let the user reset the submodule.
+for ((i = 0; i < applied; i++)); do
+  if git -C "$engine" apply --check "${patches[$i]}" 2>/dev/null; then
+    name="patches/$(basename "${patches[$i]}")"
+    echo "bootstrap: $name is not applied, but a later patch is. Reset the submodule and run bootstrap again:" >&2
+    echo "  git -C $engine checkout -- . && git -C $engine clean -fd" >&2
+    exit 1
   fi
 done
 for ((i = 0; i < ${#patches[@]}; i++)); do
