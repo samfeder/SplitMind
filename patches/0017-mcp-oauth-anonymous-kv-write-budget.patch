@@ -1,0 +1,1974 @@
+SplitMind patch 0017 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft text: docs/upstream/mcp-oauth-issue-drafts.md, Draft 3 (#78).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 5799e7f3b7db98074d447ac3121b964cf6445d2c Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sun, 15 Nov 2026 09:25:40 -0500
+Subject: [PATCH] feat(mcp-oauth): budget anonymous writes to OAUTH_KV per UTC
+ day
+
+Three unauthenticated requests write to OAUTH_KV, and Workers Free allows
+1,000 KV writes a day: POST /oauth/mcp/register, GET /oauth/mcp/authorize
+(a consent transaction, reachable with an attacker-hosted CIMD client that
+needs no registration), and POST /oauth/mcp/token with a client_assertion (a
+replay marker). Using the day's writes up stops token refresh for connected
+clients.
+
+When a Durable Object namespace is bound as MCP_OAUTH_ANONYMOUS_WRITES
+(class McpOAuthAnonymousWriteBudget, SQLite-backed), registrations and
+authorize GETs take a slot from one budget: at most
+OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY (default 100) in total
+and ..._PER_IP_PER_DAY (default 20) per CF-Connecting-IP (IPv6 per /64), per
+UTC day, both checked and taken in one call under blockConcurrencyWhile.
+Registration takes its slot after the redirect allowlist passes. The
+authorize slot is taken after the library has validated the client and
+redirect URI (parseAuthRequest, describeConsent and the allowlist) and before
+beginConsent, which does the KV write, so only requests that would write
+use a slot. Over the budget, registration answers invalid_client_metadata
+and authorize answers 429 HTML, with no KV write. If the budget errors, or
+the per-request env scope is missing, the request is refused. Token requests
+carrying client_assertion or client_assertion_type get 401 invalid_client,
+read from a clone of the request. Without the binding, behaviour is
+unchanged. Consent POSTs, token exchange and refresh never touch the
+budget.
+
+The wrapper's own 400 and 401 token responses carry the library's CORS
+headers. The bounded token body is parsed with formData(), as the library
+does. IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) share the IPv4 key.
+---
+ src/server/cloudflare.ts                      |   3 +
+ src/server/cloudflare/cloudflare-bindings.ts  |   6 +
+ src/server/cloudflare/cloudflare-env.ts       |  12 +-
+ .../mcp-oauth-anonymous-write-budget.ts       |  73 ++
+ .../mcp-oauth-registration-counter.test.ts    | 262 +++++
+ .../cloudflare/mcp-oauth-request-env.test.ts  |  95 ++
+ src/server/cloudflare/mcp-oauth.test.ts       | 908 +++++++++++++++++-
+ src/server/cloudflare/mcp-oauth.ts            | 199 +++-
+ .../cloudflare/test-registration-counter.ts   | 198 ++++
+ 9 files changed, 1745 insertions(+), 11 deletions(-)
+ create mode 100644 src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
+ create mode 100644 src/server/cloudflare/mcp-oauth-registration-counter.test.ts
+ create mode 100644 src/server/cloudflare/mcp-oauth-request-env.test.ts
+ create mode 100644 src/server/cloudflare/test-registration-counter.ts
+
+diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
+index c7baa1943..a3d37c9f6 100644
+--- a/src/server/cloudflare.ts
++++ b/src/server/cloudflare.ts
+@@ -39,6 +39,9 @@ interface ScheduledEventLike {
+   cron?: string;
+ }
+ 
++// The Worker's Durable Object class, bound as MCP_OAUTH_ANONYMOUS_WRITES in the wrangler config.
++export { McpOAuthAnonymousWriteBudget } from "./cloudflare/mcp-oauth-anonymous-write-budget.ts";
++
+ interface CloudflareExecutionContext {
+   waitUntil(promise: Promise<unknown>): void;
+   passThroughOnException(): void;
+diff --git a/src/server/cloudflare/cloudflare-bindings.ts b/src/server/cloudflare/cloudflare-bindings.ts
+index f400d97ee..691f8f710 100644
+--- a/src/server/cloudflare/cloudflare-bindings.ts
++++ b/src/server/cloudflare/cloudflare-bindings.ts
+@@ -41,3 +41,9 @@ export interface KVNamespaceBinding {
+   get(key: string, type: "arrayBuffer"): Promise<ArrayBuffer | null>;
+   delete(key: string): Promise<void>;
+ }
++
++/** The slice of a Durable Object namespace the MCP OAuth anonymous-write budget uses. */
++export interface DurableObjectNamespaceBinding {
++  idFromName(name: string): unknown;
++  get(id: unknown): { fetch(request: Request): Promise<Response> };
++}
+diff --git a/src/server/cloudflare/cloudflare-env.ts b/src/server/cloudflare/cloudflare-env.ts
+index 79956d70d..d9381817e 100644
+--- a/src/server/cloudflare/cloudflare-env.ts
++++ b/src/server/cloudflare/cloudflare-env.ts
+@@ -1,4 +1,10 @@
+-import type { AssetsBinding, D1DatabaseBinding, KVNamespaceBinding, R2BucketBinding } from "./cloudflare-bindings.ts";
++import type {
++  AssetsBinding,
++  D1DatabaseBinding,
++  DurableObjectNamespaceBinding,
++  KVNamespaceBinding,
++  R2BucketBinding,
++} from "./cloudflare-bindings.ts";
+ 
+ export interface CloudflareEnv {
+   DB: D1DatabaseBinding;
+@@ -6,6 +12,8 @@ export interface CloudflareEnv {
+   TRANSIT_FILES_BACKEND?: "r2" | "kv"; // New: used to distinguish backend type at runtime
+   ASSETS?: AssetsBinding;
+   OAUTH_KV?: KVNamespaceBinding;
++  /** Durable Object namespace that budgets anonymous MCP OAuth writes to OAUTH_KV. Absent means no budget. */
++  MCP_OAUTH_ANONYMOUS_WRITES?: DurableObjectNamespaceBinding;
+   OOMOL_CONNECT_ORIGIN?: string;
+   OOMOL_CONNECT_ADMIN_TOKEN?: string;
+   OOMOL_CONNECT_RUNTIME_TOKEN?: string;
+@@ -29,6 +37,8 @@ export interface CloudflareEnv {
+   OOMOL_CONNECT_MCP_OAUTH_GRANT_TTL_SECONDS?: string;
+   OOMOL_CONNECT_MCP_OAUTH_GRANT_IDLE_TTL_SECONDS?: string;
+   OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS?: string;
++  OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY?: string;
++  OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY?: string;
+ }
+ 
+ export function resolvePublicOrigin(request: Request, env: CloudflareEnv): string {
+diff --git a/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
+new file mode 100644
+index 000000000..b8fcaced3
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
+@@ -0,0 +1,73 @@
++/**
++ * Durable Object that budgets the unauthenticated MCP OAuth requests that write to OAUTH_KV (client registrations and
++ * authorize requests), so they cannot use up the Workers Free plan's daily KV write allowance. One instance
++ * ("global") holds one global count and one count per client address for the current UTC day only. Each call checks
++ * both limits and takes a slot in one step.
++ *
++ * Plain class (no base class): the Workers runtime accepts it, and tests construct it with a fake storage. The
++ * read-modify-write runs inside blockConcurrencyWhile, so concurrent calls cannot both take the last slot even where
++ * no input gate is emulated.
++ */
++
++interface BudgetStorage {
++  get<T>(key: string): Promise<T | undefined>;
++  put(entries: Record<string, unknown>): Promise<void>;
++}
++
++interface BudgetState {
++  storage: BudgetStorage;
++  blockConcurrencyWhile<T>(closure: () => Promise<T>): Promise<T>;
++}
++
++interface DayCounts {
++  day: string;
++  total: number;
++  perIp: Record<string, number>;
++}
++
++const countsKey = "counts";
++
++export class McpOAuthAnonymousWriteBudget {
++  private readonly state: BudgetState;
++  private readonly now: () => number;
++
++  constructor(state: BudgetState, _env: unknown, now: () => number = Date.now) {
++    this.state = state;
++    this.now = now;
++  }
++
++  async fetch(request: Request): Promise<Response> {
++    const body = await readTakeRequest(request);
++    if (!body) return Response.json({ ok: false, error: "invalid_request" }, { status: 400 });
++    const ok = await this.state.blockConcurrencyWhile(() => this.take(body));
++    return Response.json({ ok });
++  }
++
++  private async take(body: { ip: string; maxPerDay: number; maxPerIpPerDay: number }): Promise<boolean> {
++    const day = new Date(this.now()).toISOString().slice(0, 10);
++    const stored = await this.state.storage.get<DayCounts>(countsKey);
++    // A different day means the old counts are dropped, so storage never grows with the days run.
++    const counts: DayCounts = stored?.day === day ? stored : { day, total: 0, perIp: {} };
++    const ipCount = Object.hasOwn(counts.perIp, body.ip) ? counts.perIp[body.ip]! : 0;
++    if (counts.total >= body.maxPerDay || ipCount >= body.maxPerIpPerDay) return false;
++    counts.total += 1;
++    counts.perIp[body.ip] = ipCount + 1;
++    await this.state.storage.put({ [countsKey]: counts });
++    return true;
++  }
++}
++
++async function readTakeRequest(
++  request: Request,
++): Promise<{ ip: string; maxPerDay: number; maxPerIpPerDay: number } | undefined> {
++  let body: unknown;
++  try {
++    body = await request.json();
++  } catch {
++    return undefined;
++  }
++  if (typeof body !== "object" || body === null) return undefined;
++  const { ip, maxPerDay, maxPerIpPerDay } = body as Record<string, unknown>;
++  if (typeof ip !== "string" || typeof maxPerDay !== "number" || typeof maxPerIpPerDay !== "number") return undefined;
++  return { ip, maxPerDay, maxPerIpPerDay };
++}
+diff --git a/src/server/cloudflare/mcp-oauth-registration-counter.test.ts b/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
+new file mode 100644
+index 000000000..5dc512f7d
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
+@@ -0,0 +1,262 @@
++// Unit tests for McpOAuthAnonymousWriteBudget (SplitMind #78). The interface under test is pinned in the header of
++// ./test-registration-counter.ts: POST {ip, maxPerDay, maxPerIpPerDay} to fetch, get {ok} back.
++import { describe, expect, it, vi } from "vitest";
++import { createCounter, FakeClock, FakeDurableStorage, takeRequest } from "./test-registration-counter.ts";
++
++// A Durable Object base class from the Workers runtime, should the implementation extend one.
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++const noon = Date.UTC(2026, 10, 10, 12);
++const lastMs = Date.UTC(2026, 10, 10, 23, 59, 59, 999);
++const midnight = Date.UTC(2026, 10, 11, 0, 0, 0, 0);
++
++function setup(time = noon) {
++  const storage = new FakeDurableStorage();
++  const clock = new FakeClock(time);
++  const counter = createCounter(storage, clock);
++  const take = async (ip: string, maxPerDay: number, maxPerIpPerDay: number): Promise<boolean> => {
++    const response = await counter.fetch(takeRequest({ ip, maxPerDay, maxPerIpPerDay }));
++    expect(response.status).toBe(200);
++    const body = (await response.json()) as { ok: unknown };
++    expect(typeof body.ok).toBe("boolean");
++    return body.ok as boolean;
++  };
++  return { storage, clock, counter, take };
++}
++
++describe("McpOAuthAnonymousWriteBudget: limits", () => {
++  it("takes slots until the global limit is reached, then refuses", async () => {
++    const { take } = setup();
++    expect(await take("203.0.113.1", 3, 100)).toBe(true);
++    expect(await take("203.0.113.2", 3, 100)).toBe(true);
++    expect(await take("203.0.113.3", 3, 100)).toBe(true);
++    expect(await take("203.0.113.4", 3, 100)).toBe(false);
++    expect(await take("203.0.113.1", 3, 100)).toBe(false);
++  });
++
++  it("counts repeated calls from one address against its limit", async () => {
++    const { take } = setup();
++    for (let i = 0; i < 5; i++) expect(await take("203.0.113.9", 100, 5)).toBe(true);
++    expect(await take("203.0.113.9", 100, 5)).toBe(false);
++    expect(await take("203.0.113.9", 100, 5)).toBe(false);
++  });
++
++  it("keeps a separate count for each address, including IPv6 addresses in different /64s and the 'unknown' placeholder", async () => {
++    const { take } = setup();
++    for (const ip of ["203.0.113.1", "2001:db8:1::1", "2001:db8:2::1", "unknown"]) {
++      expect(await take(ip, 100, 1)).toBe(true);
++    }
++    for (const ip of ["203.0.113.1", "2001:db8:1::1", "2001:db8:2::1", "unknown"]) {
++      expect(await take(ip, 100, 1)).toBe(false);
++    }
++  });
++
++  it("never takes more than the global limit when many calls arrive at once on one storage", async () => {
++    const { counter } = setup();
++    // No serializing namespace and no input gate: the counter's own atomicity decides this.
++    const responses = await Promise.all(
++      Array.from({ length: 40 }, (_, i) =>
++        counter.fetch(takeRequest({ ip: `203.0.113.${(i % 8) + 1}`, maxPerDay: 7, maxPerIpPerDay: 100 })),
++      ),
++    );
++    const bodies = (await Promise.all(responses.map((response) => response.json()))) as { ok: boolean }[];
++    expect(bodies.filter((body) => body.ok)).toHaveLength(7);
++    expect(bodies.filter((body) => !body.ok)).toHaveLength(33);
++  });
++
++  it("never takes more than the address limit when many calls from one address arrive at once", async () => {
++    const { counter } = setup();
++    const responses = await Promise.all(
++      Array.from({ length: 30 }, (_, i) =>
++        counter.fetch(takeRequest({ ip: i % 2 ? "198.51.100.1" : "198.51.100.2", maxPerDay: 100, maxPerIpPerDay: 4 })),
++      ),
++    );
++    const bodies = (await Promise.all(responses.map((response) => response.json()))) as { ok: boolean }[];
++    // 15 calls per address, 4 slots each.
++    expect(bodies.filter((body) => body.ok)).toHaveLength(8);
++    expect(bodies.filter((body, i) => body.ok && i % 2 === 1)).toHaveLength(4);
++  });
++
++  it("writes nothing to storage for a refused call", async () => {
++    const { take, storage } = setup();
++    expect(await take("a", 1, 1)).toBe(true);
++    const writes = storage.writes;
++    const snapshot = storage.snapshot();
++    expect(await take("b", 1, 1)).toBe(false);
++    expect(await take("a", 5, 1)).toBe(false);
++    expect(storage.writes).toBe(writes);
++    expect(storage.snapshot()).toBe(snapshot);
++  });
++
++  it("allows exactly one slot at a limit of 1", async () => {
++    const { take } = setup();
++    expect(await take("a", 1, 1)).toBe(true);
++    expect(await take("b", 1, 1)).toBe(false);
++  });
++
++  it("takes nothing from the global count when the address limit refuses", async () => {
++    const { take } = setup();
++    expect(await take("a", 3, 1)).toBe(true);
++    // Refused by a's own limit, five times. None of these may use a global slot.
++    for (let i = 0; i < 5; i++) expect(await take("a", 3, 1)).toBe(false);
++    expect(await take("b", 3, 1)).toBe(true);
++    expect(await take("c", 3, 1)).toBe(true);
++    expect(await take("d", 3, 1)).toBe(false);
++  });
++
++  it("takes nothing from the address count when the global limit refuses", async () => {
++    const { take } = setup();
++    expect(await take("a", 2, 5)).toBe(true);
++    expect(await take("a", 2, 5)).toBe(true);
++    // The global limit of 2 is full. b is refused three times.
++    for (let i = 0; i < 3; i++) expect(await take("b", 2, 1)).toBe(false);
++    // Raise the global limit. If b's refusals had counted against b, its limit of 1 would refuse it now.
++    expect(await take("b", 10, 1)).toBe(true);
++  });
++
++  it("applies the limits given with each call to the counts it already holds", async () => {
++    const { take } = setup();
++    expect(await take("a", 2, 5)).toBe(true);
++    expect(await take("b", 2, 5)).toBe(true);
++    expect(await take("c", 2, 5)).toBe(false);
++    // Raised mid-day: the two used slots stay used, room opens up.
++    expect(await take("c", 3, 5)).toBe(true);
++    expect(await take("d", 3, 5)).toBe(false);
++    // Lowered below what is already used: refused.
++    expect(await take("e", 1, 5)).toBe(false);
++  });
++});
++
++describe("McpOAuthAnonymousWriteBudget: UTC day rollover", () => {
++  it("keeps the counts through the last millisecond of the UTC day", async () => {
++    const { take, clock } = setup(noon);
++    expect(await take("a", 1, 1)).toBe(true);
++    clock.time = lastMs;
++    expect(await take("b", 1, 1)).toBe(false);
++    expect(await take("a", 5, 1)).toBe(false);
++  });
++
++  it("resets the global and per-address counts at 00:00:00.000 UTC", async () => {
++    const { take, clock } = setup(lastMs);
++    expect(await take("a", 1, 1)).toBe(true);
++    expect(await take("a", 1, 1)).toBe(false);
++    clock.time = midnight;
++    expect(await take("a", 1, 1)).toBe(true);
++    expect(await take("b", 1, 1)).toBe(false);
++  });
++
++  it("counts a new day up from zero and refuses at the limit again", async () => {
++    const { take, clock } = setup();
++    for (const ip of ["a", "b", "c"]) expect(await take(ip, 3, 3)).toBe(true);
++    expect(await take("d", 3, 3)).toBe(false);
++    clock.time = midnight + 3_600_000;
++    for (const ip of ["a", "a", "a"]) expect(await take(ip, 3, 3)).toBe(true);
++    expect(await take("a", 3, 3)).toBe(false);
++    clock.time = midnight + 7_200_000;
++    // Still the same new day: no second reset.
++    expect(await take("b", 3, 3)).toBe(false);
++  });
++
++  it("resets after a gap of several days", async () => {
++    const { take, clock } = setup();
++    expect(await take("a", 1, 1)).toBe(true);
++    clock.time = Date.UTC(2026, 10, 15, 8); // date-guard: ok -- injected clock, not wall time
++    expect(await take("a", 1, 1)).toBe(true);
++  });
++
++  it("resets for the same day of the month in the next month, and across a year end", async () => {
++    const { take, clock } = setup(Date.UTC(2026, 9, 10, 12));
++    expect(await take("a", 1, 1)).toBe(true);
++    clock.time = Date.UTC(2026, 10, 10, 12);
++    expect(await take("a", 1, 1)).toBe(true);
++    clock.time = Date.UTC(2026, 11, 31, 23, 59, 59, 999); // date-guard: ok -- injected clock, not wall time
++    expect(await take("a", 1, 1)).toBe(true);
++    expect(await take("a", 1, 1)).toBe(false);
++    clock.time = Date.UTC(2027, 0, 1, 0, 0, 0, 0); // date-guard: ok -- injected clock, not wall time
++    expect(await take("a", 1, 1)).toBe(true);
++  });
++
++  it("changes day on the UTC calendar, not the host's local one", async () => {
++    // 2026-11-10T19:30-05:00 is already 2026-11-11 in UTC.
++    const { take, clock } = setup(Date.parse("2026-11-10T18:30:00-05:00"));
++    expect(await take("a", 1, 1)).toBe(true);
++    clock.time = Date.parse("2026-11-10T19:30:00-05:00");
++    expect(await take("a", 1, 1)).toBe(true);
++  });
++
++  it("keeps only the current day: an earlier day's counts are dropped from storage", async () => {
++    const day1 = setup(noon);
++    for (let i = 1; i <= 8; i++) await day1.take(`198.51.100.${i}`, 50, 10);
++    day1.clock.time = midnight + 60_000;
++    await day1.take("203.0.113.77", 50, 10);
++
++    const fresh = setup(midnight + 60_000);
++    await fresh.take("203.0.113.77", 50, 10);
++
++    expect(day1.storage.snapshot()).toBe(fresh.storage.snapshot());
++  });
++
++  it("does not grow its storage with the number of days it has run", async () => {
++    const { take, clock, storage } = setup(noon);
++    await take("a", 50, 10);
++    const oneDay = storage.snapshot().length;
++    for (let day = 1; day <= 30; day++) {
++      clock.time = noon + day * 86_400_000;
++      await take("a", 50, 10);
++    }
++    expect(storage.snapshot().length).toBeLessThanOrEqual(oneDay + 8);
++  });
++});
++
++describe("McpOAuthAnonymousWriteBudget: persistence", () => {
++  it("continues the same counts in a new instance over the same storage", async () => {
++    const storage = new FakeDurableStorage();
++    const clock = new FakeClock(noon);
++    const first = createCounter(storage, clock);
++    const call = (counter: typeof first, ip: string) =>
++      counter.fetch(takeRequest({ ip, maxPerDay: 2, maxPerIpPerDay: 2 })).then((r) => r.json());
++    expect(await call(first, "a")).toEqual({ ok: true });
++    expect(await call(first, "b")).toEqual({ ok: true });
++    const restarted = createCounter(storage, clock);
++    expect(await call(restarted, "c")).toEqual({ ok: false });
++  });
++
++  it("starts the new day clean when an instance restarts after midnight", async () => {
++    const storage = new FakeDurableStorage();
++    const clock = new FakeClock(lastMs);
++    const call = (counter: ReturnType<typeof createCounter>) =>
++      counter.fetch(takeRequest({ ip: "a", maxPerDay: 1, maxPerIpPerDay: 1 })).then((r) => r.json());
++    expect(await call(createCounter(storage, clock))).toEqual({ ok: true });
++    clock.time = midnight;
++    expect(await call(createCounter(storage, clock))).toEqual({ ok: true });
++  });
++});
++
++describe("McpOAuthAnonymousWriteBudget: bad requests", () => {
++  it.each([
++    ["not JSON", "not json"],
++    ["an empty body", ""],
++    ["a missing ip", { maxPerDay: 3, maxPerIpPerDay: 3 }],
++    ["a missing global limit", { ip: "a", maxPerIpPerDay: 3 }],
++    ["a missing address limit", { ip: "a", maxPerDay: 3 }],
++    ["a non-numeric limit", { ip: "a", maxPerDay: "3", maxPerIpPerDay: 3 }],
++    ["a non-string ip", { ip: 5, maxPerDay: 3, maxPerIpPerDay: 3 }],
++  ])("answers 400 and takes no slot for %s", async (_name, body) => {
++    const { counter, take } = setup();
++    const response = await counter.fetch(takeRequest(body));
++    expect(response.status).toBe(400);
++    expect(((await response.json().catch(() => ({}))) as { ok?: unknown }).ok).not.toBe(true);
++    // A bad request must not have used the only slot.
++    expect(await take("a", 1, 1)).toBe(true);
++  });
++});
+diff --git a/src/server/cloudflare/mcp-oauth-request-env.test.ts b/src/server/cloudflare/mcp-oauth-request-env.test.ts
+new file mode 100644
+index 000000000..8892dcac8
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-request-env.test.ts
+@@ -0,0 +1,95 @@
++// A gate that runs without the current request's env must fail closed (SplitMind #78, R5).
++//
++// createMcpOAuthHandler keeps no handle on its options, and the only code that can reach the registration callback
++// without going through the handler's fetch wrapper is the OAuth library. So the library's default export is
++// replaced here by a recorder. It keeps the options it was built with, and its fetch() calls the registration callback
++// from inside the wrapper, which is where the library calls it. That gives two honest paths to the same callback:
++// through the wrapper (the env is known) and called directly from the recorded options (no wrapper, no env).
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createCounterNamespace } from "./test-registration-counter.ts";
++
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++interface RecordedOptions {
++  clientRegistrationCallback(input: { clientMetadata: Record<string, unknown>; request: Request }): Promise<unknown>;
++}
++
++const recorded = vi.hoisted(() => ({ options: undefined as unknown }));
++
++vi.mock("@cloudflare/workers-oauth-provider", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("@cloudflare/workers-oauth-provider")>();
++  class RecordingProvider {
++    constructor(options: RecordedOptions) {
++      recorded.options = options;
++    }
++    async fetch(request: Request): Promise<Response> {
++      const result = await (recorded.options as RecordedOptions).clientRegistrationCallback({
++        clientMetadata: { redirect_uris: ["https://claude.ai/api/mcp/auth_callback"] },
++        request,
++      });
++      return Response.json({ result: result ?? null });
++    }
++  }
++  return { ...actual, default: RecordingProvider };
++});
++
++const { createMcpOAuthHandler } = await import("./mcp-oauth.ts");
++
++const origin = "https://connect.example.com";
++const registerRequest = () =>
++  new Request(`${origin}/oauth/mcp/register`, { method: "POST", headers: { "cf-connecting-ip": "203.0.113.4" } });
++const context = { waitUntil() {}, passThroughOnException() {} };
++
++afterEach(() => {
++  vi.restoreAllMocks();
++});
++
++function newHandler() {
++  return createMcpOAuthHandler(origin, async () => new Response("runtime"));
++}
++
++describe("registration gate without a per-request env", () => {
++  it("rejects, and logs an error, when the callback runs outside the handler's wrapper", async () => {
++    newHandler();
++    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
++    const result = (await (recorded.options as RecordedOptions).clientRegistrationCallback({
++      clientMetadata: { redirect_uris: ["https://claude.ai/api/mcp/auth_callback"] },
++      request: registerRequest(),
++    })) as { description?: string } | undefined;
++    expect(result).toBeDefined();
++    expect(result?.description).toBeTruthy();
++    expect(errors).toHaveBeenCalled();
++  });
++
++  it("accepts when the wrapper supplies an env that has no budget binding", async () => {
++    const handler = newHandler();
++    const env = { OOMOL_CONNECT_ORIGIN: origin } as CloudflareEnv;
++    const response = await handler.fetch(registerRequest(), env, context);
++    expect(await response.json()).toEqual({ result: null });
++  });
++
++  it("uses the budget the wrapper's env binds", async () => {
++    const handler = newHandler();
++    const namespace = createCounterNamespace();
++    const env = {
++      OOMOL_CONNECT_ORIGIN: origin,
++      MCP_OAUTH_ANONYMOUS_WRITES: namespace,
++      OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY: "1",
++    } as unknown as CloudflareEnv;
++    expect(await (await handler.fetch(registerRequest(), env, context)).json()).toEqual({ result: null });
++    const second = await (await handler.fetch(registerRequest(), env, context)).json();
++    expect(second).toEqual({ result: { description: expect.stringContaining("daily limit") } });
++  });
++});
+diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
+index 517110e79..407e59566 100644
+--- a/src/server/cloudflare/mcp-oauth.test.ts
++++ b/src/server/cloudflare/mcp-oauth.test.ts
+@@ -1,17 +1,38 @@
+ import type { AssetsBinding, KVNamespaceBinding } from "./cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ 
+-import { createHash, randomBytes } from "node:crypto";
+-import { describe, expect, it, vi } from "vitest";
++import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
++import { afterEach, describe, expect, it, vi } from "vitest";
+ import worker from "../cloudflare.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
++import { createCounterNamespace, createStubNamespace, FakeClock } from "./test-registration-counter.ts";
+ 
+ // The OAuth library imports the Workers runtime module only for its WorkerEntrypoint base class.
+-vi.mock("cloudflare:workers", () => ({ WorkerEntrypoint: class {} }));
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  // Present in case the registration counter extends the runtime's Durable Object base class.
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
+ 
+ const origin = "https://connect.example.com";
+ const adminToken = "test-admin-token";
+ const claudeCallback = "https://claude.ai/api/mcp/auth_callback";
++const signInLimitMessage = "This gateway has reached its daily limit for new sign-ins. Try again after 00:00 UTC.";
++const cimdClientId = "https://attacker.example/client.json";
++const limitMessage = "This gateway has reached its daily limit for new client registrations. Try again tomorrow (UTC).";
++const globalCapVar = "OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY";
++const ipCapVar = "OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY";
+ 
+ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+   it("issues one-hour access tokens by default", async () => {
+@@ -82,7 +103,11 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+   it("asks for read-only access by default on the consent page", async () => {
+     const env = createEnv({});
+     const clientId = await register(env, [claudeCallback]);
+-    const page = await worker.fetch(new Request(authorizeUrl(clientId, claudeCallback, "x".repeat(43))), env, context());
++    const page = await worker.fetch(
++      new Request(authorizeUrl(clientId, claudeCallback, "x".repeat(43))),
++      env,
++      context(),
++    );
+     const html = await page.text();
+     expect(html).toContain('<input type="radio" name="access" value="read" checked>');
+     expect(html).not.toContain('value="all" checked');
+@@ -104,6 +129,788 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+   });
+ });
+ 
++describe("MCP OAuth anonymous write budget", () => {
++  /** An env with the counter bound, the redirect allowlist on, and the given cap variables. */
++  function cappedEnv(
++    caps: { global?: string; ip?: string; allowlist?: string | null },
++    namespace: unknown,
++    kv: MemoryKV = new MemoryKV(),
++  ): CloudflareEnv {
++    const vars: Record<string, unknown> = { MCP_OAUTH_ANONYMOUS_WRITES: namespace };
++    if (caps.global !== undefined) vars[globalCapVar] = caps.global;
++    if (caps.ip !== undefined) vars[ipCapVar] = caps.ip;
++    if (caps.allowlist !== null) vars.OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS = caps.allowlist ?? claudeCallback;
++    return createEnv(vars as Partial<CloudflareEnv>, kv);
++  }
++
++  async function clientCount(kv: MemoryKV): Promise<number> {
++    return (await kv.list({ prefix: "client:" })).keys.length;
++  }
++
++  async function expectLimited(response: Response): Promise<void> {
++    expect(response.status).toBe(400);
++    const body = await response.json();
++    expect(body.error).toBe("invalid_client_metadata");
++    expect(body.error_description).toBe(limitMessage);
++    expect(body.client_id).toBeUndefined();
++  }
++
++  it("accepts registrations up to the global cap, rejects the next, and writes only the accepted clients", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "3", ip: "50" }, createCounterNamespace(), kv);
++    for (let i = 0; i < 3; i++)
++      expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": `203.0.113.${i + 1}` })).status).toBe(
++        201,
++      );
++    await expectLimited(await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.9" }));
++    expect(await clientCount(kv)).toBe(3);
++  });
++
++  it("applies the global cap with no redirect allowlist configured", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "2", ip: "50", allowlist: null }, createCounterNamespace(), kv);
++    expect((await registerResponse(env, ["https://a.example/cb"])).status).toBe(201);
++    expect((await registerResponse(env, ["https://b.example/cb"])).status).toBe(201);
++    await expectLimited(await registerResponse(env, ["https://c.example/cb"]));
++    expect(await clientCount(kv)).toBe(2);
++  });
++
++  it("limits each client address separately and answers with the same message", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "50", ip: "2" }, createCounterNamespace(), kv);
++    const from = (ip: string) => registerResponse(env, [claudeCallback], { "cf-connecting-ip": ip });
++    expect((await from("198.51.100.1")).status).toBe(201);
++    expect((await from("198.51.100.1")).status).toBe(201);
++    await expectLimited(await from("198.51.100.1"));
++    expect((await from("198.51.100.2")).status).toBe(201);
++    expect(await clientCount(kv)).toBe(3);
++  });
++
++  it("treats requests without CF-Connecting-IP as one shared address", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "50", ip: "2" }, createCounterNamespace(), kv);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    await expectLimited(await registerResponse(env, [claudeCallback]));
++    // A request that does carry an address is a different address.
++    expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "198.51.100.5" })).status).toBe(201);
++    expect(await clientCount(kv)).toBe(3);
++  });
++
++  it("sends the client address and the configured limits to the one global counter", async () => {
++    const namespace = createCounterNamespace();
++    const env = cappedEnv({ global: "7", ip: "4" }, namespace);
++    await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.7" });
++    await registerResponse(env, [claudeCallback]);
++    expect(namespace.takes).toEqual([
++      { ip: "203.0.113.7", maxPerDay: 7, maxPerIpPerDay: 4 },
++      { ip: "unknown", maxPerDay: 7, maxPerIpPerDay: 4 },
++    ]);
++    expect(new Set(namespace.names)).toEqual(new Set(["global"]));
++    expect(namespace.names.length).toBeGreaterThan(0);
++  });
++
++  it("spends no slot on registrations the redirect allowlist rejects", async () => {
++    const kv = new MemoryKV();
++    const namespace = createCounterNamespace();
++    const env = cappedEnv({ global: "3", ip: "3" }, namespace, kv);
++    for (let i = 0; i < 6; i++) {
++      const bad = await registerResponse(env, [`https://attacker${i}.example/cb`], { "cf-connecting-ip": "192.0.2.1" });
++      expect(bad.status).toBe(400);
++      expect((await bad.json()).error_description).not.toBe(limitMessage);
++    }
++    expect(namespace.takes).toEqual([]);
++    for (let i = 0; i < 3; i++) {
++      expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "192.0.2.1" })).status).toBe(201);
++    }
++    await expectLimited(await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "192.0.2.1" }));
++    expect(await clientCount(kv)).toBe(3);
++  });
++
++  it("answers an allowlist rejection with the allowlist message even when the cap is exhausted", async () => {
++    const env = cappedEnv({ global: "1", ip: "1" }, createCounterNamespace());
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    const bad = await registerResponse(env, ["https://attacker.example/cb"]);
++    expect(bad.status).toBe(400);
++    expect((await bad.json()).error_description).toBe("This gateway does not accept clients with these redirect URIs.");
++  });
++
++  it("starts a new UTC day with the full cap again", async () => {
++    const clock = new FakeClock(Date.UTC(2026, 10, 10, 23, 59, 59, 999));
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "2", ip: "2" }, createCounterNamespace(clock), kv);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    await expectLimited(await registerResponse(env, [claudeCallback]));
++    clock.time = Date.UTC(2026, 10, 11, 0, 0, 0, 0);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++    await expectLimited(await registerResponse(env, [claudeCallback]));
++    expect(await clientCount(kv)).toBe(4);
++  });
++
++  describe("fails closed", () => {
++    const failures: [string, () => unknown][] = [
++      ["the counter call rejects", () => createStubNamespace(() => Promise.reject(new Error("do unavailable")))],
++      ["the counter answers 500", () => createStubNamespace(() => new Response("boom", { status: 500 }))],
++      ["the counter answers a body that is not JSON", () => createStubNamespace(() => new Response("<html>"))],
++      ["the counter answers without an ok field", () => createStubNamespace(() => Response.json({}))],
++      ["the counter answers ok: false", () => createStubNamespace(() => Response.json({ ok: false }))],
++      [
++        "get() throws",
++        () => ({
++          idFromName: (name: string) => ({ name }),
++          get: () => {
++            throw new Error("no stub");
++          },
++        }),
++      ],
++      [
++        "idFromName() throws",
++        () => ({
++          idFromName: () => {
++            throw new Error("no id");
++          },
++          get: () => ({ fetch: async () => Response.json({ ok: true }) }),
++        }),
++      ],
++    ];
++
++    it.each(failures)("rejects the registration and writes nothing when %s", async (_name, makeNamespace) => {
++      const kv = new MemoryKV();
++      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
++      const warnings = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const env = cappedEnv({ global: "50", ip: "10" }, makeNamespace(), kv);
++      const response = await registerResponse(env, [claudeCallback]);
++      errors.mockRestore();
++      warnings.mockRestore();
++      await expectLimited(response);
++      expect(await clientCount(kv)).toBe(0);
++    });
++
++    it("still serves other routes when the counter is down", async () => {
++      const namespace = createStubNamespace(() => Promise.reject(new Error("do unavailable")));
++      const env = cappedEnv({}, namespace);
++      const metadata = await worker.fetch(
++        new Request(`${origin}/.well-known/oauth-authorization-server`),
++        env,
++        context(),
++      );
++      expect(metadata.status).toBe(200);
++      expect(namespace.calls).toHaveLength(0);
++    });
++  });
++
++  it("allows unlimited registrations when the counter is not bound", async () => {
++    const kv = new MemoryKV();
++    const env = createEnv(
++      {
++        OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback,
++        [globalCapVar]: "1",
++        [ipCapVar]: "1",
++      } as Partial<CloudflareEnv>,
++      kv,
++    );
++    for (let i = 0; i < 60; i++) {
++      expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.1" })).status).toBe(201);
++    }
++    expect(await clientCount(kv)).toBe(60);
++  });
++
++  describe("invalid limit variables fall back to the defaults (100 a day, 20 per address)", () => {
++    const invalid = ["0", "abc", "", "-1", "2.5"];
++
++    it.each(invalid)("uses 20 per address for %j", async (value) => {
++      const kv = new MemoryKV();
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({ global: "500", ip: value }, namespace, kv);
++      const from = (ip: string) => registerResponse(env, [claudeCallback], { "cf-connecting-ip": ip });
++      for (let i = 0; i < 20; i++) expect((await from("203.0.113.1")).status).toBe(201);
++      await expectLimited(await from("203.0.113.1"));
++      expect((await from("203.0.113.2")).status).toBe(201);
++      expect(namespace.takes.every((take) => take.maxPerIpPerDay === 20)).toBe(true);
++    });
++
++    it.each(invalid)("uses 100 a day for %j", async (value) => {
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({ global: value, ip: "500" }, namespace);
++      await registerResponse(env, [claudeCallback]);
++      expect(namespace.takes).toEqual([{ ip: "unknown", maxPerDay: 100, maxPerIpPerDay: 500 }]);
++    });
++
++    it("enforces 100 a day and 20 per address when both variables are unset", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createCounterNamespace(), kv);
++      // Ten addresses use 10 of their 20 slots each, so only the global limit can stop this.
++      for (let i = 0; i < 100; i++) {
++        const ip = `203.0.113.${(i % 10) + 1}`;
++        expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": ip })).status).toBe(201);
++      }
++      await expectLimited(await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.99" }));
++      expect(await clientCount(kv)).toBe(100);
++    });
++
++    it("applies a valid value above the default", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "120", ip: "30" }, createCounterNamespace(), kv);
++      for (let i = 0; i < 30; i++) {
++        expect((await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.1" })).status).toBe(201);
++      }
++      await expectLimited(await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.1" }));
++    });
++  });
++
++  it("leaves a client that is already connected able to refresh its token with the cap exhausted", async () => {
++    const kv = new MemoryKV();
++    const namespace = createCounterNamespace();
++    // One registration and one authorize GET are the whole budget.
++    const env = cappedEnv({ global: "2", ip: "2" }, namespace, kv);
++    const tokens = await authorizeAndExchange(env, claudeCallback);
++    expect(tokens.status).toBe(200);
++    await expectLimited(await registerResponse(env, [claudeCallback]));
++    const takesBefore = namespace.takes.length;
++
++    const refreshed = await post(env, "/oauth/mcp/token", {
++      grant_type: "refresh_token",
++      refresh_token: String(tokens.body.refresh_token),
++      client_id: tokens.clientId,
++    });
++    expect(refreshed.status).toBe(200);
++    expect((await refreshed.json()).access_token).toBeTruthy();
++    // Registration, authorize GET and the refused registration reached the counter. The consent POST, the code
++    // exchange and the refresh did not.
++    expect(takesBefore).toBe(3);
++    expect(namespace.takes).toHaveLength(3);
++  });
++
++  it("uses the counter bound to each request's own env, not the first one the Worker saw", async () => {
++    const first = createCounterNamespace();
++    const second = createCounterNamespace();
++    const kvA = new MemoryKV();
++    const kvB = new MemoryKV();
++    const envA = cappedEnv({ global: "1", ip: "1" }, first, kvA);
++    const envB = cappedEnv({ global: "1", ip: "1" }, second, kvB);
++    expect((await registerResponse(envA, [claudeCallback])).status).toBe(201);
++    // envA is full. envB has its own counter and its own cap.
++    expect((await registerResponse(envB, [claudeCallback])).status).toBe(201);
++    await expectLimited(await registerResponse(envA, [claudeCallback]));
++    await expectLimited(await registerResponse(envB, [claudeCallback]));
++    expect(first.takes).toHaveLength(2);
++    expect(second.takes).toHaveLength(2);
++    expect(await clientCount(kvA)).toBe(1);
++    expect(await clientCount(kvB)).toBe(1);
++  });
++
++  it("never exceeds the global cap under concurrent registrations", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "3", ip: "50" }, createCounterNamespace(), kv);
++    const responses = await Promise.all(
++      Array.from({ length: 15 }, (_, i) =>
++        registerResponse(env, [claudeCallback], { "cf-connecting-ip": `203.0.113.${i + 1}` }),
++      ),
++    );
++    expect(responses.filter((response) => response.status === 201)).toHaveLength(3);
++    expect(responses.filter((response) => response.status === 400)).toHaveLength(12);
++    expect(await clientCount(kv)).toBe(3);
++  });
++
++  it("counts each concurrent request against its own client address", async () => {
++    const kv = new MemoryKV();
++    const env = cappedEnv({ global: "50", ip: "1" }, createCounterNamespace(), kv);
++    const ips = ["198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4"];
++    const attempts = ips.flatMap((ip) => [ip, ip, ip]);
++    const responses = await Promise.all(
++      attempts.map((ip) => registerResponse(env, [claudeCallback], { "cf-connecting-ip": ip })),
++    );
++    for (const ip of ips) {
++      const statuses = responses.filter((_, i) => attempts[i] === ip).map((response) => response.status);
++      expect(statuses.filter((status) => status === 201)).toHaveLength(1);
++      expect(statuses.filter((status) => status === 400)).toHaveLength(2);
++    }
++    expect(await clientCount(kv)).toBe(4);
++  });
++
++  describe("authorize gate (GET /oauth/mcp/authorize)", () => {
++    const authorizeGet = (env: CloudflareEnv, clientId: string, headers: Record<string, string> = {}) =>
++      worker.fetch(new Request(authorizeUrl(clientId, claudeCallback, "x".repeat(43)), { headers }), env, context());
++
++    async function expectSignInLimited(response: Response): Promise<void> {
++      expect(response.status).toBe(429);
++      expect(response.headers.get("content-type")).toContain("text/html");
++      expect(await response.text()).toContain(signInLimitMessage);
++    }
++
++    async function allKeys(kv: MemoryKV): Promise<string[]> {
++      return (await kv.list()).keys.map((key) => key.name).sort();
++    }
++
++    async function transactionCount(kv: MemoryKV): Promise<number> {
++      return (await kv.list({ prefix: "transaction:" })).keys.length;
++    }
++
++    it("takes a slot for a CIMD client's authorize GET, and answers 429 with no KV write once the budget is spent", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({ global: "2", ip: "5" }, namespace, kv);
++      expect((await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.4" })).status).toBe(200);
++      expect((await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.5" })).status).toBe(200);
++      expect(await transactionCount(kv)).toBe(2);
++      expect(namespace.takes.map((take) => take.ip)).toEqual(["198.51.100.4", "198.51.100.5"]);
++
++      const keysBefore = await allKeys(kv);
++      await expectSignInLimited(await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.6" }));
++      expect(await allKeys(kv)).toEqual(keysBefore);
++      expect(await transactionCount(kv)).toBe(2);
++    });
++
++    it("takes a slot for a registered client's authorize GET too", async () => {
++      const kv = new MemoryKV();
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({ global: "2", ip: "5" }, namespace, kv);
++      const clientId = await register(env, [claudeCallback]);
++      expect((await authorizeGet(env, clientId)).status).toBe(200);
++      expect(namespace.takes).toHaveLength(2);
++      await expectSignInLimited(await authorizeGet(env, clientId));
++      expect(await transactionCount(kv)).toBe(1);
++    });
++
++    it("shares one budget between registrations and authorize GETs", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "3", ip: "10" }, createCounterNamespace(), kv);
++      expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++      expect((await registerResponse(env, [claudeCallback])).status).toBe(201);
++      expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++      // Three slots used, two of them by registrations. Both kinds of request are now refused.
++      await expectLimited(await registerResponse(env, [claudeCallback]));
++      await expectSignInLimited(await authorizeGet(env, cimdClientId));
++      expect(await clientCount(kv)).toBe(2);
++      expect(await transactionCount(kv)).toBe(1);
++    });
++
++    it("lets authorize GETs use up the budget before any registration", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "2", ip: "10" }, createCounterNamespace(), kv);
++      expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++      expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++      await expectLimited(await registerResponse(env, [claudeCallback]));
++      expect(await clientCount(kv)).toBe(0);
++    });
++
++    it("applies the per-address limit to authorize GETs", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "50", ip: "1" }, createCounterNamespace(), kv);
++      expect((await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.1" })).status).toBe(200);
++      await expectSignInLimited(await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.1" }));
++      expect((await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "198.51.100.2" })).status).toBe(200);
++      expect(await transactionCount(kv)).toBe(2);
++    });
++
++    it("sends the address and the limits with an authorize GET's slot", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({}, namespace);
++      await authorizeGet(env, cimdClientId, { "cf-connecting-ip": "203.0.113.50" });
++      expect(namespace.takes).toEqual([{ ip: "203.0.113.50", maxPerDay: 100, maxPerIpPerDay: 20 }]);
++    });
++
++    it.each([
++      ["the counter call rejects", () => createStubNamespace(() => Promise.reject(new Error("do unavailable")))],
++      ["the counter answers 500", () => createStubNamespace(() => new Response("boom", { status: 500 }))],
++      ["the counter answers ok: false", () => createStubNamespace(() => Response.json({ ok: false }))],
++      ["the counter answers without an ok field", () => createStubNamespace(() => Response.json({}))],
++    ])("answers 429 and writes nothing when %s", async (_name, makeNamespace) => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
++      const env = cappedEnv({}, makeNamespace(), kv);
++      const response = await authorizeGet(env, cimdClientId);
++      errors.mockRestore();
++      await expectSignInLimited(response);
++      expect(await allKeys(kv)).toEqual([]);
++    });
++
++    describe("charges only requests that pass validation", () => {
++      const challenge = "x".repeat(43);
++      const otherCallback = "https://other.example/cb";
++
++      async function expectUncharged(kv: MemoryKV, namespace: ReturnType<typeof createCounterNamespace>, response: Response) {
++        // The library may answer a malformed request with an error redirect (302) or an error page (4xx), never 200.
++        const rejected =
++          response.status >= 400 || (response.status === 302 && (response.headers.get("location") ?? "").includes("error="));
++        expect(rejected).toBe(true);
++        expect(response.status).not.toBe(429);
++        expect(namespace.takes).toEqual([]);
++        expect((await kv.list()).keys).toEqual([]);
++      }
++
++      it.each([
++        ["a plain client_id nobody registered", "no-such-client"],
++        ["a CIMD client_id whose document cannot be fetched", "https://nowhere.example/missing.json"],
++      ])("does not charge a GET with %s", async (_name, clientId) => {
++        stubCimd({});
++        const kv = new MemoryKV();
++        const namespace = createCounterNamespace();
++        const env = cappedEnv({ global: "5", ip: "5" }, namespace, kv);
++        await expectUncharged(kv, namespace, await authorizeGet(env, clientId));
++      });
++
++      it("does not charge a GET whose redirect_uri is not on the allowlist", async () => {
++        stubCimd({ [cimdClientId]: { ...cimdDocument(cimdClientId), redirect_uris: [claudeCallback, otherCallback] } });
++        const kv = new MemoryKV();
++        const namespace = createCounterNamespace();
++        const env = cappedEnv({ global: "5", ip: "5" }, namespace, kv);
++        const response = await worker.fetch(
++          new Request(authorizeUrl(cimdClientId, otherCallback, challenge)),
++          env,
++          context(),
++        );
++        expect(response.status).toBe(403);
++        await expectUncharged(kv, namespace, response);
++      });
++
++      it("does not charge a GET with no code_challenge", async () => {
++        stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++        const kv = new MemoryKV();
++        const namespace = createCounterNamespace();
++        const env = cappedEnv({ global: "5", ip: "5" }, namespace, kv);
++        const url = new URL(authorizeUrl(cimdClientId, claudeCallback, challenge));
++        url.searchParams.delete("code_challenge");
++        url.searchParams.delete("code_challenge_method");
++        await expectUncharged(kv, namespace, await worker.fetch(new Request(url), env, context()));
++      });
++
++      it("keeps the whole budget for valid requests after a run of invalid ones", async () => {
++        stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++        const kv = new MemoryKV();
++        const namespace = createCounterNamespace();
++        const env = cappedEnv({ global: "2", ip: "2" }, namespace, kv);
++        for (let i = 0; i < 6; i++) await authorizeGet(env, `no-such-client-${i}`);
++        expect(namespace.takes).toEqual([]);
++        expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++        expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++        await expectSignInLimited(await authorizeGet(env, cimdClientId));
++      });
++    });
++
++    it("does not gate the approve and deny POSTs of a consent that already began", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({ global: "3", ip: "10" }, namespace, kv);
++      const registered = await register(env, [claudeCallback]);
++      const toApprove = await beginConsent(env, registered);
++      const toDeny = await beginConsent(env, cimdClientId);
++      // Budget spent: one registration and two authorize GETs.
++      await expectSignInLimited(await authorizeGet(env, cimdClientId));
++      const takesBefore = namespace.takes.length;
++
++      const approved = await postConsent(env, toApprove, { decision: "approve", access: "all" });
++      expect(approved.status).toBe(302);
++      expect(new URL(approved.headers.get("location") ?? "").searchParams.get("code")).toBeTruthy();
++      const denied = await postConsent(env, toDeny, { decision: "deny" });
++      expect(denied.status).toBe(302);
++      expect(new URL(denied.headers.get("location") ?? "").searchParams.get("error")).toBe("access_denied");
++      expect(namespace.takes).toHaveLength(takesBefore);
++    });
++
++    it("leaves authorize unlimited when the budget is not bound", async () => {
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++      const kv = new MemoryKV();
++      const env = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback }, kv);
++      for (let i = 0; i < 8; i++) expect((await authorizeGet(env, cimdClientId)).status).toBe(200);
++      expect(await transactionCount(kv)).toBe(8);
++    });
++  });
++
++  describe("client assertions at the token endpoint", () => {
++    const assertionMessage = "Client assertions are not supported by this gateway.";
++
++    async function expectAssertionRefused(response: Response): Promise<void> {
++      expect(response.status).toBe(401);
++      expect(await response.json()).toEqual({ error: "invalid_client", error_description: assertionMessage });
++    }
++
++    it("refuses a validly signed private_key_jwt assertion from a CIMD client and writes nothing to KV", async () => {
++      const key = newSigningKey();
++      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId, key.jwk) });
++      const kv = new MemoryKV();
++      const namespace = createCounterNamespace();
++      const env = cappedEnv({}, namespace, kv);
++      const response = await post(env, "/oauth/mcp/token", {
++        grant_type: "refresh_token",
++        refresh_token: "no-such-user:no-such-grant:no-secret",
++        client_id: cimdClientId,
++        client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
++        client_assertion: key.assertion(cimdClientId, `${origin}/oauth/mcp/token`),
++      });
++      await expectAssertionRefused(response);
++      expect((await kv.list()).keys).toEqual([]);
++      expect(namespace.takes).toEqual([]);
++    });
++
++    it("refuses a request that sends only client_assertion_type", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createCounterNamespace(), kv);
++      const response = await post(env, "/oauth/mcp/token", {
++        grant_type: "refresh_token",
++        refresh_token: "x",
++        client_id: "anything",
++        client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
++      });
++      await expectAssertionRefused(response);
++      expect((await kv.list()).keys).toEqual([]);
++    });
++
++    it("refuses a request that sends only client_assertion", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createCounterNamespace(), kv);
++      const response = await post(env, "/oauth/mcp/token", {
++        grant_type: "authorization_code",
++        code: "x",
++        client_id: "anything",
++        client_assertion: "a.b.c",
++      });
++      await expectAssertionRefused(response);
++      expect((await kv.list()).keys).toEqual([]);
++    });
++
++    const assertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
++
++    it("refuses a client assertion whose field name is percent-encoded", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createCounterNamespace(), kv);
++      for (const body of [
++        `grant_type=refresh_token&refresh_token=x&client_id=anything&client%5Fassertion=a.b.c&client%5Fassertion%5Ftype=${encodeURIComponent(assertionType)}`,
++        "grant_type=refresh_token&refresh_token=x&client_id=anything&%63lient_assertion=a.b.c",
++        `grant_type=refresh_token&refresh_token=x&client_id=anything&client_assertion_type=${encodeURIComponent(assertionType)}`.replace("client_assertion_type", "client%5Fassertion%5Ftype"),
++      ]) {
++        await expectAssertionRefused(await postRaw(env, body));
++      }
++      expect((await kv.list()).keys).toEqual([]);
++    });
++
++    it("refuses a client assertion sent with a charset on the content type", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createCounterNamespace(), kv);
++      const body = new URLSearchParams({
++        grant_type: "refresh_token",
++        refresh_token: "x",
++        client_id: "anything",
++        client_assertion_type: assertionType,
++        client_assertion: "a.b.c",
++      }).toString();
++      for (const contentType of [
++        "application/x-www-form-urlencoded; charset=UTF-8",
++        "Application/X-WWW-Form-Urlencoded;charset=utf-8",
++        "  application/x-www-form-urlencoded ; charset=UTF-8",
++      ]) {
++        await expectAssertionRefused(await postRaw(env, body, { "content-type": contentType }));
++      }
++      expect((await kv.list()).keys).toEqual([]);
++    });
++
++    describe("CORS headers on the wrapper's own token responses", () => {
++      const corsOrigin = "https://app.example";
++
++      /** The headers the library adds for a browser caller: every Access-Control-* header, and Vary. */
++      function corsHeaders(response: Response): Record<string, string> {
++        const picked: Record<string, string> = {};
++        for (const [name, value] of response.headers) {
++          if (name.startsWith("access-control-") || name === "vary") picked[name] = value;
++        }
++        return picked;
++      }
++
++      async function libraryReference(env: CloudflareEnv): Promise<Record<string, string>> {
++        const clientId = await register(env, [claudeCallback]);
++        const response = await postRaw(
++          env,
++          new URLSearchParams({
++            grant_type: "refresh_token",
++            refresh_token: "no-such-user:no-such-grant:no-secret",
++            client_id: clientId,
++          }).toString(),
++          { origin: corsOrigin },
++        );
++        expect((await response.json()).error).toBe("invalid_grant");
++        return corsHeaders(response);
++      }
++
++      it("sends the library's CORS headers with the 401 for a client assertion", async () => {
++        const env = cappedEnv({}, createCounterNamespace());
++        const reference = await libraryReference(env);
++        expect(reference["access-control-allow-origin"]).toBe(corsOrigin);
++        const response = await postRaw(
++          env,
++          `grant_type=refresh_token&refresh_token=x&client_id=a&client_assertion_type=${encodeURIComponent(assertionType)}&client_assertion=a.b.c`,
++          { origin: corsOrigin },
++        );
++        expect(response.status).toBe(401);
++        expect(corsHeaders(response)).toEqual(reference);
++      });
++
++      it("sends no CORS headers when the request has no Origin, as the library does", async () => {
++        const env = cappedEnv({}, createCounterNamespace());
++        const response = await postRaw(env, "grant_type=refresh_token&client_assertion=a.b.c");
++        expect(response.status).toBe(401);
++        expect(corsHeaders(response)).toEqual({});
++      });
++
++      it("answers a urlencoded body over 64 KiB with 400 and the library's CORS headers, even for a valid refresh", async () => {
++        const kv = new MemoryKV();
++        const env = cappedEnv({ global: "50", ip: "50" }, createCounterNamespace(), kv);
++        const reference = await libraryReference(env);
++        const tokens = await authorizeAndExchange(env, claudeCallback);
++        expect(tokens.status).toBe(200);
++        const keysBefore = (await kv.list()).keys.map((key) => key.name).sort();
++        const body = `${new URLSearchParams({
++          grant_type: "refresh_token",
++          refresh_token: String(tokens.body.refresh_token),
++          client_id: tokens.clientId,
++        })}&padding=${"a".repeat(70 * 1024)}`;
++        const response = await postRaw(env, body, { origin: corsOrigin });
++        expect(response.status).toBe(400);
++        expect(corsHeaders(response)).toEqual(reference);
++        expect((await kv.list()).keys.map((key) => key.name).sort()).toEqual(keysBefore);
++      });
++
++      it("accepts a urlencoded body just under 64 KiB", async () => {
++        const env = cappedEnv({ global: "50", ip: "50" }, createCounterNamespace());
++        const tokens = await authorizeAndExchange(env, claudeCallback);
++        const body = `${new URLSearchParams({
++          grant_type: "refresh_token",
++          refresh_token: String(tokens.body.refresh_token),
++          client_id: tokens.clientId,
++        })}&padding=${"a".repeat(60 * 1024)}`;
++        expect((await postRaw(env, body)).status).toBe(200);
++      });
++    });
++
++    it("leaves a normal refresh-token request untouched", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "50", ip: "50" }, createCounterNamespace(), kv);
++      const tokens = await authorizeAndExchange(env, claudeCallback);
++      expect(tokens.status).toBe(200);
++      const refreshed = await post(env, "/oauth/mcp/token", {
++        grant_type: "refresh_token",
++        refresh_token: String(tokens.body.refresh_token),
++        client_id: tokens.clientId,
++      });
++      expect(refreshed.status).toBe(200);
++      expect((await refreshed.json()).access_token).toBeTruthy();
++    });
++
++    it("still reports a bad refresh token as the library does", async () => {
++      const env = cappedEnv({}, createCounterNamespace());
++      const clientId = await register(env, [claudeCallback]);
++      const response = await post(env, "/oauth/mcp/token", {
++        grant_type: "refresh_token",
++        refresh_token: "no-such-user:no-such-grant:no-secret",
++        client_id: clientId,
++      });
++      expect(response.status).toBe(400);
++      expect((await response.json()).error).toBe("invalid_grant");
++    });
++  });
++
++  describe("IPv6 clients share a per-address limit by /64 prefix", () => {
++    const from = (env: CloudflareEnv, ip: string) =>
++      registerResponse(env, [claudeCallback], { "cf-connecting-ip": ip });
++
++    it("counts two addresses in one /64 against the same limit", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "2" }, createCounterNamespace(), kv);
++      expect((await from(env, "2001:db8:abcd:12::1")).status).toBe(201);
++      expect((await from(env, "2001:db8:abcd:12:ffff:ffff:ffff:ffff")).status).toBe(201);
++      await expectLimited(await from(env, "2001:db8:abcd:12:1234:5678:9abc:def0"));
++      await expectLimited(await from(env, "2001:db8:abcd:12::1"));
++      expect(await clientCount(kv)).toBe(2);
++    });
++
++    it("keeps addresses in different /64s apart, even when only the last bit of the prefix differs", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "2001:db8:abcd:12::1")).status).toBe(201);
++      await expectLimited(await from(env, "2001:db8:abcd:12::2"));
++      expect((await from(env, "2001:db8:abcd:13::1")).status).toBe(201);
++      expect((await from(env, "2001:db8:abcd:1::1")).status).toBe(201);
++      expect((await from(env, "2001:db8:abce:12::1")).status).toBe(201);
++      expect(await clientCount(kv)).toBe(4);
++    });
++
++    it("gives different spellings of one address, and of one prefix, a single key", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "2001:db8::1")).status).toBe(201);
++      for (const spelling of [
++        "2001:0db8:0000:0000:0000:0000:0000:0001",
++        "2001:DB8::1",
++        "2001:db8:0:0:0:0:0:1",
++        "2001:db8::0:1",
++        // Same /64, different interface identifier, different spelling of the prefix.
++        "2001:0DB8:0:0:9:9:9:9",
++        "2001:db8:0::5",
++      ]) {
++        await expectLimited(await from(env, spelling));
++      }
++      expect(await clientCount(kv)).toBe(1);
++    });
++
++    it("treats a prefix that differs from another only after zero compression as a different /64", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "2001:db8::5")).status).toBe(201);
++      expect((await from(env, "2001:db8:0:1::5")).status).toBe(201);
++      expect((await from(env, "2001:db8:1::5")).status).toBe(201);
++    });
++
++    it("keeps IPv4-mapped addresses apart from each other and shares a bucket with the plain IPv4 form", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "::ffff:1.2.3.4")).status).toBe(201);
++      // Another mapped address is not in the same bucket, although both sit in one /64.
++      expect((await from(env, "::ffff:5.6.7.8")).status).toBe(201);
++      await expectLimited(await from(env, "1.2.3.4"));
++      await expectLimited(await from(env, "::ffff:1.2.3.4"));
++      await expectLimited(await from(env, "::FFFF:1.2.3.4"));
++      await expectLimited(await from(env, "5.6.7.8"));
++      // Loopback is a different address from both.
++      expect((await from(env, "::1")).status).toBe(201);
++      expect(await clientCount(kv)).toBe(3);
++    });
++
++    it("shares a bucket between the plain IPv4 form first and the mapped form after", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "1.2.3.4")).status).toBe(201);
++      await expectLimited(await from(env, "::ffff:1.2.3.4"));
++      expect((await from(env, "::ffff:1.2.3.5")).status).toBe(201);
++    });
++
++    it("still counts IPv4 per full address", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "100", ip: "1" }, createCounterNamespace(), kv);
++      expect((await from(env, "203.0.113.1")).status).toBe(201);
++      expect((await from(env, "203.0.113.2")).status).toBe(201);
++      expect((await from(env, "203.0.114.1")).status).toBe(201);
++      await expectLimited(await from(env, "203.0.113.1"));
++      await expectLimited(await from(env, "203.0.113.2"));
++      expect(await clientCount(kv)).toBe(3);
++    });
++
++    it("still counts the global limit once per request across a /64", async () => {
++      const kv = new MemoryKV();
++      const env = cappedEnv({ global: "3", ip: "50" }, createCounterNamespace(), kv);
++      for (const last of ["1", "2", "3"]) expect((await from(env, `2001:db8:1:1::${last}`)).status).toBe(201);
++      await expectLimited(await from(env, "2001:db8:1:1::4"));
++    });
++  });
++});
++
+ async function authorizeAndExchange(
+   env: CloudflareEnv,
+   redirectUri: string,
+@@ -148,6 +955,78 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
+   return { clientId, verifier, consent };
+ }
+ 
++/** Serves CIMD metadata documents by URL through the global fetch the OAuth library uses, and turns CIMD on. */
++function stubCimd(documents: Record<string, unknown>): void {
++  vi.stubGlobal("Cloudflare", { compatibilityFlags: { global_fetch_strictly_public: true } });
++  vi.stubGlobal("fetch", async (input: string | URL | Request) => {
++    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
++    return url in documents ? Response.json(documents[url]) : new Response("not found", { status: 404 });
++  });
++}
++
++function cimdDocument(clientId: string, jwk?: Record<string, unknown>): Record<string, unknown> {
++  return {
++    client_id: clientId,
++    client_name: "Look-alike client",
++    redirect_uris: [claudeCallback],
++    grant_types: ["authorization_code", "refresh_token"],
++    response_types: ["code"],
++    ...(jwk
++      ? {
++          token_endpoint_auth_method: "private_key_jwt",
++          token_endpoint_auth_signing_alg: "ES256",
++          jwks: { keys: [jwk] },
++        }
++      : { token_endpoint_auth_method: "none" }),
++  };
++}
++
++/** An ES256 key pair and a signer for RFC 7523 client assertions. */
++function newSigningKey() {
++  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
++  const jwk = { ...publicKey.export({ format: "jwk" }), kid: "attacker-key", alg: "ES256", use: "sig" };
++  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
++  return {
++    jwk,
++    assertion(clientId: string, audience: string): string {
++      const signingInput = `${encode({ alg: "ES256", typ: "JWT", kid: "attacker-key" })}.${encode({
++        iss: clientId,
++        sub: clientId,
++        aud: audience,
++        exp: Math.floor(Date.now() / 1000) + 60,
++        jti: randomUUID(),
++      })}`;
++      const signature = sign("sha256", Buffer.from(signingInput), { key: privateKey, dsaEncoding: "ieee-p1363" });
++      return `${signingInput}.${signature.toString("base64url")}`;
++    },
++  };
++}
++
++/** GETs the consent page and returns what the form POST needs. */
++async function beginConsent(env: CloudflareEnv, clientId: string) {
++  const challenge = createHash("sha256").update(randomBytes(48).toString("base64url")).digest("base64url");
++  const page = await worker.fetch(new Request(authorizeUrl(clientId, claudeCallback, challenge)), env, context());
++  expect(page.status).toBe(200);
++  const handle = /name="handle" value="([^"]+)"/.exec(await page.text())?.[1] ?? "";
++  const cookies = page.headers
++    .getSetCookie()
++    .map((cookie) => cookie.split(";")[0])
++    .join("; ");
++  return { handle, cookies };
++}
++
++function postConsent(env: CloudflareEnv, consent: { handle: string; cookies: string }, fields: Record<string, string>) {
++  return worker.fetch(
++    new Request(`${origin}/oauth/mcp/authorize`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded", origin, cookie: consent.cookies },
++      body: new URLSearchParams({ handle: consent.handle, admin_token: adminToken, ...fields }),
++    }),
++    env,
++    context(),
++  );
++}
++
+ function authorizeUrl(clientId: string, redirectUri: string, challenge: string): string {
+   return `${origin}/oauth/mcp/authorize?${new URLSearchParams({
+     response_type: "code",
+@@ -167,11 +1046,15 @@ async function register(env: CloudflareEnv, redirectUris: string[]): Promise<str
+   return (await response.json()).client_id;
+ }
+ 
+-function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<Response> {
++function registerResponse(
++  env: CloudflareEnv,
++  redirectUris: string[],
++  headers: Record<string, string> = {},
++): Promise<Response> {
+   return worker.fetch(
+     new Request(`${origin}/oauth/mcp/register`, {
+       method: "POST",
+-      headers: { "content-type": "application/json" },
++      headers: { "content-type": "application/json", ...headers },
+       body: JSON.stringify({
+         client_name: "Test client",
+         redirect_uris: redirectUris,
+@@ -185,6 +1068,19 @@ function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<R
+   );
+ }
+ 
++/** POSTs a token-endpoint body as written, with the form content type unless the headers set another. */
++function postRaw(env: CloudflareEnv, body: string, headers: Record<string, string> = {}): Promise<Response> {
++  return worker.fetch(
++    new Request(`${origin}/oauth/mcp/token`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
++      body,
++    }),
++    env,
++    context(),
++  );
++}
++
+ function post(env: CloudflareEnv, path: string, form: Record<string, string>): Promise<Response> {
+   return worker.fetch(
+     new Request(`${origin}${path}`, {
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index ca245397e..d0de3e9ae 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -8,10 +8,12 @@ import OAuthProvider, {
+   insufficientScope,
+   OAuthError,
+ } from "@cloudflare/workers-oauth-provider";
++import { AsyncLocalStorage } from "node:async_hooks";
+ import { timingSafeEqual } from "node:crypto";
+ import { readBoundedResponseBytes } from "../../core/request.ts";
+ import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
+ import { RuntimeTokenService } from "../storage/runtime-token-service.ts";
++import { readPositiveInteger } from "./cloudflare-env.ts";
+ import { renderMcpConsentPage } from "./mcp-consent-page.ts";
+ import { McpGrantScopeError, readMcpGrantRequest, resolveMcpGrantScope } from "./mcp-grant-scope.ts";
+ 
+@@ -96,10 +98,13 @@ export function createMcpOAuthHandler(
+         return runtime(new Request(request, { headers }), env);
+       },
+     },
+-    clientRegistrationCallback({ clientMetadata }) {
++    async clientRegistrationCallback({ clientMetadata, request }) {
+       const uris = Array.isArray(clientMetadata.redirect_uris) ? clientMetadata.redirect_uris : [];
+-      if (uris.every((uri) => typeof uri === "string" && redirectAllowed(uri))) return;
+-      return { description: "This gateway does not accept clients with these redirect URIs." };
++      if (!uris.every((uri) => typeof uri === "string" && redirectAllowed(uri))) {
++        return { description: "This gateway does not accept clients with these redirect URIs." };
++      }
++      // After the allowlist, so requests it rejects never use up the budget.
++      if (!(await takeFromRequestScope(request))) return { description: registrationLimitMessage };
+     },
+     async resolveExternalToken({ token, env }) {
+       if (!(await validRuntimeToken(env, token))) return null;
+@@ -124,6 +129,9 @@ export function createMcpOAuthHandler(
+             const details = await oauth.describeConsent(auth);
+             // Checked before anything redirects, so a disallowed client never receives a callback.
+             if (!redirectAllowed(details.redirectUri)) return localError("This client is not allowed.", 403);
++            // After the library has validated the client and redirect URI, so only requests that would write a
++            // consent transaction use a slot. The slot is taken before beginConsent, which does the KV write.
++            if (!(await takeAnonymousWriteSlot(env, request))) return signInLimitResponse();
+             const consent = await oauth.beginConsent(auth);
+             consent.headers.set("Content-Type", "text/html; charset=utf-8");
+             // Chrome applies form-action to the POST's redirect as well as its initial target.
+@@ -220,9 +228,192 @@ export function createMcpOAuthHandler(
+         url.pathname = "/.well-known/oauth-protected-resource/mcp";
+         request = new Request(url, request);
+       }
+-      return provider.fetch(request, env, context);
++      if (request.method === "POST" && url.pathname === tokenPath) {
++        const refused = await refuseClientAssertion(request);
++        if (refused) return refused;
++      }
++      // The handler is cached across envs, so the callback reads the current request's env from here.
++      return requestEnv.run(env, () => provider.fetch(request, env, context));
++    },
++  };
++}
++
++const registrationLimitMessage =
++  "This gateway has reached its daily limit for new client registrations. Try again tomorrow (UTC).";
++const signInLimitMessage = "This gateway has reached its daily limit for new sign-ins. Try again after 00:00 UTC.";
++const defaultMaxAnonymousWritesPerDay = 100;
++const defaultMaxAnonymousWritesPerIpPerDay = 20;
++const tokenPath = "/oauth/mcp/token";
++
++/** The env of the request being served. Scoped per request, so concurrent requests never see each other's. */
++const requestEnv = new AsyncLocalStorage<CloudflareEnv>();
++
++/** Take a slot using the env the handler's fetch wrapper scoped to this request. Without one, fail closed. */
++async function takeFromRequestScope(request: Request | undefined): Promise<boolean> {
++  const env = requestEnv.getStore();
++  if (!env) {
++    console.error("MCP OAuth anonymous-write budget ran outside a request scope; rejecting.");
++    return false;
++  }
++  return takeAnonymousWriteSlot(env, request);
++}
++
++/**
++ * Take one slot from the daily budget for unauthenticated writes to OAUTH_KV. True when the request may go ahead.
++ * Without the binding there is no budget. If the budget is bound but cannot answer, this fails closed.
++ */
++async function takeAnonymousWriteSlot(env: CloudflareEnv, request: Request | undefined): Promise<boolean> {
++  const namespace = env.MCP_OAUTH_ANONYMOUS_WRITES;
++  if (!namespace) return true;
++  try {
++    const response = await namespace.get(namespace.idFromName("global")).fetch(
++      new Request("https://anonymous-writes.invalid/take", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({
++          ip: clientAddressKey(request?.headers.get("cf-connecting-ip")),
++          maxPerDay: readPositiveInteger(
++            env.OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY,
++            defaultMaxAnonymousWritesPerDay,
++          ),
++          maxPerIpPerDay: readPositiveInteger(
++            env.OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY,
++            defaultMaxAnonymousWritesPerIpPerDay,
++          ),
++        }),
++      }),
++    );
++    if (!response.ok) throw new Error(`anonymous-write budget answered ${response.status}`);
++    const body = (await response.json()) as { ok?: unknown };
++    return body.ok === true;
++  } catch (error) {
++    console.error("MCP OAuth anonymous-write budget failed; rejecting the request.", error);
++    return false;
++  }
++}
++
++/** The per-address key: the full address for IPv4, the /64 prefix (in expanded form) for IPv6. */
++function clientAddressKey(header: string | null | undefined): string {
++  const address = header?.trim();
++  if (!address) return "unknown";
++  if (!address.includes(":")) return address;
++  const groups = expandIpv6(address.split("%")[0]!);
++  if (!groups) return address.toLowerCase();
++  // ::ffff:a.b.c.d is the IPv4 address a.b.c.d, so both spellings share one key.
++  if (groups.slice(0, 5).every((group) => group === "0000") && groups[5] === "ffff") {
++    const high = Number.parseInt(groups[6]!, 16);
++    const low = Number.parseInt(groups[7]!, 16);
++    return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
++  }
++  return groups.slice(0, 4).join(":");
++}
++
++/** Expand an IPv6 address to eight 4-digit hex groups, or undefined if it is not one. */
++function expandIpv6(address: string): string[] | undefined {
++  let text = address.toLowerCase();
++  const tail = /^(.*:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(text);
++  if (tail) {
++    const octets = tail[2]!.split(".").map(Number);
++    if (octets.some((octet) => octet > 255)) return undefined;
++    const hex = (a: number, b: number) => (a * 256 + b).toString(16);
++    text = `${tail[1]}${hex(octets[0]!, octets[1]!)}:${hex(octets[2]!, octets[3]!)}`;
++  }
++  const halves = text.split("::");
++  if (halves.length > 2) return undefined;
++  const side = (part: string) => (part === "" ? [] : part.split(":"));
++  const head = side(halves[0]!);
++  const rest = halves.length === 2 ? side(halves[1]!) : [];
++  const missing = 8 - head.length - rest.length;
++  if (halves.length === 1 ? missing !== 0 : missing < 1) return undefined;
++  const groups = [...head, ...Array.from({ length: halves.length === 2 ? missing : 0 }, () => "0"), ...rest];
++  if (!groups.every((group) => /^[0-9a-f]{1,4}$/.test(group))) return undefined;
++  return groups.map((group) => group.padStart(4, "0"));
++}
++
++function signInLimitResponse(): Response {
++  return new Response(
++    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign-in limit reached</title></head><body><p>${signInLimitMessage}</p></body></html>`,
++    {
++      status: 429,
++      headers: {
++        "Content-Type": "text/html; charset=utf-8",
++        "Cache-Control": "no-store",
++        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
++        "X-Content-Type-Options": "nosniff",
++        "Referrer-Policy": "no-referrer",
++      },
+     },
++  );
++}
++
++const maxTokenBodyBytes = 65536;
++
++/**
++ * The gateway has no use for client assertions (private_key_jwt), and the library writes a replay marker to KV
++ * after checking one, which a client's own key would let anyone trigger. Refuse them before the library runs.
++ * The body is read from a clone, so the original request is untouched for the library.
++ */
++async function refuseClientAssertion(request: Request): Promise<Response | undefined> {
++  const contentType = request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
++  // The library rejects any other content type itself, before it reads the body or writes anything.
++  if (contentType !== "application/x-www-form-urlencoded") return undefined;
++  let form: FormData;
++  try {
++    const bytes = await readBoundedResponseBytes(new Response(request.clone().body), {
++      maxBytes: maxTokenBodyBytes,
++      fieldName: "token request",
++      createError: () => new Error("Token request is too large."),
++      signal: request.signal,
++    });
++    // Parsed with formData(), as the library does, so both read the same fields from the same bytes.
++    form = await new Response(bytes as BodyInit, {
++      headers: { "content-type": request.headers.get("content-type") ?? "" },
++    }).formData();
++  } catch {
++    return withCorsHeaders(
++      Response.json(
++        { error: "invalid_request", error_description: "Token request is too large or unreadable." },
++        { status: 400, headers: { "Cache-Control": "no-store" } },
++      ),
++      request,
++    );
++  }
++  if (!form.has("client_assertion") && !form.has("client_assertion_type")) return undefined;
++  return withCorsHeaders(
++    Response.json(
++      { error: "invalid_client", error_description: "Client assertions are not supported by this gateway." },
++      { status: 401, headers: { "Cache-Control": "no-store" } },
++    ),
++    request,
++  );
++}
++
++/** The CORS headers the OAuth library adds to its own responses (its withCorsHeaders is not exported). */
++function withCorsHeaders(response: Response, request: Request): Response {
++  const origin = request.headers.get("Origin");
++  if (!origin) return response;
++  const cors = new Response(response.body, response);
++  const setUnlessPresent = (name: string, value: string) => {
++    if (!cors.headers.has(name)) cors.headers.set(name, value);
+   };
++  setUnlessPresent("Access-Control-Allow-Origin", origin);
++  setUnlessPresent("Access-Control-Allow-Methods", "*");
++  setUnlessPresent("Access-Control-Allow-Headers", "Authorization, *");
++  setUnlessPresent("Access-Control-Max-Age", "86400");
++  appendHeaderValue(cors.headers, "Vary", "Origin");
++  appendHeaderValue(cors.headers, "Access-Control-Expose-Headers", "WWW-Authenticate");
++  appendHeaderValue(cors.headers, "Access-Control-Expose-Headers", "Retry-After");
++  return cors;
++}
++
++/** Adds `value` to a comma-separated header unless it is already there (case-insensitively). */
++function appendHeaderValue(headers: Headers, name: string, value: string): void {
++  const values = (headers.get(name) ?? "")
++    .split(",")
++    .map((item) => item.trim())
++    .filter(Boolean);
++  if (!values.some((item) => item.toLowerCase() === value.toLowerCase())) values.push(value);
++  headers.set(name, values.join(", "));
+ }
+ 
+ const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+diff --git a/src/server/cloudflare/test-registration-counter.ts b/src/server/cloudflare/test-registration-counter.ts
+new file mode 100644
+index 000000000..70f584061
+--- /dev/null
++++ b/src/server/cloudflare/test-registration-counter.ts
+@@ -0,0 +1,198 @@
++// Test doubles for the MCP OAuth registration counter (SplitMind #78, patch 0006).
++//
++// PUBLIC INTERFACE OF McpOAuthAnonymousWriteBudget THAT THESE TESTS PIN (the implementer must match it):
++//   - Exported from src/server/cloudflare.ts as `McpOAuthAnonymousWriteBudget`.
++//   - Plain class, no base class and no RPC: `new McpOAuthAnonymousWriteBudget(state, env, now?)`.
++//       state: DurableObjectState. Only `state.storage` (key/value API: get / put / delete / list / transaction) and
++//              `state.blockConcurrencyWhile` are used, never `storage.sql` or `deleteAll`.
++//       env:   the Worker env (the tests pass `{}`).
++//       now:   optional `() => number` clock in epoch milliseconds, default `Date.now`. The tests inject it.
++//   - `fetch(request: Request): Promise<Response>`. The Worker calls it through the namespace stub.
++//       POST, any path, JSON body `{ ip: string, maxPerDay: number, maxPerIpPerDay: number }`.
++//       200 with JSON `{ ok: true }` when a slot was taken, `{ ok: false }` when either limit is reached (nothing taken).
++//       A malformed body (bad JSON, missing or mistyped field) gets status 400 and takes nothing.
++//   - The Worker resolves the single instance with `namespace.get(namespace.idFromName("global"))`.
++//   - The limits travel in each call (the Worker reads the env vars and applies the defaults 100 and 20), so the
++//     counter stores only counts and the current UTC day.
++import { McpOAuthAnonymousWriteBudget } from "../cloudflare.ts";
++
++/** In-memory stand-in for the key/value API of a Durable Object's `ctx.storage`. Yields like a real storage call. */
++export class FakeDurableStorage {
++  readonly data: Map<string, unknown> = new Map<string, unknown>();
++  /** How many put or delete calls ran, so a test can tell whether an operation wrote. */
++  writes = 0;
++  private transactionTail: Promise<unknown> = Promise.resolve();
++
++  async get(keyOrKeys: string | string[]): Promise<unknown> {
++    await Promise.resolve();
++    if (Array.isArray(keyOrKeys)) {
++      return new Map(
++        keyOrKeys.filter((key) => this.data.has(key)).map((key) => [key, structuredClone(this.data.get(key))]),
++      );
++    }
++    return this.data.has(keyOrKeys) ? structuredClone(this.data.get(keyOrKeys)) : undefined;
++  }
++
++  async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
++    await Promise.resolve();
++    this.writes++;
++    if (typeof keyOrEntries === "string") {
++      this.data.set(keyOrEntries, structuredClone(value));
++      return;
++    }
++    for (const [key, entry] of Object.entries(keyOrEntries)) this.data.set(key, structuredClone(entry));
++  }
++
++  async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
++    await Promise.resolve();
++    this.writes++;
++    if (Array.isArray(keyOrKeys)) return keyOrKeys.filter((key) => this.data.delete(key)).length;
++    return this.data.delete(keyOrKeys);
++  }
++
++  async list(options?: { prefix?: string }): Promise<Map<string, unknown>> {
++    await Promise.resolve();
++    const prefix = options?.prefix ?? "";
++    return new Map(
++      [...this.data.entries()]
++        .filter(([key]) => key.startsWith(prefix))
++        .map(([key, value]) => [key, structuredClone(value)]),
++    );
++  }
++
++  /** Transactions run one at a time, which is the outcome of a real transaction's conflict retry. */
++  async transaction<T>(closure: (txn: FakeDurableStorage) => Promise<T>): Promise<T> {
++    const run = this.transactionTail.then(() => closure(this));
++    this.transactionTail = run.catch(() => undefined);
++    return run;
++  }
++
++  /** Everything stored, in a stable order: two storages with the same snapshot hold the same state. */
++  snapshot(): string {
++    return JSON.stringify([...this.data.entries()].sort(([a], [b]) => (a < b ? -1 : 1)));
++  }
++}
++
++/** A settable wall clock, passed to the counter as its `now`. */
++export class FakeClock {
++  time: number;
++  constructor(time: number) {
++    this.time = time;
++  }
++  readonly now: () => number = () => this.time;
++}
++
++export interface FakeDurableObjectState {
++  storage: FakeDurableStorage;
++  id: { toString: () => string };
++  blockConcurrencyWhile<T>(closure: () => Promise<T>): Promise<T>;
++  waitUntil(): void;
++}
++
++export function fakeDurableObjectState(storage: FakeDurableStorage): FakeDurableObjectState {
++  // No input gate is emulated: plain storage calls from concurrent fetches interleave at every await. A counter has to
++  // serialize its read-modify-write itself, with storage.transaction or blockConcurrencyWhile (both honoured here).
++  let blockTail: Promise<unknown> = Promise.resolve();
++  return {
++    storage,
++    id: { toString: () => "global" },
++    blockConcurrencyWhile<T>(closure: () => Promise<T>): Promise<T> {
++      const run = blockTail.then(closure);
++      blockTail = run.catch(() => undefined);
++      return run;
++    },
++    waitUntil() {},
++  };
++}
++
++export function createCounter(storage: FakeDurableStorage, clock: FakeClock): McpOAuthAnonymousWriteBudget {
++  // oxlint-disable-next-line typescript/no-explicit-any -- the fake covers only the storage surface the counter may use.
++  return new (McpOAuthAnonymousWriteBudget as any)(fakeDurableObjectState(storage), {}, clock.now);
++}
++
++export interface RecordedTake {
++  ip: unknown;
++  maxPerDay: unknown;
++  maxPerIpPerDay: unknown;
++}
++
++/**
++ * A Durable Object namespace whose "global" instance is a real McpOAuthAnonymousWriteBudget over fake storage, so
++ * Worker tests exercise the real counting logic. Calls to the one instance run one at a time, which is what the
++ * platform's input gate gives a counter that only awaits its own storage. A counter that splits one registration
++ * into two calls still interleaves with other requests between them.
++ */
++export interface CounterNamespace {
++  storage: FakeDurableStorage;
++  clock: FakeClock;
++  names: string[];
++  takes: RecordedTake[];
++  idFromName(name: string): { name: string };
++  get(id: { name: string }): { fetch(request: Request): Promise<Response> };
++}
++
++export function createCounterNamespace(
++  clock: FakeClock = new FakeClock(Date.UTC(2026, 10, 10, 12)),
++): CounterNamespace {
++  const storage = new FakeDurableStorage();
++  const instances = new Map<string, McpOAuthAnonymousWriteBudget>();
++  const names: string[] = [];
++  const takes: RecordedTake[] = [];
++  let tail: Promise<unknown> = Promise.resolve();
++  return {
++    storage,
++    clock,
++    /** Every name passed to idFromName. */
++    names,
++    /** The body of every call that reached the counter, in order. */
++    takes,
++    idFromName(name: string) {
++      names.push(name);
++      return { name };
++    },
++    get(id: { name: string }) {
++      if (!instances.has(id.name)) instances.set(id.name, createCounter(storage, clock));
++      const counter = instances.get(id.name)!;
++      return {
++        fetch(request: Request): Promise<Response> {
++          const copy = request.clone();
++          const run = tail.then(async () => {
++            takes.push((await copy.json().catch(() => ({}))) as RecordedTake);
++            return counter.fetch(request);
++          });
++          tail = run.catch(() => undefined);
++          return run;
++        },
++      };
++    },
++  };
++}
++
++/** A namespace whose single stub answers every fetch with `behavior`, for the fail-closed cases. */
++export interface StubNamespace {
++  calls: Request[];
++  idFromName(name: string): { name: string };
++  get(): { fetch(request: Request): Promise<Response> };
++}
++
++export function createStubNamespace(behavior: (request: Request) => Response | Promise<Response>): StubNamespace {
++  const calls: Request[] = [];
++  return {
++    calls,
++    idFromName: (name: string) => ({ name }),
++    get: () => ({
++      fetch(request: Request): Promise<Response> {
++        calls.push(request);
++        return Promise.resolve().then(() => behavior(request));
++      },
++    }),
++  };
++}
++
++export function takeRequest(body: unknown): Request {
++  return new Request("https://registrations.internal/take", {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: typeof body === "string" ? body : JSON.stringify(body),
++  });
++}
+-- 
+2.34.1
+

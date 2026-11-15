@@ -230,6 +230,36 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     }
   });
 
+  it("renders the anonymous-write budget: Durable Object binding, SQLite migration and both daily limits (#78)", () => {
+    deploy();
+    const rendered = parseJsonc(readFileSync(join(engine, "wrangler.local.jsonc"), "utf8"));
+
+    expect(rendered.durable_objects).toEqual({
+      bindings: [{ name: "MCP_OAUTH_ANONYMOUS_WRITES", class_name: "McpOAuthAnonymousWriteBudget" }],
+    });
+    // new_sqlite_classes, not new_classes: the key-value-backed kind is not available on Workers Free.
+    expect(rendered.migrations).toEqual([{ tag: "v1", new_sqlite_classes: ["McpOAuthAnonymousWriteBudget"] }]);
+    const vars = rendered.vars as Record<string, unknown>;
+    expect(vars.OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY).toBe("100");
+    expect(vars.OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY).toBe("20");
+    // The class lives in the Worker's main module, so the binding needs no script_name.
+    expect(rendered.main).toBe("src/server/cloudflare.ts");
+    expect(JSON.stringify(rendered.durable_objects)).not.toContain("script_name");
+    // Nothing is left over from the registration-only cap this replaced.
+    expect(JSON.stringify(rendered)).not.toContain("REGISTRATION");
+    expect(JSON.stringify(rendered)).not.toContain("McpOAuthRegistrationCounter");
+  });
+
+  it("renders the same budget config when the deploy runs again", () => {
+    deploy();
+    const first = parseJsonc(readFileSync(join(engine, "wrangler.local.jsonc"), "utf8"));
+    deploy();
+    const second = parseJsonc(readFileSync(join(engine, "wrangler.local.jsonc"), "utf8"));
+    expect(second.durable_objects).toEqual(first.durable_objects);
+    expect(second.migrations).toEqual(first.migrations);
+    expect(second.migrations).toHaveLength(1);
+  });
+
   it("sets missing secrets from the environment without printing them", () => {
     const result = deployWith({ SPLITMIND_ADMIN_TOKEN: adminToken, SPLITMIND_ENCRYPTION_KEY: encryptionKey });
 
@@ -598,3 +628,28 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(result.stderr).toContain('splitmind.local.json is for Worker "splitmind"');
   });
 });
+
+/** Parses JSONC: drops // and /* *\/ comments outside strings, and trailing commas. */
+function parseJsonc(text: string): Record<string, unknown> {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      out += char;
+      if (char === "\\") out += text[++i];
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+      out += char;
+    } else if (char === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (char === "/" && text[i + 1] === "*") {
+      i = text.indexOf("*/", i + 2) + 1;
+    } else {
+      out += char;
+    }
+  }
+  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1")) as Record<string, unknown>;
+}

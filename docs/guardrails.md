@@ -74,6 +74,32 @@ POST /v1/actions/slack.list_channels
 `wrangler.template.jsonc` (the deploy script derives the catalog trim from it), run `npm run deploy`, then connect
 the account. See [adding a provider](adding-a-provider.md).
 
+### Budget for anonymous KV writes (patch 0017, #78)
+
+Three unauthenticated requests write to `OAUTH_KV`, and Workers Free allows 1,000 KV writes a day: registering a
+client (`POST /oauth/mcp/register`), starting a sign-in (`GET /oauth/mcp/authorize`, which stores a consent
+transaction), and a token request that carries a client assertion (the library stores a replay marker). If anyone
+could use the day's writes up, connected clients could not refresh their tokens. The Worker therefore budgets them,
+per UTC day:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY` | `100` | Registrations and sign-in starts accepted in total. |
+| `OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY` | `20` | The same, per client address (`CF-Connecting-IP`; IPv6 counts per /64). |
+
+What it covers: registration and sign-in starts share the budget; client assertions are refused outright
+(`401 invalid_client`), since this gateway has no use for them. Registrations the redirect allowlist refuses use no
+slot. Over the budget, a registration answers `400 invalid_client_metadata` and a sign-in start answers `429`, and
+nothing is written. One Durable Object (`MCP_OAUTH_ANONYMOUS_WRITES`) keeps the counts, so the limit is exact; if it
+cannot answer, the request is refused. Consent approval and denial, token exchange and refresh, and every other
+route never touch it.
+
+This narrows the exposure; it does not remove it. Claude's sign-in uses a handful of slots a day, but an attacker
+can spend the budget and block new sign-ins until 00:00 UTC. Connections that already exist keep refreshing. Other
+writes, such as the consent decision and token exchange for a real sign-in, still happen, and a real sign-in is
+rare. To open the budget up (or close it down), change the value in `wrangler.template.jsonc` and run
+`npm run deploy`. A value that is empty, not a whole number or below 1 means the default.
+
 ## 2. Writes must name an account (decision 8, E6.1)
 
 OpenConnector treats a call with no `connectionName` as a call to the connection literally named `default`
