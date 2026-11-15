@@ -1,0 +1,427 @@
+SplitMind patch 0021 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Follow-ups to patch 0018 (#135 once-per-config warnings, #136 watch wiring test).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sun, 15 Nov 2026 12:35:12 -0500
+Subject: [PATCH] fix(read-only): parse the setting once per config, test
+ the watch wiring
+
+#135: createCloudflareApp and createWatchRunner shared no parse, so each
+startup warning for OOMOL_CONNECT_READ_ONLY_CONNECTIONS was logged again
+whenever either was rebuilt. The Worker now keeps one parsed list per
+(raw setting, catalog), so every warning is logged once per isolate per
+config. Matching is unchanged.
+
+#136: a Worker-level test that the email watch refuses a non-read action on
+a read-only connection through cloudflare.ts's own createWatchRunner.
+The Node entry (src/server/index.ts) has no catalog at the point it parses
+the setting, so the unknown-provider warning stays Worker-only.
+
+diff --git a/src/server/cloudflare-read-only-startup-warnings.test.ts b/src/server/cloudflare-read-only-startup-warnings.test.ts
+new file mode 100644
+index 00000000..60c829ed
+--- /dev/null
++++ b/src/server/cloudflare-read-only-startup-warnings.test.ts
+@@ -0,0 +1,210 @@
++// Patch 0021 (#135): the Worker's read-only list is parsed once per config. Everything goes through `worker.fetch` and `worker.scheduled` in one isolate, with a
++// real D1-shaped SQLite database, the real executors and a fake Gmail API behind `fetch`.
++import type { AssetsBinding, R2BucketBinding, R2ObjectBinding } from "./cloudflare/cloudflare-bindings.ts";
++import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { provider as gmail } from "../providers/gmail/definition.ts";
++import { provider as mailWatch } from "../providers/mail_watch/definition.ts";
++import worker from "./cloudflare.ts";
++import { FakeMailbox, T0, fakeGmailFetch } from "./email-watch/test-support.ts";
++import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
++import { D1RuntimeDatabase } from "./storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "./storage/d1/test-database.ts";
++
++const READ_ONLY = "OOMOL_CONNECT_READ_ONLY_CONNECTIONS";
++const ADMIN = "admin-token";
++const minute = 60_000;
++// An epoch minute divisible by 60, so the default 10 minute watch interval is due at it.
++const M0 = Math.ceil(T0 / minute / 60) * 60;
++const at = (epochMinute: number) => epochMinute * minute + 30_000;
++
++class UnusedBucket implements R2BucketBinding {
++  async put(): Promise<unknown> {
++    throw new Error("Unexpected R2 put");
++  }
++  async get(): Promise<R2ObjectBinding | null> {
++    throw new Error("Unexpected R2 get");
++  }
++  async delete(): Promise<void> {
++    throw new Error("Unexpected R2 delete");
++  }
++}
++
++function catalogAssets(): AssetsBinding {
++  const files: Record<string, unknown> = {
++    "/catalog/index.json": { version: 1, providerCount: 2, chunks: ["apps-0000.json"] },
++    "/catalog/apps-0000.json": [JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))],
++  };
++  return {
++    async fetch(request) {
++      const pathname = new URL(request.url).pathname;
++      return pathname in files ? Response.json(files[pathname]) : new Response("not found", { status: 404 });
++    },
++  };
++}
++
++let counter = 0;
++const openDatabases: SqliteD1Database[] = [];
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++  for (const db of openDatabases.splice(0)) db.close();
++});
++
++interface Site {
++  env: CloudflareEnv;
++  mailboxes: Record<string, FakeMailbox>;
++  /** One app request through worker.fetch; `origin` defaults to this site's own. */
++  request(origin?: string): Promise<Response>;
++  /** One cron invocation at the given epoch minute, with everything it handed to waitUntil awaited. */
++  tick(epochMinute?: number): Promise<void>;
++}
++
++async function boot(options: {
++  readOnly?: string;
++  /** Leave OOMOL_CONNECT_ORIGIN unset so the public origin comes from each request. */
++  noConfiguredOrigin?: boolean;
++}): Promise<Site> {
++  const n = ++counter;
++  const db = new SqliteD1Database();
++  openDatabases.push(db);
++  // Each boot gets its own key and origin, because the Worker caches built apps and runners by config.
++  const key = `ro-startup-key-${n}`;
++  const runtime = new D1RuntimeDatabase(db, { secretCodec: await createWorkerSecretCodec(key) });
++  const mailboxes = { work: new FakeMailbox({ prefix: "w0" }), other: new FakeMailbox({ prefix: "w1" }) };
++  for (const [name, mailbox] of Object.entries(mailboxes)) {
++    await runtime.connectionStore.set("gmail", name, {
++      authType: "oauth2",
++      accessToken: `token-${name}`,
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: mailbox.email, displayName: mailbox.email, grantedScopes: [] },
++    });
++  }
++  vi.stubGlobal("fetch", vi.fn(fakeGmailFetch(mailboxes)));
++  const origin = `https://ro-startup-${n}.example.com`;
++  const env: CloudflareEnv = {
++    DB: db,
++    TRANSIT_FILES: new UnusedBucket(),
++    ASSETS: catalogAssets(),
++    OOMOL_CONNECT_ENCRYPTION_KEY: key,
++    OOMOL_CONNECT_ADMIN_TOKEN: ADMIN,
++    ...(options.noConfiguredOrigin ? {} : { OOMOL_CONNECT_ORIGIN: origin }),
++    OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS: "gmail:work",
++    ...(options.readOnly === undefined ? {} : { [READ_ONLY]: options.readOnly }),
++  };
++  const ctx = { waitUntil() {}, passThroughOnException() {} };
++  return {
++    env,
++    mailboxes,
++    request: (requestOrigin = origin) =>
++      worker.fetch(
++        new Request(`${requestOrigin}/api/connections`, { headers: { authorization: `Bearer ${ADMIN}` } }),
++        env,
++        ctx,
++      ),
++    async tick(epochMinute = M0) {
++      const pending: Promise<unknown>[] = [];
++      await worker.scheduled({ scheduledTime: at(epochMinute), cron: "* * * * *" }, env, {
++        waitUntil: (promise) => void pending.push(promise),
++        passThroughOnException() {},
++      });
++      await Promise.all(pending);
++    },
++  };
++}
++
++function quiet() {
++  vi.spyOn(console, "info").mockImplementation(() => {});
++  vi.spyOn(console, "error").mockImplementation(() => {});
++  return vi.spyOn(console, "warn").mockImplementation(() => {});
++}
++
++const mentioning = (warn: { mock: { calls: unknown[][] } }, entry: string) =>
++  warn.mock.calls.filter((call) => JSON.stringify(call).includes(entry));
++
++/** Three bad entries, one of each kind, unique to the test so the isolate-wide cache cannot hide a repeat. */
++function badEntries() {
++  const n = counter + 1;
++  return { malformed: `malformed${n}`, upper: `Upper${n}:conn`, unknown: `nosuchprovider${n}:orphan` };
++}
++
++describe("read-only setting is parsed once per config, however many times the Worker builds from it (#135)", () => {
++  it("logs each startup warning exactly once after an app request and then a cron run", async () => {
++    const warn = quiet();
++    const bad = badEntries();
++    const site = await boot({ readOnly: `${Object.values(bad).join(" ")} gmail:work` });
++
++    expect((await site.request()).status).toBe(200);
++    await site.tick();
++
++    // Guard against a vacuous pass: the watch really ran and read Gmail in this isolate.
++    expect(site.mailboxes.work!.requests.length).toBeGreaterThan(0);
++    for (const entry of Object.values(bad)) expect(mentioning(warn, entry), entry).toHaveLength(1);
++  });
++
++  it("logs each startup warning exactly once after a cron run and then an app request", async () => {
++    const warn = quiet();
++    const bad = badEntries();
++    const site = await boot({ readOnly: `${Object.values(bad).join(" ")} gmail:work` });
++
++    await site.tick();
++    expect((await site.request()).status).toBe(200);
++
++    expect(site.mailboxes.work!.requests.length).toBeGreaterThan(0);
++    for (const entry of Object.values(bad)) expect(mentioning(warn, entry), entry).toHaveLength(1);
++  });
++
++  it("stays at one warning per entry across repeated cron runs and requests", async () => {
++    const warn = quiet();
++    const bad = badEntries();
++    const site = await boot({ readOnly: `${Object.values(bad).join(" ")} gmail:work` });
++
++    await site.tick(M0);
++    await site.request();
++    await site.tick(M0 + 10);
++    await site.request();
++    await site.tick(M0 + 20);
++
++    for (const entry of Object.values(bad)) expect(mentioning(warn, entry), entry).toHaveLength(1);
++  });
++
++  it("stays at one warning per entry when the same config serves two public origins", async () => {
++    const warn = quiet();
++    const bad = badEntries();
++    const site = await boot({ readOnly: `${Object.values(bad).join(" ")} gmail:work`, noConfiguredOrigin: true });
++
++    expect((await site.request("https://first-origin.example.com")).status).toBe(200);
++    expect((await site.request("https://second-origin.example.com")).status).toBe(200);
++    await site.tick();
++
++    for (const entry of Object.values(bad)) expect(mentioning(warn, entry), entry).toHaveLength(1);
++  });
++
++  it("parses again when the setting changes: the new bad entry warns once, the unchanged one does not repeat", async () => {
++    const warn = quiet();
++    const first = `first${counter + 1}:orphan`;
++    const site = await boot({ readOnly: `${first} gmail:work` });
++    await site.request();
++    await site.tick();
++    expect(mentioning(warn, first)).toHaveLength(1);
++
++    const second = `second${counter}:orphan`;
++    site.env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS = `${first} ${second} gmail:work`;
++    await site.request();
++    await site.tick(M0 + 10);
++
++    expect(mentioning(warn, second), second).toHaveLength(1);
++  });
++
++  it("logs nothing about the setting for a valid list, after both an app request and a cron run", async () => {
++    const warn = quiet();
++    const site = await boot({ readOnly: "gmail:work gmail:other" });
++    await site.request();
++    await site.tick();
++
++    expect(warn.mock.calls.filter((call) => JSON.stringify(call).includes("READ_ONLY"))).toEqual([]);
++  });
++});
+diff --git a/src/server/cloudflare-read-only-watch-wiring.test.ts b/src/server/cloudflare-read-only-watch-wiring.test.ts
+new file mode 100644
+index 00000000..27e457d1
+--- /dev/null
++++ b/src/server/cloudflare-read-only-watch-wiring.test.ts
+@@ -0,0 +1,126 @@
++// Patch 0021 (#136 a): the email watch's runner, as cloudflare.ts builds it, honours the read-only setting.
++// `createWatchActionRunner` is covered on its own in email-watch/watch-runner-read-only.test.ts; this goes through
++// `worker.scheduled`, so deleting the read-only argument at cloudflare.ts's createWatchRunner call site fails it.
++//
++// The watch only reads, so its refusal path is out of reach of the real catalog labels. The catalog served here
++// labels gmail.get_profile, the first call the watch makes, as a write; a read-only connection must then be
++// refused by the runner cloudflare.ts builds, and Gmail must see no request at all.
++import type { AssetsBinding, R2BucketBinding, R2ObjectBinding } from "./cloudflare/cloudflare-bindings.ts";
++import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { provider as gmail } from "../providers/gmail/definition.ts";
++import { provider as mailWatch } from "../providers/mail_watch/definition.ts";
++import worker from "./cloudflare.ts";
++import { FakeMailbox, T0, fakeGmailFetch } from "./email-watch/test-support.ts";
++import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
++import { D1RuntimeDatabase } from "./storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "./storage/d1/test-database.ts";
++
++const minute = 60_000;
++// An epoch minute divisible by 60, so the default 10 minute watch interval is due at it.
++const M0 = Math.ceil(T0 / minute / 60) * 60;
++
++class UnusedBucket implements R2BucketBinding {
++  async put(): Promise<unknown> {
++    throw new Error("Unexpected R2 put");
++  }
++  async get(): Promise<R2ObjectBinding | null> {
++    throw new Error("Unexpected R2 get");
++  }
++  async delete(): Promise<void> {
++    throw new Error("Unexpected R2 delete");
++  }
++}
++
++// The Worker loads the catalog once per isolate, so every test in this file gets this one catalog.
++function catalogAssets(): AssetsBinding {
++  const gmailEntry = JSON.parse(JSON.stringify(gmail)) as { actions: { id: string; operationType?: string }[] };
++  for (const action of gmailEntry.actions) {
++    if (action.id === "gmail.get_profile") action.operationType = "write";
++  }
++  const files: Record<string, unknown> = {
++    "/catalog/index.json": { version: 1, providerCount: 2, chunks: ["apps-0000.json"] },
++    "/catalog/apps-0000.json": [gmailEntry, JSON.parse(JSON.stringify(mailWatch))],
++  };
++  return {
++    async fetch(request) {
++      const pathname = new URL(request.url).pathname;
++      return pathname in files ? Response.json(files[pathname]) : new Response("not found", { status: 404 });
++    },
++  };
++}
++
++let counter = 0;
++const openDatabases: SqliteD1Database[] = [];
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++  for (const db of openDatabases.splice(0)) db.close();
++});
++
++/** Boots a Worker with a gmail:work watch and runs one due cron tick. Returns what each mailbox saw. */
++async function runWatch(readOnly: string | undefined) {
++  vi.spyOn(console, "info").mockImplementation(() => {});
++  vi.spyOn(console, "error").mockImplementation(() => {});
++  vi.spyOn(console, "warn").mockImplementation(() => {});
++  const n = ++counter;
++  const db = new SqliteD1Database();
++  openDatabases.push(db);
++  const key = `ro-wiring-key-${n}`;
++  const runtime = new D1RuntimeDatabase(db, { secretCodec: await createWorkerSecretCodec(key) });
++  const mailboxes = { work: new FakeMailbox({ prefix: "w0" }), other: new FakeMailbox({ prefix: "w1" }) };
++  for (const [name, mailbox] of Object.entries(mailboxes)) {
++    await runtime.connectionStore.set("gmail", name, {
++      authType: "oauth2",
++      accessToken: `token-${name}`,
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: mailbox.email, displayName: mailbox.email, grantedScopes: [] },
++    });
++  }
++  vi.stubGlobal("fetch", vi.fn(fakeGmailFetch(mailboxes)));
++  const env: CloudflareEnv = {
++    DB: db,
++    TRANSIT_FILES: new UnusedBucket(),
++    ASSETS: catalogAssets(),
++    OOMOL_CONNECT_ENCRYPTION_KEY: key,
++    OOMOL_CONNECT_ORIGIN: `https://ro-wiring-${n}.example.com`,
++    OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS: "gmail:work",
++    ...(readOnly === undefined ? {} : { OOMOL_CONNECT_READ_ONLY_CONNECTIONS: readOnly }),
++  };
++  const pending: Promise<unknown>[] = [];
++  await worker.scheduled({ scheduledTime: M0 * minute + 30_000, cron: "* * * * *" }, env, {
++    waitUntil: (promise) => void pending.push(promise),
++    passThroughOnException() {},
++  });
++  await Promise.all(pending);
++  return { kinds: (name: "work" | "other") => mailboxes[name].requests.map((request) => request.kind) };
++}
++
++describe("the email watch's runner, built through cloudflare.ts, honours the read-only setting (#136 a)", () => {
++  it("refuses the watch's non-read call on a read-only connection and sends no Gmail request", async () => {
++    const { kinds } = await runWatch("gmail:work");
++
++    expect(kinds("work")).toEqual([]);
++  });
++
++  it("control: with no read-only list the watch reaches Gmail through the same catalog", async () => {
++    const { kinds } = await runWatch(undefined);
++
++    expect(kinds("work")).toContain("profile");
++  });
++
++  it("control: a read-only entry for another connection leaves gmail:work running", async () => {
++    const { kinds } = await runWatch("gmail:other");
++
++    expect(kinds("work")).toContain("profile");
++  });
++
++  it("control: an entry for a different provider with the same connection name leaves gmail:work running", async () => {
++    const { kinds } = await runWatch("notion:work");
++
++    expect(kinds("work")).toContain("profile");
++  });
++});
+diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
+index 3824e07f..60781ffd 100644
+--- a/src/server/cloudflare.ts
++++ b/src/server/cloudflare.ts
+@@ -4,6 +4,7 @@ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+ import type { McpOAuthHandler, McpOAuthSettings } from "./cloudflare/mcp-oauth.ts";
+ import type { ActionRunner } from "./actions/action-runner.ts";
+ import type { ConnectApp } from "./connect-app.ts";
++import type { ReadOnlyConnections } from "../core/read-only-connections.ts";
+ import type { Logger } from "./logger.ts";
+ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
+ 
+@@ -195,9 +196,7 @@ async function createWatchRunner(
+   const catalog = await loadCatalogOnce(assets);
+   const runner = createWatchActionRunner({
+     catalog,
+-    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS, undefined, (id) =>
+-      catalog.providers.some((provider) => provider.service === id),
+-    ),
++    readOnlyConnections: readOnlyConnectionsFor(env, catalog),
+     providerLoader: new ProviderLoader({ gmail: executorModules.gmail! }),
+     runtimeDatabase: database,
+     publicOrigin,
+@@ -279,9 +278,7 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
+     requireRuntimeAuth: Boolean(env.OAUTH_KV),
+     actionPolicy: createActionPolicy(env),
+     allowedCustomOAuth: parseActionPolicyList(env.OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH),
+-    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS, undefined, (id) =>
+-      catalog.providers.some((provider) => provider.service === id),
+-    ),
++    readOnlyConnections: readOnlyConnectionsFor(env, catalog),
+     logger: workerLogger,
+     computeRuntimeAuthConfigured: false,
+     // Cloudflare compresses on egress itself: Response defaults to
+@@ -318,6 +315,20 @@ function writeWorkerLog(level: "error" | "info" | "warn"): (fields: unknown, mes
+   };
+ }
+ 
++// One parsed list per (raw setting, catalog), shared by app builds and the watch runner, so each startup warning is
++// logged once per isolate per config instead of once per build.
++let readOnlyParsed: { raw: string | undefined; catalog: CatalogStore; value: ReadOnlyConnections } | undefined;
++
++function readOnlyConnectionsFor(env: CloudflareEnv, catalog: CatalogStore): ReadOnlyConnections {
++  const raw = env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS;
++  if (readOnlyParsed && readOnlyParsed.raw === raw && readOnlyParsed.catalog === catalog) return readOnlyParsed.value;
++  const value = parseReadOnlyConnections(raw, undefined, (id) =>
++    catalog.providers.some((provider) => provider.service === id),
++  );
++  readOnlyParsed = { raw, catalog, value };
++  return value;
++}
++
+ function loadCatalogOnce(assets: AssetsBinding): Promise<CatalogStore> {
+   // The catalog depends only on the assets binding, which is fixed for the isolate, so one slot
+   // under a constant key covers every request.
+-- 
+2.34.1
+

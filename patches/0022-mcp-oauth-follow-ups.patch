@@ -1,0 +1,157 @@
+SplitMind patch 0022 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Follow-ups to patch 0017 (#132 metadata signing algs, #129 test file rename).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sun, 15 Nov 2026 12:35:12 -0500
+Subject: [PATCH] fix(mcp-oauth): drop signing algs from metadata, rename
+ write-budget test files
+
+#132: the authorization-server metadata wrapper that removes private_key_jwt
+also removes token_endpoint_auth_signing_alg_values_supported, which only
+applies to client assertions this gateway refuses. none and
+client_id_metadata_document_supported stay.
+
+#129: test-registration-counter.ts is now test-anonymous-write-budget.ts and
+mcp-oauth-registration-counter.test.ts is mcp-oauth-anonymous-write-budget.test.ts,
+matching what the budget counts.
+
+diff --git a/src/server/cloudflare/mcp-oauth-registration-counter.test.ts b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.test.ts
+similarity index 98%
+rename from src/server/cloudflare/mcp-oauth-registration-counter.test.ts
+rename to src/server/cloudflare/mcp-oauth-anonymous-write-budget.test.ts
+index b9522f89..de5c5dca 100644
+--- a/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
++++ b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.test.ts
+@@ -1,7 +1,7 @@
+ // Unit tests for McpOAuthAnonymousWriteBudget (SplitMind #78). The interface under test is pinned in the header of
+-// ./test-registration-counter.ts: POST {ip, maxPerDay, maxPerIpPerDay} to fetch, get {ok} back (and {ok: false, limit} when refused).
++// ./test-anonymous-write-budget.ts: POST {ip, maxPerDay, maxPerIpPerDay} to fetch, get {ok} back (and {ok: false, limit} when refused).
+ import { describe, expect, it, vi } from "vitest";
+-import { createCounter, FakeClock, FakeDurableStorage, takeRequest } from "./test-registration-counter.ts";
++import { createCounter, FakeClock, FakeDurableStorage, takeRequest } from "./test-anonymous-write-budget.ts";
+ 
+ // A Durable Object base class from the Workers runtime, should the implementation extend one.
+ vi.mock("cloudflare:workers", () => ({
+diff --git a/src/server/cloudflare/mcp-oauth-request-env.test.ts b/src/server/cloudflare/mcp-oauth-request-env.test.ts
+index 8892dcac..af617e30 100644
+--- a/src/server/cloudflare/mcp-oauth-request-env.test.ts
++++ b/src/server/cloudflare/mcp-oauth-request-env.test.ts
+@@ -8,7 +8,7 @@
+ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ 
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { createCounterNamespace } from "./test-registration-counter.ts";
++import { createCounterNamespace } from "./test-anonymous-write-budget.ts";
+ 
+ vi.mock("cloudflare:workers", () => ({
+   WorkerEntrypoint: class {},
+diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
+index 1c9e6eb7..97054d58 100644
+--- a/src/server/cloudflare/mcp-oauth.test.ts
++++ b/src/server/cloudflare/mcp-oauth.test.ts
+@@ -5,7 +5,7 @@ import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import worker from "../cloudflare.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+-import { createCounterNamespace, createStubNamespace, FakeClock } from "./test-registration-counter.ts";
++import { createCounterNamespace, createStubNamespace, FakeClock } from "./test-anonymous-write-budget.ts";
+ 
+ // The OAuth library imports the Workers runtime module only for its WorkerEntrypoint base class.
+ vi.mock("cloudflare:workers", () => ({
+@@ -161,6 +161,60 @@ describe("MCP OAuth discovery metadata", () => {
+     // Public clients (claude.ai, Claude Code) use none; that must stay.
+     expect(methods).toContain("none");
+   });
++
++  it("does not advertise token_endpoint_auth_signing_alg_values_supported, since there is no assertion method to sign with (#132)", async () => {
++    // The library adds the signing algorithm list next to private_key_jwt, when CIMD is on.
++    stubCimd({});
++    const env = createEnv({});
++    const response = await worker.fetch(new Request(`${origin}/.well-known/oauth-authorization-server`), env, context());
++    expect(response.status).toBe(200);
++    const metadata = await response.json();
++    expect(metadata).not.toHaveProperty("token_endpoint_auth_signing_alg_values_supported");
++    expect(JSON.stringify(metadata)).not.toContain("token_endpoint_auth_signing_alg");
++  });
++
++  it("keeps the rest of the document when the signing algorithms are dropped (#132)", async () => {
++    stubCimd({});
++    const env = createEnv({});
++    const response = await worker.fetch(new Request(`${origin}/.well-known/oauth-authorization-server`), env, context());
++    const metadata = await response.json();
++    // The other methods the library lists stay; only private_key_jwt goes (see the test above).
++    expect(metadata.token_endpoint_auth_methods_supported).toEqual(["client_secret_basic", "client_secret_post", "none"]);
++    expect(metadata.client_id_metadata_document_supported).toBe(true);
++    expect(metadata.issuer).toBe(origin);
++    expect(metadata.authorization_endpoint).toBe(`${origin}/oauth/mcp/authorize`);
++    expect(metadata.token_endpoint).toBe(`${origin}/oauth/mcp/token`);
++    expect(metadata.response_types_supported).toContain("code");
++    expect(metadata.code_challenge_methods_supported).toContain("S256");
++  });
++
++  it("keeps the CORS headers on the metadata response (#132)", async () => {
++    stubCimd({});
++    const env = createEnv({});
++    const response = await worker.fetch(
++      new Request(`${origin}/.well-known/oauth-authorization-server`, { headers: { origin: "https://claude.ai" } }),
++      env,
++      context(),
++    );
++    expect(response.status).toBe(200);
++    expect(response.headers.get("access-control-allow-origin")).toBe("https://claude.ai");
++    expect(response.headers.get("access-control-allow-headers")).toBe("Authorization, *");
++    expect(response.headers.get("access-control-allow-methods")).toBe("*");
++    expect(response.headers.get("access-control-expose-headers")).toBe("WWW-Authenticate, Retry-After");
++    expect(response.headers.get("access-control-max-age")).toBe("86400");
++    expect(response.headers.get("vary")).toBe("Origin");
++    expect(response.headers.get("content-type")).toContain("application/json");
++  });
++
++  it("still serves the metadata, without signing algorithms, when CIMD is off (#132)", async () => {
++    vi.unstubAllGlobals();
++    const env = createEnv({});
++    const response = await worker.fetch(new Request(`${origin}/.well-known/oauth-authorization-server`), env, context());
++    expect(response.status).toBe(200);
++    const metadata = await response.json();
++    expect(metadata).not.toHaveProperty("token_endpoint_auth_signing_alg_values_supported");
++    expect(metadata.token_endpoint_auth_methods_supported).toContain("none");
++  });
+ });
+ 
+ describe("MCP OAuth anonymous write budget", () => {
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index 3fe4e1f5..7e821a27 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -335,7 +335,8 @@ async function takeRegistrationSlot(env: CloudflareEnv, request: Request | undef
+ 
+ /**
+  * The library lists private_key_jwt at the token endpoint whenever CIMD is on. This gateway refuses client
+- * assertions, so the discovery document must not offer the method. Anything else in it is left as it was.
++ * assertions, so the discovery document must not offer the method, nor the signing algorithms that only apply to it
++ * (#132). Anything else in it is left as it was.
+  */
+ async function withoutPrivateKeyJwt(response: Response): Promise<Response> {
+   if (!response.ok) return response;
+@@ -346,8 +347,10 @@ async function withoutPrivateKeyJwt(response: Response): Promise<Response> {
+     return response;
+   }
+   const methods = metadata.token_endpoint_auth_methods_supported;
+-  if (!Array.isArray(methods)) return response;
+-  metadata.token_endpoint_auth_methods_supported = methods.filter((method) => method !== "private_key_jwt");
++  if (Array.isArray(methods)) {
++    metadata.token_endpoint_auth_methods_supported = methods.filter((method) => method !== "private_key_jwt");
++  }
++  delete metadata.token_endpoint_auth_signing_alg_values_supported;
+   const headers = new Headers(response.headers);
+   headers.delete("Content-Length");
+   return new Response(JSON.stringify(metadata), { status: response.status, statusText: response.statusText, headers });
+diff --git a/src/server/cloudflare/test-registration-counter.ts b/src/server/cloudflare/test-anonymous-write-budget.ts
+similarity index 100%
+rename from src/server/cloudflare/test-registration-counter.ts
+rename to src/server/cloudflare/test-anonymous-write-budget.ts
+-- 
+2.34.1
+
