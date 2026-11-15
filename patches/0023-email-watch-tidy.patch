@@ -2,9 +2,9 @@ SplitMind patch 0023 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0022).
 Upstream issue: not filed yet.
 Email watch tidy-ups from the 0016 reviews (#127): a test D1 that throws instead of reporting 0 changes, and a loud guard for an unreachable branch.
 
-From fb92a540f67158b16d27b7bbb3f8d3644be6b915 Mon Sep 17 00:00:00 2001
+From 54d6cdd717c85768767d172d15d7d78865d17d47 Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
-Date: Sun, 15 Nov 2026 12:49:09 -0500
+Date: Sun, 15 Nov 2026 12:52:48 -0500
 Subject: [PATCH] fix(email-watch): loud test D1 batch, loud unreachable
  no_budget guard (#127)
 
@@ -14,10 +14,10 @@ get_profile reports no_budget, which run() makes unreachable. Adds a pin that
 the failing notice claim works on a cursor with a null fingerprint.
 ---
  src/server/email-watch/watcher.test.ts      |  59 ++++++++
- src/server/email-watch/watcher.ts           |   5 +-
+ src/server/email-watch/watcher.ts           |   4 +-
  src/server/storage/d1/test-database.test.ts | 152 ++++++++++++++++++++
  src/server/storage/d1/test-database.ts      |  18 ++-
- 4 files changed, 228 insertions(+), 6 deletions(-)
+ 4 files changed, 227 insertions(+), 6 deletions(-)
  create mode 100644 src/server/storage/d1/test-database.test.ts
 
 diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
@@ -88,14 +88,12 @@ index fad909bc..e2b8176c 100644
 +  });
 +});
 diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
-index e22b2750..f3e40dc0 100644
+index e22b2750..f436524a 100644
 --- a/src/server/email-watch/watcher.ts
 +++ b/src/server/email-watch/watcher.ts
-@@ -244,9 +244,10 @@ export class EmailWatcher {
-     stub: Cursor | undefined,
+@@ -245,8 +245,8 @@ export class EmailWatcher {
    ): Promise<void> {
      const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
-+    // No budget check here: run() only polls a name while budget remains, and nothing before this call spends it.
      if (reply.kind === "no_budget") {
 -      this.logSkip(name, "no_budget");
 -      return;
