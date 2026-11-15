@@ -1,0 +1,178 @@
+SplitMind patch 0024 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Follow-ups to patches 0021 and 0022 (#140).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sun, 15 Nov 2026 13:02:19 -0500
+Subject: [PATCH] fix(mcp-oauth): pass non-object metadata bodies through
+ unchanged
+
+#140: withoutPrivateKeyJwt threw when the library's AS metadata body was
+null, an array or a primitive. It now returns the original response for
+those. Tests also fix the changed-setting warning count for the read-only
+startup warnings.
+
+diff --git a/src/server/cloudflare-read-only-startup-warnings.test.ts b/src/server/cloudflare-read-only-startup-warnings.test.ts
+index 60c829ed..b0b7b826 100644
+--- a/src/server/cloudflare-read-only-startup-warnings.test.ts
++++ b/src/server/cloudflare-read-only-startup-warnings.test.ts
+@@ -183,7 +183,7 @@ describe("read-only setting is parsed once per config, however many times the Wo
+     for (const entry of Object.values(bad)) expect(mentioning(warn, entry), entry).toHaveLength(1);
+   });
+ 
+-  it("parses again when the setting changes: the new bad entry warns once, the unchanged one does not repeat", async () => {
++  it("parses again when the setting changes, so every bad entry in it warns once more", async () => {
+     const warn = quiet();
+     const first = `first${counter + 1}:orphan`;
+     const site = await boot({ readOnly: `${first} gmail:work` });
+@@ -196,7 +196,9 @@ describe("read-only setting is parsed once per config, however many times the Wo
+     await site.request();
+     await site.tick(M0 + 10);
+ 
++    // The changed string is a new config: the new entry warns once, and the unchanged one warns again (2 in total).
+     expect(mentioning(warn, second), second).toHaveLength(1);
++    expect(mentioning(warn, first), first).toHaveLength(2);
+   });
+ 
+   it("logs nothing about the setting for a valid list, after both an app request and a cron run", async () => {
+diff --git a/src/server/cloudflare/mcp-oauth-metadata-passthrough.test.ts b/src/server/cloudflare/mcp-oauth-metadata-passthrough.test.ts
+new file mode 100644
+index 00000000..9fddeaa9
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-metadata-passthrough.test.ts
+@@ -0,0 +1,109 @@
++// Patch 0024 (#140): the authorization-server metadata wrapper passes a body that is not a plain JSON object
++// through untouched. The OAuth library cannot be made to emit such a body, so, as in mcp-oauth-request-env.test.ts,
++// its default export is replaced by a stub whose fetch() answers the metadata path with whatever the test sets.
++// The handler is the real createMcpOAuthHandler; what comes out of handler.fetch is what a Worker would return.
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++const stub = vi.hoisted(() => ({ answer: undefined as undefined | (() => Response), last: undefined as undefined | Response }));
++
++vi.mock("@cloudflare/workers-oauth-provider", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("@cloudflare/workers-oauth-provider")>();
++  class StubProvider {
++    async fetch(): Promise<Response> {
++      stub.last = stub.answer!();
++      return stub.last;
++    }
++  }
++  return { ...actual, default: StubProvider };
++});
++
++const { createMcpOAuthHandler } = await import("./mcp-oauth.ts");
++
++const origin = "https://connect.example.com";
++const context = { waitUntil() {}, passThroughOnException() {} };
++const env = { OOMOL_CONNECT_ORIGIN: origin } as CloudflareEnv;
++const metadataRequest = (method = "GET") => new Request(`${origin}/.well-known/oauth-authorization-server`, { method });
++
++const corsHeaders = {
++  "access-control-allow-origin": "https://claude.ai",
++  "access-control-allow-headers": "Authorization, *",
++  "access-control-allow-methods": "*",
++  "access-control-expose-headers": "WWW-Authenticate, Retry-After",
++  "vary": "Origin",
++  "x-stub-marker": "from-the-library",
++};
++
++afterEach(() => {
++  stub.answer = undefined;
++  stub.last = undefined;
++  vi.restoreAllMocks();
++});
++
++async function serve(body: string, status = 200) {
++  stub.answer = () => new Response(body, { status, headers: { "content-type": "application/json", ...corsHeaders } });
++  const response = await createMcpOAuthHandler(origin, async () => new Response("runtime")).fetch(
++    metadataRequest(),
++    env,
++    context,
++  );
++  return response;
++}
++
++describe("metadata wrapper with a body that is not a plain object (#140)", () => {
++  it.each([
++    ["null", "null"],
++    ["an empty array", "[]"],
++    ["an array of objects", '[{"token_endpoint_auth_methods_supported":["private_key_jwt"]}]'],
++    ["a string", '"x"'],
++    ["a number", "5"],
++    ["a boolean", "true"],
++  ])("returns the library's own response for %s, without throwing", async (_label, body) => {
++    const response = await serve(body);
++
++    expect(response === stub.last, "the original Response object is returned").toBe(true);
++    expect(response.status).toBe(200);
++    expect(await response.text()).toBe(body);
++    for (const [name, value] of Object.entries(corsHeaders)) expect(response.headers.get(name), name).toBe(value);
++    expect(response.headers.get("content-type")).toBe("application/json");
++  });
++
++  it("keeps a non-200 status with a non-object body", async () => {
++    const response = await serve("null", 202);
++
++    expect(response === stub.last, "the original Response object is returned").toBe(true);
++    expect(response.status).toBe(202);
++  });
++
++  it("control: an object body is still rewritten, dropping private_key_jwt and the signing algorithms", async () => {
++    const response = await serve(
++      JSON.stringify({
++        issuer: origin,
++        token_endpoint_auth_methods_supported: ["none", "private_key_jwt"],
++        token_endpoint_auth_signing_alg_values_supported: ["RS256", "ES256"],
++        client_id_metadata_document_supported: true,
++      }),
++    );
++
++    expect(await response.json()).toEqual({
++      issuer: origin,
++      token_endpoint_auth_methods_supported: ["none"],
++      client_id_metadata_document_supported: true,
++    });
++    expect(response.headers.get("access-control-allow-origin")).toBe("https://claude.ai");
++    expect(response.headers.get("x-stub-marker")).toBe("from-the-library");
++  });
++});
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index 7e821a27..8383560e 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -340,12 +340,15 @@ async function takeRegistrationSlot(env: CloudflareEnv, request: Request | undef
+  */
+ async function withoutPrivateKeyJwt(response: Response): Promise<Response> {
+   if (!response.ok) return response;
+-  let metadata: Record<string, unknown>;
++  let parsed: unknown;
+   try {
+-    metadata = (await response.clone().json()) as Record<string, unknown>;
++    parsed = await response.clone().json();
+   } catch {
+     return response;
+   }
++  // null, an array or a primitive is not metadata (#140): hand back the original response untouched.
++  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return response;
++  const metadata = parsed as Record<string, unknown>;
+   const methods = metadata.token_endpoint_auth_methods_supported;
+   if (Array.isArray(methods)) {
+     metadata.token_endpoint_auth_methods_supported = methods.filter((method) => method !== "private_key_jwt");
+-- 
+2.34.1
+
