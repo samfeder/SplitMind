@@ -218,10 +218,12 @@ apply: an account whose policy refuses one of the three is skipped for that run.
 minutes.
 
 **What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`, one of which
-`0021_email_watch_drop_connection_index.sql` drops again):
+`0021_email_watch_drop_connection_index.sql` drops again; `0022_email_watch_cursor_state.sql` adds three cursor columns):
 
 - `email_watch_cursors`: per account, the Gmail history id it has read up to, a page token while it is part-way
-  through a backlog, the last run time and a catch-up flag.
+  through a backlog, the last run time and a catch-up flag, the time of the last successful read (`last_success_at`),
+  the time the "could not read" item was left for the current failure streak (`failing_notice_at`) and the id of the
+  Gmail connection the alias pointed at when the cursor was written (`connection_id`).
 - `email_watch_items`: one row per kept message: the account alias, Gmail's message and thread ids, the sender's
   **domain** (not the address), the subject (control characters removed, at most 200 characters), the category and
   rule id, the received time, status (`pending` or `acknowledged`) and a duplicate key. The same alert in the same
@@ -230,7 +232,24 @@ minutes.
 Mail that matches no rule writes nothing. Full addresses, recipients, snippets, bodies, labels and other header
 values are never stored. If Gmail has dropped the history the watcher was reading (after about a week without a
 check), it restarts from the mailbox's current position and adds one `watch_gap` item saying which period was not
-checked.
+checked. That item's window starts at the **last successful read** (`last_success_at`), not at the last attempt, so
+days of failed polls before the history expired are inside it.
+
+**When an account keeps failing.** A poll that cannot read Gmail (an auth error, a refusal by policy, a 5xx or a rate
+limit) leaves the cursor where it was and goes back to the normal interval: it does **not** retry every minute. Only
+an account the 15-run budget did not reach is flagged for an off-interval run. When the first failed poll of a streak
+comes 24 hours or more after the last successful read, the watcher leaves one pending `watch_gap` item with rule id
+`watch-failing` and the subject `Email watch could not read this account since <time of the last successful read>`.
+It carries no error text, address or subject. There is one per failure streak; the next successful read clears the
+streak, and a later 24-hour failure gets a new item.
+
+**An alias reused by another account.** At the start of each poll the watcher asks the connection store (no Gmail
+call) which connection the alias points at and compares its id with the cursor's `connection_id`. A cursor from before
+patch 0015 has none and simply adopts the current id. If the id differs, or the alias no longer points at any
+connection, the alias's items and cursor are deleted, one warn line carrying only the alias is logged, and, if the
+alias resolves, the watch starts fresh for it (no backfill). If the store cannot be read the poll is skipped and
+nothing is deleted. Until the next poll runs, `list_pending_mail` and `acknowledge_mail` hide and leave alone the items
+of an alias whose recorded id differs from the current one, so a different account never sees the previous one's mail.
 
 **Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
 pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
@@ -240,16 +259,22 @@ request titles are written by anyone. Mail from github.com that carries that hea
 only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
 
 **Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
-contain a verification code. Before a subject is stored, and before its duplicate key is computed, all Unicode
-format characters (category Cf: soft hyphen, zero-width characters, directional marks, tag characters and more) and
-U+034F (combining grapheme joiner) are removed, then every run of 4 or more digits is replaced with
+contain a verification code. Before a subject is stored, and before its duplicate key is computed, these are
+removed: every Unicode default-ignorable code point (all format characters, category Cf: soft hyphen, zero-width
+characters, directional marks, tag characters; the combining grapheme joiner U+034F; the Hangul fillers U+115F, U+1160,
+U+3164 and U+FFA0; the variation selectors U+FE00 to U+FE0F and U+E0100 to U+E01EF; the Mongolian free variation
+selectors), the braille blank U+2800, the combining enclosing keycap U+20E3, and any combining mark that follows a
+decimal digit. Marks after letters stay (`café`). Keycap digits such as `4️⃣8️⃣2️⃣9️⃣` become `4829` and are redacted.
+Then every run of 4 or more digits is replaced with
 `[redacted]`, in every category. A digit is any Unicode decimal digit (fullwidth and Arabic-Indic included). Neighbouring
 digits may be separated by nothing or by exactly one separator: whitespace (including no-break spaces), a dot, a
 hyphen, a dash (U+2010 to U+2015) or a minus (U+2212), so `123456`, `123 456`, `482.913` and `482–913` are all
 redacted. Years, invoice numbers, decimals such as `1.234` and IP-like strings with 4 or more digits are redacted too,
 and two code mails with different codes count as one item. **Residual:** these are not redacted: codes that mix
 letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`). A zero-width joiner
-(U+200D) is a format character, so emoji joined with it are split into separate emoji in the stored subject.
+(U+200D) is a format character, so emoji joined with it are split into separate emoji in the stored subject, and
+U+FE0F is removed too, so emoji show in their text presentation. Other invisible characters outside these classes, and a
+combining mark that follows a non-digit and sits inside a digit run, are not covered.
 Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
@@ -260,9 +285,10 @@ missing DMARC result, or a `header.from` for another domain stores nothing, so m
 rule domain does not appear in the list.
 
 **Logs.** Watcher log lines carry only the account alias, counts, rule ids, categories and error codes: never a
-subject, an address, a header value or a Gmail id. Its run-log entries (Runs page, `caller` = `cron`) record the
-outcome and policy decision but no `inputSummary` or `outputSummary`, so nothing from a message reaches the run log,
-unlike the rows in section 4. Runs of the `mail_watch` actions (`list_pending_mail`, `acknowledge_mail`) are
+subject, an address, a header value or a Gmail id. Its run-log entries (Runs page, `caller` = `cron`) are written
+only for a **failed** Gmail call (a successful poll leaves no row, so the watcher does not fill the run log); a failure
+records the outcome and policy decision but no `inputSummary` or `outputSummary`, so nothing from a message reaches the
+run log, unlike the rows in section 4. The host log's completion line for those runs omits the connection id. Runs of the `mail_watch` actions (`list_pending_mail`, `acknowledge_mail`) are
 outcome-only too, whoever calls them and whatever `audit` value they pass: `ActionRunner` enforces it for the
 `mail_watch` provider, and a failed run keeps its error code but a fixed message.
 
@@ -288,7 +314,8 @@ returns `{ enabled, items }`, newest first, each with a Gmail link built at read
 profile (the address is not copied into the new tables). `mail_watch.acknowledge_mail` (write; 1–100 item ids) marks
 items acknowledged and writes only to `email_watch_items`. A read-only MCP grant (patch 0004) gets the list action and
 not the acknowledge action. A token or grant scoped to chosen accounts (patch 0004) sees and
-acknowledges only the items of those Gmail accounts, `watch_gap` items included; an unscoped one sees all. With the watch off both return `enabled: false` / `acknowledged: 0` and touch nothing.
+acknowledges only the items of those Gmail accounts, `watch_gap` items included; an unscoped one sees all. One statement lists at most 90 accounts (D1 allows 100 bound values); if more accounts than that have items the
+list logs one warn line with the count left out (`omitted`) and no names. With the watch off both return `enabled: false` / `acknowledged: 0` and touch nothing.
 
 **Turning it on** is a deliberate step, not part of `npm run deploy`:
 
@@ -299,7 +326,8 @@ acknowledges only the items of those Gmail accounts, `watch_gap` items included;
    is how often it runs. The rendered config does not name them, and Wrangler replaces
    variables that exist only in the dashboard when it deploys, so confirm they are still set after each
    `npm run deploy`; if they are gone the watch is simply off.
-3. Check **Runs**: `caller=cron` rows for `gmail.get_profile` mean the first pass worked. The first pass reads
-   nothing from the past; only mail that arrives afterwards is checked.
+3. Check the cursors: a row in `email_watch_cursors` for each alias, with `connection_id` set, means the first pass
+   worked (successful passes leave no run-log row; a failed Gmail call leaves a `caller=cron` row on **Runs**). The
+   first pass reads nothing from the past; only mail that arrives afterwards is checked.
 
 **CPU.** On Workers Free each invocation has 10 ms of CPU. Measurements for this patch are in the pull request.

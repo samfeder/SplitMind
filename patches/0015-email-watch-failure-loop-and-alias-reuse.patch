@@ -1,0 +1,2483 @@
+SplitMind patch 0015 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0014).
+Upstream issue: not filed yet.
+Email watch: #96 failure loop, #97 quieter run log, #98 gap start, #101 alias reuse, #102 tests and 90-cap log, #119 wider invisible strip.
+From a6c9a89c169532d0b50c3b277d30ed20f25c10f3 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 08:33:39 -0500
+Subject: [PATCH] fix(email-watch): failure loop, gap start, alias reuse,
+ quieter run log, invisible strip (#96 #97 #98 #101 #102 #119)
+
+#96: an aborted poll clears catch_up (retried on the normal interval); after 24
+hours without a successful read, one pending watch_gap item (rule watch-failing)
+per failure streak. #98: the expired-history gap starts at last_success_at.
+#101: cursors record the Gmail connection id; a different or missing id drops
+the alias's items and cursor, and list/acknowledge hide them until then.
+#97: audit "failures" writes no run row for a successful watcher call.
+#102: warn with the omitted count past the 90-connection cap; race tests assert
+the injection ran. #119: strip every default-ignorable code point, U+2800,
+U+20E3 and marks after digits. Migration 0022 adds the cursor columns.
+---
+ migrations/0022_email_watch_cursor_state.sql  |   7 +
+ .../0022_email_watch_cursor_state.sql         |   7 +
+ src/core/types.ts                             |   5 +
+ src/providers/mail_watch/executors.ts         |  51 +-
+ .../actions/action-runner-audit.test.ts       |  91 ++-
+ src/server/actions/action-runner.ts           |  43 +-
+ src/server/cloudflare-email-watch.test.ts     | 412 +++++++++++-
+ src/server/email-watch/gmail-access.test.ts   |  11 +-
+ src/server/email-watch/gmail-access.ts        |   6 +-
+ .../email-watch/mail-watch-provider.test.ts   |  82 ++-
+ .../email-watch/mail-watch-scope.test.ts      |  95 ++-
+ src/server/email-watch/migration.test.ts      | 114 +++-
+ src/server/email-watch/rules.ts               |  12 +-
+ src/server/email-watch/test-support.ts        |  32 +-
+ src/server/email-watch/watcher.test.ts        | 597 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             | 141 ++++-
+ .../storage/postgres/runtime-store.test.ts    |  93 ++-
+ .../storage/sqlite/runtime-store.test.ts      |   1 +
+ 18 files changed, 1715 insertions(+), 85 deletions(-)
+ create mode 100644 migrations/0022_email_watch_cursor_state.sql
+ create mode 100644 migrations/postgresql/0022_email_watch_cursor_state.sql
+
+diff --git a/migrations/0022_email_watch_cursor_state.sql b/migrations/0022_email_watch_cursor_state.sql
+new file mode 100644
+index 00000000..3ba7e275
+--- /dev/null
++++ b/migrations/0022_email_watch_cursor_state.sql
+@@ -0,0 +1,7 @@
++-- Email watch (patch 0015). last_success_at: the last poll that read Gmail successfully (start of an unchecked
++-- window). failing_notice_at: set when the "could not read" item is inserted, cleared on the next success.
++-- connection_id: the Gmail connection the name resolved to when the cursor was written. All ISO-8601 UTC text.
++alter table email_watch_cursors add column last_success_at text;
++alter table email_watch_cursors add column failing_notice_at text;
++alter table email_watch_cursors add column connection_id text;
++update email_watch_cursors set last_success_at = last_run_at;
+diff --git a/migrations/postgresql/0022_email_watch_cursor_state.sql b/migrations/postgresql/0022_email_watch_cursor_state.sql
+new file mode 100644
+index 00000000..3ba7e275
+--- /dev/null
++++ b/migrations/postgresql/0022_email_watch_cursor_state.sql
+@@ -0,0 +1,7 @@
++-- Email watch (patch 0015). last_success_at: the last poll that read Gmail successfully (start of an unchecked
++-- window). failing_notice_at: set when the "could not read" item is inserted, cleared on the next success.
++-- connection_id: the Gmail connection the name resolved to when the cursor was written. All ISO-8601 UTC text.
++alter table email_watch_cursors add column last_success_at text;
++alter table email_watch_cursors add column failing_notice_at text;
++alter table email_watch_cursors add column connection_id text;
++update email_watch_cursors set last_success_at = last_run_at;
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 970be72b..250dedb1 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -394,6 +394,11 @@ export interface ExecutionContext {
+    * own connection check. Absent means every connection is allowed.
+    */
+   isConnectionAllowed?: (connectionName: string) => Promise<boolean>;
++  /**
++   * The id of the Gmail connection a name resolves to now, undefined when it has none; rejects on any other failure.
++   * Set by the action runner; the mail_watch executors use it to hide items stored for a different account.
++   */
++  resolveConnectionId?: (connectionName: string) => Promise<string | undefined>;
+ }
+ 
+ /**
+diff --git a/src/providers/mail_watch/executors.ts b/src/providers/mail_watch/executors.ts
+index 144f2b66..0d9c04f3 100644
+--- a/src/providers/mail_watch/executors.ts
++++ b/src/providers/mail_watch/executors.ts
+@@ -1,5 +1,5 @@
+ import type { D1DatabaseBinding } from "../../server/cloudflare/cloudflare-bindings.ts";
+-import type { ProviderExecutors } from "../../core/types.ts";
++import type { ExecutionContext, ProviderExecutors } from "../../core/types.ts";
+ 
+ const itemColumns =
+   "id, connection_name, gmail_message_id, category, rule_id, sender_domain, subject, received_at, occurrences";
+@@ -45,8 +45,9 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+         values.push(filters.connectionName);
+       }
+       // Deny by default: without the runner's connection predicate nothing is listed.
+-      const isAllowed = context.isConnectionAllowed;
+-      if (!isAllowed) return { ok: true, output: { enabled: true, items: [] } };
++      const baseAllowed = context.isConnectionAllowed;
++      if (!baseAllowed) return { ok: true, output: { enabled: true, items: [] } };
++      const isAllowed = withAccountCheck(deps.database, context, baseAllowed);
+       // Ask the predicate about every connection that has matching items, then list only those connections.
+       const verdicts = new Map<string, boolean>();
+       const check = async (name: string): Promise<boolean> => {
+@@ -60,8 +61,12 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+       const allowed: string[] = [];
+       for (const row of names) if (await check(row.connection_name)) allowed.push(row.connection_name);
+       if (allowed.length === 0) return { ok: true, output: { enabled: true, items: [] } };
+-      // D1 allows 100 bound values per statement.
++      // D1 allows 100 bound values per statement, so one statement lists at most 90 connections (the rest are bound
++      // by the filters above). Connections past the cap are left out of this answer; say how many, never which.
+       const listed = allowed.slice(0, 90);
++      if (allowed.length > listed.length) {
++        context.logger?.warn({ omitted: allowed.length - listed.length }, "mail watch list left out connections over the cap");
++      }
+       clauses.push(`connection_name in (${listed.map(() => "?").join(", ")})`);
+       values.push(...listed);
+       const limit = Math.min(filters.limit ?? defaultLimit, maxLimit);
+@@ -101,6 +106,7 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+       if (!deps.enabled) return { ok: true, output: { acknowledged: 0 } };
+       const ids = [...new Set(((input ?? {}) as { ids?: string[] }).ids ?? [])];
+       if (ids.length === 0 || !context.isConnectionAllowed) return { ok: true, output: { acknowledged: 0 } };
++      const isAllowed = withAccountCheck(deps.database, context, context.isConnectionAllowed);
+       // D1 allows 100 bound values per statement, so a full list of 100 ids goes in two.
+       const acknowledgedAt = new Date(now()).toISOString();
+       const allowed = new Map<string, boolean>();
+@@ -115,7 +121,7 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+         const permitted: string[] = [];
+         for (const row of results) {
+           if (!allowed.has(row.connection_name)) {
+-            allowed.set(row.connection_name, (await context.isConnectionAllowed?.(row.connection_name)) ?? false);
++            allowed.set(row.connection_name, await isAllowed(row.connection_name));
+           }
+           if (allowed.get(row.connection_name)) permitted.push(row.id);
+         }
+@@ -133,6 +139,41 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+   };
+ }
+ 
++/**
++ * The caller's connection predicate, narrowed so a name whose cursor was written for a different connection id than
++ * the name resolves to now is not allowed: its items belong to a previous account, and the next poll deletes them.
++ * A cursor without a connection id (written before patch 0015) is not checked. Without a resolver on the context
++ * nothing is checked. A name that no longer resolves, or whose resolution fails, is hidden.
++ */
++function withAccountCheck(
++  database: D1DatabaseBinding,
++  context: ExecutionContext,
++  allowed: (connectionName: string) => Promise<boolean>,
++): (connectionName: string) => Promise<boolean> {
++  const resolve = context.resolveConnectionId;
++  let recorded: Map<string, string> | undefined;
++  const recordedIds = async (): Promise<Map<string, string>> => {
++    if (!recorded) {
++      const { results } = await database
++        .prepare("select connection_name, connection_id from email_watch_cursors where connection_id is not null")
++        .all<{ connection_name: string; connection_id: string }>();
++      recorded = new Map(results.map((row) => [row.connection_name, row.connection_id]));
++    }
++    return recorded;
++  };
++  return async (name) => {
++    if (!(await allowed(name))) return false;
++    if (!resolve) return true;
++    const expected = (await recordedIds()).get(name);
++    if (expected === undefined) return true;
++    try {
++      return (await resolve(name)) === expected;
++    } catch {
++      return false;
++    }
++  };
++}
++
+ /** A message link, or for a watch_gap item (which has no message) the inbox. */
+ function gmailLink(email: string | undefined, row: ItemRow): string {
+   const place = row.category === "watch_gap" ? "#inbox" : `#all/${row.gmail_message_id}`;
+diff --git a/src/server/actions/action-runner-audit.test.ts b/src/server/actions/action-runner-audit.test.ts
+index 592c7923..b1deaa63 100644
+--- a/src/server/actions/action-runner-audit.test.ts
++++ b/src/server/actions/action-runner-audit.test.ts
+@@ -66,7 +66,7 @@ function setup(executor: ActionExecutor = async () => ({ ok: true, output: { sni
+   return { runner, database };
+ }
+ 
+-function input(overrides: Partial<RunActionInput> & { audit?: "outcome" } = {}): RunActionInput {
++function input(overrides: Partial<RunActionInput> & { audit?: "outcome" | "failures" } = {}): RunActionInput {
+   return {
+     actionId: "example.echo",
+     input: { subject: SECRET_INPUT, token: "tok-1" },
+@@ -164,3 +164,92 @@ describe("the cron caller in the run log store", () => {
+     expect(page.items[0]!.caller).toBe("cron");
+   });
+ });
++
++// Patch 0015, #97: the email watch's own Gmail runs used to fill the run log (one row per call, every few minutes).
++// `audit: "failures"` is outcome-only like "outcome", and a run that succeeds writes no row at all; a run that fails
++// writes its outcome-only row as before. ("failures" is the name the spec suggests; the tests below observe rows only.)
++describe("ActionRunner audit: failures (patch 0015, #97)", () => {
++  const rowsOf = async (database: D1RuntimeDatabase, caller: RunActionInput["caller"] = "cron") =>
++    (await database.runLogStore.list({ caller })).items;
++
++  it("writes no run row for a successful run, and still returns the full output", async () => {
++    const { runner, database } = setup();
++    const run = await runner.run(input({ audit: "failures" }));
++    expect(run!.result).toEqual({ ok: true, output: { snippet: SECRET_OUTPUT } });
++    expect(await rowsOf(database)).toEqual([]);
++    expect(await database.runLogStore.get(run!.executionId)).toBeUndefined();
++  });
++
++  it("writes no row for any number of successful runs", async () => {
++    const { runner, database } = setup();
++    for (let n = 0; n < 5; n += 1) await runner.run(input({ audit: "failures" }));
++    expect(await rowsOf(database)).toEqual([]);
++  });
++
++  it("writes one outcome-only row for a failed run: the error code is kept, no summary, no message", async () => {
++    const { runner, database } = setup(async () => ({
++      ok: false,
++      error: { code: "provider_error", message: `upstream said ${SECRET_OUTPUT}` },
++    }));
++    const run = await runner.run(input({ audit: "failures" }));
++    expect(run!.result).toMatchObject({ ok: false, error: { code: "provider_error" } });
++    const rows = await rowsOf(database);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ id: run!.executionId, service: "example", actionId: "example.echo", caller: "cron", ok: false, errorCode: "provider_error" });
++    expect(rows[0]!.inputSummary).toBeUndefined();
++    expect(rows[0]!.outputSummary).toBeUndefined();
++    expect(JSON.stringify(rows[0])).not.toContain(SECRET_INPUT);
++    expect(JSON.stringify(rows[0])).not.toContain(SECRET_OUTPUT);
++  });
++
++  it("writes one outcome-only row for an executor that throws", async () => {
++    const { runner, database } = setup(async () => {
++      throw new Error(`boom ${SECRET_OUTPUT}`);
++    });
++    const run = await runner.run(input({ audit: "failures" }));
++    expect(run!.result.ok).toBe(false);
++    const rows = await rowsOf(database);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ ok: false });
++    expect(rows[0]!.inputSummary).toBeUndefined();
++    expect(JSON.stringify(rows[0])).not.toContain(SECRET_OUTPUT);
++  });
++
++  it("writes one outcome-only row for a policy refusal, with its decision", async () => {
++    const { runner, database } = setup();
++    const blocked = new ActionPolicyService({ blockedActions: ["example.echo"] }).createSnapshot();
++    const run = await runner.run(input({ audit: "failures", policy: blocked }));
++    expect(run!.result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    const rows = await rowsOf(database);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ ok: false, policy: { allowed: false, code: "action_blocked" }, errorCode: "action_blocked" });
++    expect(rows[0]!.inputSummary).toBeUndefined();
++  });
++
++  it("a failure after successes leaves exactly one row: the failure's", async () => {
++    let calls = 0;
++    const { runner, database } = setup(async () => (++calls === 3 ? { ok: false, error: { code: "provider_error", message: "x" } } : { ok: true, output: {} }));
++    const ids: string[] = [];
++    for (let n = 0; n < 4; n += 1) ids.push((await runner.run(input({ audit: "failures" })))!.executionId);
++    expect((await rowsOf(database)).map((row) => row.id)).toEqual([ids[2]]);
++  });
++
++  it("does not change the other modes: outcome still writes a row for a success, and an unset audit keeps its summaries", async () => {
++    const { runner, database } = setup();
++    const quiet = await runner.run(input({ audit: "outcome" }));
++    const loud = await runner.run(input());
++    await runner.run(input({ audit: "failures" }));
++    const rows = await rowsOf(database);
++    expect(rows.map((row) => row.id).sort()).toEqual([quiet!.executionId, loud!.executionId].sort());
++    expect((await database.runLogStore.get(quiet!.executionId))!.inputSummary).toBeUndefined();
++    expect((await database.runLogStore.get(loud!.executionId))!.inputSummary).toMatchObject({ subject: SECRET_INPUT });
++  });
++
++  it.each(["http", "mcp", "web"])("a successful run of the %s caller with audit unset still writes its full row (control)", async (caller) => {
++    const { runner, database } = setup();
++    const run = await runner.run(input({ caller: caller as RunActionInput["caller"] }));
++    expect(await rowsOf(database, caller as RunActionInput["caller"])).toMatchObject([
++      { id: run!.executionId, inputSummary: { subject: SECRET_INPUT, token: "[redacted]" }, outputSummary: { snippet: SECRET_OUTPUT } },
++    ]);
++  });
++});
+diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
+index 6931981e..a167620d 100644
+--- a/src/server/actions/action-runner.ts
++++ b/src/server/actions/action-runner.ts
+@@ -42,9 +42,11 @@ export interface RunActionInput {
+   signal?: AbortSignal;
+   /**
+    * "outcome" records the run row without an input or output summary, for callers whose data must not reach the
+-   * run log (the email watch). Unset keeps both summaries.
++   * run log (the email watch). "failures" is outcome-only too, and a successful run writes no row at all (the
++   * watcher's own polling would fill the run log); a failed run still writes its outcome-only row. Unset keeps both
++   * summaries.
+    */
+-  audit?: "outcome";
++  audit?: "outcome" | "failures";
+ }
+ 
+ export interface ActionRunResult {
+@@ -233,7 +235,7 @@ export class ActionRunner {
+     const durationMs = completedAtMs - startedAtMs;
+     const auditError = safeRunLogError(result.error);
+     // Mail-watch runs carry subjects and senders, so they are always recorded outcome-only (patch 0011, #104).
+-    const outcomeOnly = input.audit === "outcome" || action.service === MAIL_WATCH_SERVICE;
++    const outcomeOnly = input.audit === "outcome" || input.audit === "failures" || action.service === MAIL_WATCH_SERVICE;
+     const runLog: RunLog = {
+       id: executionId,
+       remoteExecutionId,
+@@ -254,20 +256,25 @@ export class ActionRunner {
+     };
+ 
+     let auditPersisted = false;
+-    try {
+-      const write = await this.options.runs.add(runLog);
+-      auditPersisted = true;
+-      if (!write.retentionApplied) {
+-        this.options.logger?.warn({ ...logContext, auditPersisted }, "run audit retention failed");
++    // audit "failures": a successful run is not recorded; only a failure leaves a row.
++    if (!(input.audit === "failures" && result.ok)) {
++      try {
++        const write = await this.options.runs.add(runLog);
++        auditPersisted = true;
++        if (!write.retentionApplied) {
++          this.options.logger?.warn({ ...logContext, auditPersisted }, "run audit retention failed");
++        }
++      } catch {
++        this.options.logger?.warn({ ...logContext, auditPersisted }, "run audit persistence failed");
+       }
+-    } catch {
+-      this.options.logger?.warn({ ...logContext, auditPersisted }, "run audit persistence failed");
+     }
+ 
+     const completedLogContext = {
+       ...logContext,
+       remoteExecutionId,
+-      connectionId: connection?.summary?.id,
++      // The watcher's own runs (audit "failures") keep the connection id out of the host log: the email watch logs
++      // no account identifier, and the cursor already records the id.
++      ...(input.audit === "failures" ? {} : { connectionId: connection?.summary?.id }),
+       durationMs,
+       ok: result.ok,
+       errorCode: result.error?.code,
+@@ -300,6 +307,19 @@ export class ActionRunner {
+     return this.options.runs.get(id);
+   }
+ 
++  /**
++   * The id of the Gmail connection this name resolves to now (the id the runner records in run logs), or undefined
++   * when the name has no connection. Any other failure is thrown. It reads the connection store only.
++   */
++  async resolveGmailConnectionId(connectionName: string): Promise<string | undefined> {
++    try {
++      return (await this.options.connections.getConnectionSummary("gmail", connectionName))?.id;
++    } catch (error) {
++      if (error instanceof ConnectionError && error.code === "connection_not_found") return undefined;
++      throw error;
++    }
++  }
++
+   /** The caller's connection policy for the Gmail connection with this name; a name with no connection has no id. */
+   private async isGmailConnectionAllowed(connectionName: string, policy: ActionPolicySnapshot): Promise<boolean> {
+     let connectionId: string | undefined;
+@@ -321,6 +341,7 @@ export class ActionRunner {
+       signal,
+       logger: this.options.logger,
+       isConnectionAllowed: (connectionName) => this.isGmailConnectionAllowed(connectionName, policy),
++      resolveConnectionId: (connectionName) => this.resolveGmailConnectionId(connectionName),
+     };
+     if (this.options.transitFiles) {
+       context.transitFiles = this.options.transitFiles;
+diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
+index ccb1d38d..6065aa33 100644
+--- a/src/server/cloudflare-email-watch.test.ts
++++ b/src/server/cloudflare-email-watch.test.ts
+@@ -313,29 +313,29 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+     expect(history.params.get("startHistoryId")).toBe("1000");
+   });
+ 
+-  it("leaves run rows with the cron caller and no input or output summary, and no mail content in them", async () => {
++  // Patch 0015 (#97): this test used to expect a cron row for every Gmail call (get_profile, list_history, two
++  // fetches), all with no summaries. A successful watcher run now writes no row; a failed call still writes its
++  // outcome-only row. The same content checks apply to the rows that remain.
++  it("a successful run leaves no run row; a failing Gmail call leaves its outcome-only cron row with no mail content in it", async () => {
+     const s = await seeded();
+     const mailbox = s.mailboxes.work!;
+     mailbox.deliver(vercelFailure("Deployment failed for my-app"));
+     mailbox.deliver({ from: "Pat <pat@example.com>", subject: "Dinner at 7", snippet: "Private chat" });
+     await s.tick(M0 + 10);
++    expect((await s.db.inner.prepare("select * from runs").all()).results).toEqual([]);
++    expect(await s.watchRows("email_watch_items")).toHaveLength(1);
+ 
+-    const runs = (await s.db.inner.prepare("select * from runs").all<{ caller: string; action_id: string; value: string }>()).results;
+-    // get_profile (first run), then list_history and two fetches.
+-    expect(runs.map((run) => run.action_id).sort()).toEqual(
+-      [
+-        "gmail.fetch_message_by_message_id",
+-        "gmail.fetch_message_by_message_id",
+-        "gmail.get_profile",
+-        "gmail.list_history",
+-      ].sort(),
+-    );
++    mailbox.deliver(vercelFailure("Deployment failed for the-next-app"));
++    mailbox.failWith("message", 500);
++    await s.tick(M0 + 20);
++    const runs = (await s.db.inner.prepare("select * from runs").all<{ caller: string; action_id: string; ok: number; value: string }>()).results;
++    expect(runs.map((run) => [run.action_id, run.ok])).toEqual([["gmail.fetch_message_by_message_id", 0]]);
+     for (const run of runs) {
+       expect(run.caller).toBe("cron");
+       const value = JSON.parse(run.value) as Record<string, unknown>;
+       expect(value.inputSummary ?? null).toBeNull();
+       expect(value.outputSummary ?? null).toBeNull();
+-      expect(value).toMatchObject({ ok: true, caller: "cron" });
++      expect(value).toMatchObject({ ok: false, caller: "cron" });
+     }
+     // The run row keeps the connection's own profile (the owner's address) as it does for every caller; what it
+     // must not hold is anything from the messages.
+@@ -345,11 +345,13 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+       "no-reply@vercel.com",
+       "Dinner at 7",
+       "Deployment failed for my-app",
++      "Deployment failed for the-next-app",
+       "Private chat",
+       "Snippet that must never",
+       mailbox.threadIdOf("w0-0001"),
+       "w0-0001",
+       "w0-0002",
++      "w0-0003",
+     ]) {
+       expect(dump, secret).not.toContain(secret);
+     }
+@@ -461,6 +463,8 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+ describe("run log listing", () => {
+   it("lists the watcher's runs under caller=cron and still rejects an unknown caller", async () => {
+     const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    // Patch 0015 (#97): a successful watcher run writes no row, so the run that is listed here is a failing one.
++    s.mailboxes.work!.failWith("profile", 500);
+     await s.tick(M0);
+     const get = (query: string) =>
+       worker.fetch(new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/api/runs?${query}`), s.env, {
+@@ -472,7 +476,7 @@ describe("run log listing", () => {
+     expect(cron.status).toBe(200);
+     const page = (await cron.json()) as { items: { actionId: string; caller: string; inputSummary?: unknown; outputSummary?: unknown }[] };
+     expect(page.items.map((item) => item.actionId)).toEqual(["gmail.get_profile"]);
+-    expect(page.items[0]).toMatchObject({ caller: "cron" });
++    expect(page.items[0]).toMatchObject({ caller: "cron", ok: false });
+     expect(page.items[0]!.inputSummary).toBeUndefined();
+     expect(page.items[0]!.outputSummary).toBeUndefined();
+ 
+@@ -1135,3 +1139,385 @@ describe("one-time codes through the cron and the list action (patch 0011, #105)
+     for (const code of codes) expect(text, JSON.stringify(code)).not.toContain(code);
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #96 through the Worker's cron: a failing connection is retried on the interval, not every minute.
++// ---------------------------------------------------------------------------------------------------------------
++describe("a failing connection stops being retried every minute (patch 0015, #96)", () => {
++  async function failingWithCatchUp(): Promise<Setup> {
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    await insertCursor(s.db, {
++      connection_name: "work",
++      history_id: "1000",
++      page_token: "p20",
++      last_run_at: new Date(T0 - 60_000).toISOString(),
++      catch_up: 1,
++    });
++    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for catch-up"));
++    s.mailboxes.work!.failWith("history", 401);
++    return s;
++  }
++
++  it("the catch-up minute that fails clears the flag: the next off-interval minutes do nothing, the next due minute runs", async () => {
++    const s = await failingWithCatchUp();
++    await s.tick(M0 + 3);
++    expect(s.fetcher).toHaveBeenCalled();
++    expect((await s.watchRows<{ catch_up: number }>("email_watch_cursors"))[0]!.catch_up).toBe(0);
++
++    s.fetcher.mockClear();
++    await s.tick(M0 + 4);
++    await s.tick(M0 + 5);
++    await s.tick(M0 + 9);
++    expect(s.fetcher).not.toHaveBeenCalled();
++
++    await s.tick(M0 + 10);
++    expect(s.fetcher).toHaveBeenCalled();
++  });
++
++  it("a connection that is merely starved of budget is still caught up off-interval (control)", async () => {
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const names = ["a", "b", "c"];
++    const s = await setup({ names, vars: { [CONNECTIONS]: names.map((name) => `gmail:${name}`).join(",") } });
++    await s.tick(M0);
++    for (const name of names) {
++      s.mailboxes[name]!.maxPageSize = 5;
++      for (let index = 0; index < 10; index += 1) s.mailboxes[name]!.deliver(vercelFailure(`Deployment failed for ${name}-${index}`));
++    }
++    await s.tick(M0 + 10);
++    expect((await s.watchRows<{ catch_up: number }>("email_watch_cursors")).some((cursor) => cursor.catch_up === 1)).toBe(true);
++    s.fetcher.mockClear();
++    await s.tick(M0 + 11);
++    expect(s.fetcher).toHaveBeenCalled();
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #97 through the Worker: the watcher's successful Gmail runs write no run-log row, its failed ones write
++// an outcome-only row, and nobody else's rows change. (Runner level: actions/action-runner-audit.test.ts.)
++// ---------------------------------------------------------------------------------------------------------------
++describe("the watcher and the run log (patch 0015, #97)", () => {
++  const ctx = { waitUntil() {}, passThroughOnException() {} };
++
++  interface RunRow {
++    action_id: string;
++    caller: string;
++    ok: number;
++    value: string;
++  }
++
++  const runRows = async (s: Setup): Promise<RunRow[]> =>
++    (await s.db.inner.prepare("select * from runs order by started_at, id").all<RunRow>()).results;
++
++  async function callHttp(s: Setup, actionId: string, input: Record<string, unknown>, connectionName?: string) {
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/${actionId}`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input, ...(connectionName ? { connectionName } : {}) }),
++      }),
++      s.env,
++      ctx,
++    );
++    return { status: response.status, text: JSON.stringify(await response.json()) };
++  }
++
++  async function callMcp(s: Setup, actionId: string, input: Record<string, unknown>) {
++    const transport = new StreamableHTTPClientTransport(new URL(`${s.env.OOMOL_CONNECT_ORIGIN}/mcp`), {
++      fetch: (async (request: RequestInfo | URL, init?: RequestInit) => worker.fetch(new Request(request, init), s.env, ctx)) as typeof fetch,
++    });
++    const client = new Client({ name: "email-watch-test", version: "0.0.0" });
++    await client.connect(transport);
++    try {
++      const result = await client.callTool({ name: "execute_action", arguments: { actionId, input } });
++      return { ok: !result.isError, text: JSON.stringify(result) };
++    } finally {
++      await client.close();
++    }
++  }
++
++  async function watching(): Promise<Setup> {
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    await s.tick(M0);
++    return s;
++  }
++
++  it("a run that reads Gmail successfully, with mail to store, writes no run row for any caller cron call", async () => {
++    const s = await watching();
++    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for my-app"));
++    await s.tick(M0 + 10);
++    expect(await s.watchRows("email_watch_items")).toHaveLength(1);
++    expect((await runRows(s)).filter((row) => row.caller === "cron")).toEqual([]);
++    expect(await runRows(s)).toEqual([]);
++  });
++
++  it("many successful watcher runs leave the run log empty", async () => {
++    const s = await watching();
++    for (const offset of [10, 20, 30, 40]) await s.tick(M0 + offset);
++    expect(await runRows(s)).toEqual([]);
++  });
++
++  it("a failed Gmail call leaves exactly one outcome-only cron row, with its error code and nothing from the mail", async () => {
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const s = await watching();
++    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for ledger-9QX"));
++    s.mailboxes.work!.failWith("history", 500);
++    await s.tick(M0 + 10);
++    const rows = await runRows(s);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ action_id: "gmail.list_history", caller: "cron", ok: 0 });
++    const value = JSON.parse(rows[0]!.value) as Record<string, any>;
++    expect(value).toMatchObject({ ok: false, caller: "cron", actionId: "gmail.list_history" });
++    expect(typeof value.errorCode).toBe("string");
++    expect("inputSummary" in value).toBe(false);
++    expect("outputSummary" in value).toBe(false);
++    expect(JSON.stringify(rows)).not.toContain("ledger-9QX");
++  });
++
++  it("a connection that fails every time writes one row per failed call and none for the other connection's successes", async () => {
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const s = await setup({ names: ["work", "ops"], vars: { [CONNECTIONS]: "gmail:work,gmail:ops" } });
++    await s.tick(M0);
++    s.mailboxes.work!.failWith("history", 401);
++    await s.tick(M0 + 10);
++    await s.tick(M0 + 20);
++    const rows = await runRows(s);
++    expect(rows.map((row) => [row.action_id, row.caller, row.ok])).toEqual([
++      ["gmail.list_history", "cron", 0],
++      ["gmail.list_history", "cron", 0],
++    ]);
++  });
++
++  it.each(["mcp", "http"] as const)("a %s mail_watch.list_pending_mail call still writes its outcome-only row, next to a successful cron run that writes none", async (route) => {
++    const s = await watching();
++    await insertItem(s.db, itemRow({ id: "i1", connection_name: "work", subject: "Deployment failed for ledger-9QX", dedup_key: "key-i1" }));
++    await s.tick(M0 + 10);
++    const response = route === "mcp" ? await callMcp(s, "mail_watch.list_pending_mail", {}) : await callHttp(s, "mail_watch.list_pending_mail", {});
++    expect(response.text).toContain("ledger-9QX");
++    const rows = await runRows(s);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ action_id: "mail_watch.list_pending_mail", caller: route, ok: 1 });
++    const value = JSON.parse(rows[0]!.value) as Record<string, unknown>;
++    expect("inputSummary" in value).toBe(false);
++    expect("outputSummary" in value).toBe(false);
++    expect(JSON.stringify(rows)).not.toContain("ledger-9QX");
++  });
++
++  it("a non-mail_watch HTTP action still writes its full row with summaries (control)", async () => {
++    const s = await watching();
++    await s.tick(M0 + 10);
++    const response = await callHttp(s, "gmail.get_profile", {}, "work");
++    expect(response.status).toBe(200);
++    const rows = await runRows(s);
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ action_id: "gmail.get_profile", caller: "http", ok: 1 });
++    const value = JSON.parse(rows[0]!.value) as Record<string, unknown>;
++    expect(value.inputSummary).toBeDefined();
++    expect(value.outputSummary).toBeDefined();
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #101 through the Worker: an alias that is deleted and recreated as a different account must not hand the
++// old account's items to the new one. The cursor records the id of the connection the name resolved to; a mismatch
++// hides the items at once (list and acknowledge) and the next poll deletes them. Real stores, real ActionRunner, real
++// connection ids; nothing about how the watcher resolves the id is assumed. (Executor level: mail-watch-scope.test.ts.)
++// ---------------------------------------------------------------------------------------------------------------
++describe("an alias reused by a different account (patch 0015, #101)", () => {
++  const ctx = { waitUntil() {}, passThroughOnException() {} };
++  const OLD_SUBJECT = "Deployment failed for old-account-app";
++  const OTHER_SUBJECT = "Deployment failed for untouched-b-app";
++
++  async function connections(s: Setup) {
++    return new D1RuntimeDatabase(s.db, { secretCodec: await createWorkerSecretCodec(s.env.OOMOL_CONNECT_ENCRYPTION_KEY!) }).connectionStore;
++  }
++
++  const credentialFor = (name: string, email: string) => ({
++    authType: "oauth2" as const,
++    accessToken: `token-${name}`,
++    tokenType: "Bearer",
++    metadata: {},
++    profile: { accountId: email, displayName: email, grantedScopes: [] },
++  });
++
++  /** Watches a and b, runs the first poll (cursors with their connection ids), and stores one item for each. */
++  async function watched() {
++    const info = vi.spyOn(console, "info").mockImplementation(() => {});
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    const error = vi.spyOn(console, "error").mockImplementation(() => {});
++    const s = await setup({ names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a,gmail:b" } });
++    await s.tick(M0);
++    const store = await connections(s);
++    const oldId = (await store.get("gmail", "a"))!.id;
++    const bId = (await store.get("gmail", "b"))!.id;
++    await insertItem(s.db, itemRow({ id: "old-1", connection_name: "a", gmail_message_id: "g-old-1", subject: OLD_SUBJECT, dedup_key: "k-old-1" }));
++    await insertItem(s.db, itemRow({ id: "old-2", connection_name: "a", gmail_message_id: "g-old-2", subject: `${OLD_SUBJECT} again`, dedup_key: "k-old-2" }));
++    await insertItem(s.db, itemRow({ id: "b-1", connection_name: "b", gmail_message_id: "g-b-1", subject: OTHER_SUBJECT, dedup_key: "k-b-1" }));
++    return { s, store, oldId, bId, warn, info, error };
++  }
++
++  /** The connection is deleted and the name is saved again for another Gmail account (a new connection id). */
++  async function replaceAccount(s: Setup, store: Awaited<ReturnType<typeof connections>>, name: string) {
++    await store.delete("gmail", name);
++    s.mailboxes[name] = new FakeMailbox({ prefix: "z", email: "new-owner@example.org", startHistoryId: 5000 });
++    return (await store.set("gmail", name, credentialFor(name, "new-owner@example.org"))).id;
++  }
++
++  async function listText(s: Setup): Promise<string> {
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/mail_watch.list_pending_mail`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input: {} }),
++      }),
++      s.env,
++      ctx,
++    );
++    return JSON.stringify(await response.json());
++  }
++
++  async function acknowledge(s: Setup, ids: string[]) {
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/mail_watch.acknowledge_mail`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input: { ids } }),
++      }),
++      s.env,
++      ctx,
++    );
++    return JSON.stringify(await response.json());
++  }
++
++  const itemIds = async (s: Setup, name: string) =>
++    (await s.watchRows<{ id: string; connection_name: string }>("email_watch_items")).filter((row) => row.connection_name === name).map((row) => row.id).sort();
++  const cursorOfName = async (s: Setup, name: string) =>
++    (await s.watchRows<{ connection_name: string; connection_id: string | null; history_id: string }>("email_watch_cursors")).find((row) => row.connection_name === name);
++  const nameOnlyWarnings = (warn: { mock: { calls: unknown[][] } }, name: string) =>
++    warn.mock.calls.filter((call) => JSON.stringify(call[1]) === JSON.stringify({ connectionName: name }));
++
++  it("the first poll records the connection id each name resolved to", async () => {
++    const { s, oldId, bId } = await watched();
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: oldId });
++    expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: bId });
++    expect(oldId).not.toBe(bId);
++  });
++
++  it("before any poll: the list shows none of the old account's items and acknowledge touches none, while the other alias is unaffected", async () => {
++    const { s, store, oldId } = await watched();
++    const newId = await replaceAccount(s, store, "a");
++    expect(newId).not.toBe(oldId);
++
++    const text = await listText(s);
++    expect(text).not.toContain(OLD_SUBJECT);
++    expect(text).toContain(OTHER_SUBJECT);
++    expect(await acknowledge(s, ["old-1", "old-2", "b-1"])).toContain('"acknowledged":1');
++    const statuses = Object.fromEntries((await s.watchRows<{ id: string; status: string }>("email_watch_items")).map((row) => [row.id, row.status]));
++    expect(statuses).toEqual({ "old-1": "pending", "old-2": "pending", "b-1": "acknowledged" });
++    // Nothing has been deleted yet: only a poll does that.
++    expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++  });
++
++  it("the next poll deletes the old items and cursor, logs one warn line with only the name, and starts fresh", async () => {
++    const { s, store, oldId, bId, warn, info, error } = await watched();
++    const newId = await replaceAccount(s, store, "a");
++    const requestsBefore = s.mailboxes.a!.requests.length;
++    await s.tick(M0 + 10);
++
++    expect(await itemIds(s, "a")).toEqual([]);
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: newId, history_id: "5000" });
++    // Fresh start: the new mailbox is asked for its profile and for nothing else.
++    expect(s.mailboxes.a!.requests.slice(requestsBefore).map((request) => request.kind)).toEqual(["profile"]);
++    // The other alias is untouched.
++    expect(await itemIds(s, "b")).toEqual(["b-1"]);
++    expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: bId });
++
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++    expect(nameOnlyWarnings(warn, "b")).toHaveLength(0);
++    const text = JSON.stringify([...warn.mock.calls, ...info.mock.calls, ...error.mock.calls]);
++    for (const secret of [oldId, newId, "new-owner@example.org", OWNER_EMAIL, OLD_SUBJECT, "old-1", "g-old-1"]) {
++      expect(text, secret).not.toContain(secret);
++    }
++    // And the list no longer has the old items either, nor does anything come back on the poll after.
++    expect(await listText(s)).not.toContain(OLD_SUBJECT);
++    s.mailboxes.a!.deliver(vercelFailure("Deployment failed for the-new-account-app"));
++    await s.tick(M0 + 20);
++    expect((await s.watchRows<{ subject: string; connection_name: string }>("email_watch_items")).filter((row) => row.connection_name === "a").map((row) => row.subject)).toEqual([
++      "Deployment failed for the-new-account-app",
++    ]);
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++  });
++
++  it("a poll with nothing changed deletes nothing, logs no such line and makes no Gmail call beyond the history read", async () => {
++    const { s, warn } = await watched();
++    const before = { a: s.mailboxes.a!.requests.length, b: s.mailboxes.b!.requests.length };
++    await s.tick(M0 + 10);
++    expect(s.mailboxes.a!.requests.slice(before.a).map((request) => request.kind)).toEqual(["history"]);
++    expect(s.mailboxes.b!.requests.slice(before.b).map((request) => request.kind)).toEqual(["history"]);
++    expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++    expect(await itemIds(s, "b")).toEqual(["b-1"]);
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(0);
++    expect(nameOnlyWarnings(warn, "b")).toHaveLength(0);
++  });
++
++  it("a pre-patch cursor with a null connection_id is adopted: the id is recorded, the items stay, nothing is logged", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    const id = (await (await connections(s)).get("gmail", "work"))!.id;
++    await insertCursor(s.db, { connection_name: "work", history_id: "1000", last_run_at: new Date(T0 - HOUR).toISOString() });
++    await insertItem(s.db, itemRow({ id: "pre-1", connection_name: "work", subject: OLD_SUBJECT, dedup_key: "k-pre-1" }));
++    expect((await s.watchRows<{ connection_id: string | null }>("email_watch_cursors"))[0]!.connection_id).toBeNull();
++    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for a-fresh-one"));
++    await s.tick(M0 + 10);
++    expect((await s.watchRows<{ connection_id: string | null }>("email_watch_cursors"))[0]!.connection_id).toBe(id);
++    // Adopting the id costs no Gmail call: the poll reads history and the one new message, and never the profile.
++    expect(s.mailboxes.work!.requests.map((request) => request.kind)).toEqual(["history", "message"]);
++    expect((await s.watchRows<{ id: string }>("email_watch_items")).map((row) => row.id).includes("pre-1")).toBe(true);
++    expect(await s.watchRows("email_watch_items")).toHaveLength(2);
++    expect(warn.mock.calls.filter((call) => JSON.stringify(call[1]) === JSON.stringify({ connectionName: "work" }))).toEqual([]);
++  });
++
++  it("a name that no longer resolves has its items and cursor deleted, one warn line, and no Gmail call", async () => {
++    const { s, store, warn } = await watched();
++    await store.delete("gmail", "a");
++    const requestsBefore = s.mailboxes.a!.requests.length;
++    await s.tick(M0 + 10);
++    expect(await itemIds(s, "a")).toEqual([]);
++    expect(await cursorOfName(s, "a")).toBeUndefined();
++    expect(s.mailboxes.a!.requests.length).toBe(requestsBefore);
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++    expect(await itemIds(s, "b")).toEqual(["b-1"]);
++    expect(await cursorOfName(s, "b")).toBeDefined();
++    expect(await listText(s)).not.toContain(OLD_SUBJECT);
++  });
++
++  it("when that name is saved again for another account the watch starts fresh for it", async () => {
++    const { s, store } = await watched();
++    await store.delete("gmail", "a");
++    await s.tick(M0 + 10);
++    const newId = await replaceAccount(s, store, "a");
++    await s.tick(M0 + 20);
++    expect(await itemIds(s, "a")).toEqual([]);
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: newId, history_id: "5000" });
++  });
++
++  it("a transient failure while resolving the name deletes nothing, and the next poll that can resolve does the cleanup", async () => {
++    const { s, store, oldId, warn } = await watched();
++    await replaceAccount(s, store, "a");
++    s.db.failWhen = (query) => /\bfrom\s+connections\b/i.test(query);
++    await s.tick(M0 + 10);
++    expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: oldId });
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(0);
++
++    s.db.failWhen = undefined;
++    await s.tick(M0 + 20);
++    expect(await itemIds(s, "a")).toEqual([]);
++    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++  });
++});
+diff --git a/src/server/email-watch/gmail-access.test.ts b/src/server/email-watch/gmail-access.test.ts
+index 4ced6617..1fbde714 100644
+--- a/src/server/email-watch/gmail-access.test.ts
++++ b/src/server/email-watch/gmail-access.test.ts
+@@ -11,7 +11,8 @@ import type { RunActionInput } from "../actions/action-runner.ts";
+ //   `call` REJECTS (throws) before touching the runner unless the call is one of
+ //     gmail.get_profile | gmail.list_history | gmail.fetch_message_by_message_id with input.format === "metadata".
+ //   Otherwise it calls runner.run exactly once with { actionId, input, connectionName, policy,
+-//     caller: "cron", audit: "outcome" } and returns what the runner returns.
++//     caller: "cron", audit: "failures" } and returns what the runner returns.
++//   (Patch 0015, #97: audit was "outcome". "failures" is outcome-only too and writes no run row for a successful run.)
+ 
+ const policy = new ActionPolicyService().createSnapshot();
+ const HEADERS = ["From", "Subject", "Authentication-Results", "X-GitHub-Reason", "List-Id"];
+@@ -90,7 +91,7 @@ describe("the watcher's Gmail allowlist", () => {
+     expect(run).not.toHaveBeenCalled();
+   });
+ 
+-  it("runs gmail.get_profile through the runner as the cron caller with outcome-only audit", async () => {
++  it("runs gmail.get_profile through the runner as the cron caller with the failures-only audit mode", async () => {
+     const { run, client } = setup();
+     const result = await client.call("work", "gmail.get_profile", {});
+     expect(run).toHaveBeenCalledTimes(1);
+@@ -99,7 +100,7 @@ describe("the watcher's Gmail allowlist", () => {
+       input: {},
+       connectionName: "work",
+       caller: "cron",
+-      audit: "outcome",
++      audit: "failures",
+       policy,
+     });
+     expect(result).toMatchObject({ executionId: "e1", result: { ok: true } });
+@@ -115,7 +116,7 @@ describe("the watcher's Gmail allowlist", () => {
+       input,
+       connectionName: "ops",
+       caller: "cron",
+-      audit: "outcome",
++      audit: "failures",
+     });
+   });
+ 
+@@ -129,7 +130,7 @@ describe("the watcher's Gmail allowlist", () => {
+       input,
+       connectionName: "work",
+       caller: "cron",
+-      audit: "outcome",
++      audit: "failures",
+     });
+   });
+ 
+diff --git a/src/server/email-watch/gmail-access.ts b/src/server/email-watch/gmail-access.ts
+index c46ba93d..dd2474ff 100644
+--- a/src/server/email-watch/gmail-access.ts
++++ b/src/server/email-watch/gmail-access.ts
+@@ -3,6 +3,8 @@ import type { ActionPolicySnapshot } from "../../core/action-policy.ts";
+ 
+ export interface WatchActionRunner {
+   run(input: RunActionInput): Promise<ActionRunResult | undefined>;
++  /** The Gmail connection id the name resolves to now, undefined when it has none. Optional: no id, no alias check. */
++  resolveGmailConnectionId?(connectionName: string): Promise<string | undefined>;
+ }
+ 
+ export interface WatchGmailClient {
+@@ -22,13 +24,13 @@ export const WATCH_ACTION_IDS: { getProfile: string; listHistory: string; fetchM
+ /**
+  * The only way the watcher reaches Gmail. It allows exactly three reads (profile, history, and a message fetched
+  * with format "metadata") and refuses everything else before the runner is called. Allowed calls still go
+- * through ActionRunner, so deployment policy and connection grants apply, and they record an outcome-only run row.
++ * through ActionRunner, so deployment policy and connection grants apply, and a failed one records an outcome-only run row (a successful one records none).
+  */
+ export function createWatchGmailClient(runner: WatchActionRunner, policy: ActionPolicySnapshot): WatchGmailClient {
+   return {
+     async call(connectionName, actionId, input) {
+       assertAllowed(actionId, input);
+-      return runner.run({ actionId, input, connectionName, caller: "cron", audit: "outcome", policy });
++      return runner.run({ actionId, input, connectionName, caller: "cron", audit: "failures", policy });
+     },
+   };
+ }
+diff --git a/src/server/email-watch/mail-watch-provider.test.ts b/src/server/email-watch/mail-watch-provider.test.ts
+index 2d6716a1..28a2061e 100644
+--- a/src/server/email-watch/mail-watch-provider.test.ts
++++ b/src/server/email-watch/mail-watch-provider.test.ts
+@@ -23,7 +23,7 @@ import { validateActionInput } from "../../core/validation.ts";
+ import { resolveMcpGrantScope } from "../cloudflare/mcp-grant-scope.ts";
+ import type { CloudflareEnv } from "../cloudflare/cloudflare-env.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+-import { DAY, HOUR, T0, insertItem, itemRow, selectAll } from "./test-support.ts";
++import { DAY, HOUR, T0, createLogCapture, insertItem, itemRow, selectAll } from "./test-support.ts";
+ import { provider } from "../../providers/mail_watch/definition.ts";
+ import { createMailWatchExecutors, executors as unboundExecutors } from "../../providers/mail_watch/executors.ts";
+ 
+@@ -319,3 +319,83 @@ describe("read-only MCP grant (patch 0004)", () => {
+     expect(policy.evaluate(byId["mail_watch.acknowledge_mail"]!)).toMatchObject({ allowed: false, code: "action_not_allowed" });
+   });
+ });
++
++// Patch 0015, #102: one statement lists the items of at most 90 connections (D1 binds at most 100 values). When more
++// connections than that have items, the rest are left out; that is logged once, as a count and no names.
++describe("the 90-connection cap on list_pending_mail (patch 0015, #102)", () => {
++  async function withConnections(count: number) {
++    const s = setup();
++    for (let n = 0; n < count; n += 1) {
++      const name = `conn-${String(n).padStart(3, "0")}`;
++      await insertItem(s.db, itemRow({ id: `item-${n}`, connection_name: name, received_at: iso(T0 - n * 1000), created_at: iso(T0 - n * 1000) }));
++    }
++    return s;
++  }
++
++  async function listWithLog(s: ReturnType<typeof setup>, allowed: (name: string) => boolean = () => true) {
++    const log = createLogCapture();
++    const executors = createMailWatchExecutors({ database: s.db, enabled: true, profileEmail: async () => "owner@example.org", now: () => T0 });
++    const result = await executors["mail_watch.list_pending_mail"]!(
++      { limit: 100 },
++      { getCredential: async () => undefined, isConnectionAllowed: async (name: string) => allowed(name), logger: log.logger },
++    );
++    return { result, log };
++  }
++
++  it("with 95 connections holding items: lists 90 of them and logs one warn line with the count 5", async () => {
++    const s = await withConnections(95);
++    const { result, log } = await listWithLog(s);
++    expect(output<{ items: Item[] }>(result).items).toHaveLength(90);
++    const warns = log.entries.filter((entry) => entry.level === "warn");
++    expect(warns).toHaveLength(1);
++    expect(warns[0]!.fields).toEqual({ omitted: 5 });
++    expect(log.entries.filter((entry) => entry.level !== "warn")).toEqual([]);
++  });
++
++  it("the log line names no connection, item or subject", async () => {
++    const s = await withConnections(95);
++    const { log } = await listWithLog(s);
++    expect(log.entries).toHaveLength(1);
++    const text = log.text();
++    expect(text).not.toContain("conn-");
++    expect(text).not.toContain("item-");
++    expect(text).not.toContain("Seed subject");
++    expect(text).not.toContain("example.org");
++  });
++
++  it("with 91 connections the count is 1", async () => {
++    const s = await withConnections(91);
++    const { log } = await listWithLog(s);
++    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([{ omitted: 1 }]);
++  });
++
++  it("with exactly 90 connections, or fewer, it logs nothing", async () => {
++    for (const count of [1, 89, 90]) {
++      const s = await withConnections(count);
++      const { result, log } = await listWithLog(s);
++      expect(output<{ items: Item[] }>(result).items).toHaveLength(count);
++      expect(log.entries, String(count)).toEqual([]);
++      database?.close();
++      database = undefined;
++    }
++  });
++
++  it("counts only the connections the caller may use: 100 with items, 92 allowed, 2 omitted", async () => {
++    const s = await withConnections(100);
++    const { result, log } = await listWithLog(s, (name) => Number(name.slice(-3)) < 92);
++    expect(output<{ items: Item[] }>(result).items).toHaveLength(90);
++    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([{ omitted: 2 }]);
++  });
++
++  it("with a caller that may use only a few of the 100 connections, nothing is omitted and nothing is logged", async () => {
++    const s = await withConnections(100);
++    const { result, log } = await listWithLog(s, (name) => Number(name.slice(-3)) < 3);
++    expect(output<{ items: Item[] }>(result).items).toHaveLength(3);
++    expect(log.entries).toEqual([]);
++  });
++
++  it("a run without a logger still lists (the log is a diagnostic, not a requirement)", async () => {
++    const s = await withConnections(95);
++    expect(output<{ items: Item[] }>(await s.list({ limit: 100 })).items).toHaveLength(90);
++  });
++});
+diff --git a/src/server/email-watch/mail-watch-scope.test.ts b/src/server/email-watch/mail-watch-scope.test.ts
+index 613224d9..66ba214c 100644
+--- a/src/server/email-watch/mail-watch-scope.test.ts
++++ b/src/server/email-watch/mail-watch-scope.test.ts
+@@ -33,7 +33,7 @@ import { ProviderLoader } from "../../providers/provider-loader.ts";
+ import { ActionRunner } from "../actions/action-runner.ts";
+ import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+-import { HOUR, T0, insertItem, itemRow, selectAll } from "./test-support.ts";
++import { HOUR, T0, insertCursor, insertItem, itemRow, selectAll } from "./test-support.ts";
+ 
+ const EMAILS: Record<string, string> = { a: "a-owner@example.org", b: "b-owner@example.net" };
+ const iso = (ms: number) => new Date(ms).toISOString();
+@@ -96,10 +96,11 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
+   const catalog = createCatalogStore([JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))], {
+     executableActionIds: mailWatch.actions.map((action) => action.id),
+   });
++  const watchDatabase: D1DatabaseBinding = wrap ? wrap(binding) : binding;
+   const providerLoader = new ProviderLoader({
+     mail_watch: async () => ({
+       executors: createMailWatchExecutors({
+-        database: wrap ? wrap(binding) : binding,
++        database: watchDatabase,
+         enabled: true,
+         profileEmail: async (name) => EMAILS[name],
+         now: () => T0,
+@@ -126,6 +127,8 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
+   };
+   return {
+     binding,
++    /** The database the executors use: an InjectingD1 when `wrap` made one. */
++    watchDatabase,
+     ids,
+     list: (allowedConnections?: string[], input: Record<string, unknown> = {}) => run("list_pending_mail", input, allowedConnections),
+     acknowledge: (allowedConnections: string[] | undefined, itemIds: string[]) => run("acknowledge_mail", { ids: itemIds }, allowedConnections),
+@@ -440,6 +443,8 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+       const result = await r.executors["mail_watch.list_pending_mail"]!({}, r.context);
+       expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList);
+       expect(JSON.stringify(result)).not.toContain("intruder");
++      // Patch 0015 (#102): a query rewrite that stops the injection must fail the test, not pass it vacuously.
++      expect(r.db.injected).toBeGreaterThan(0);
+     });
+ 
+     it("list with limit 1 returns at most the newest allowed item, never an intruder", async () => {
+@@ -447,6 +452,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+       await r.seed();
+       const result = await r.executors["mail_watch.list_pending_mail"]!({ limit: 1 }, r.context);
+       expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList.slice(0, 1));
++      expect(r.db.injected).toBeGreaterThan(0);
+     });
+ 
+     it("acknowledge never touches the intruder, and acknowledges exactly the allowed rows it was given", async () => {
+@@ -459,6 +465,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+       const rows = await selectAll<{ id: string; status: string }>(r.inner, "select id, status from email_watch_items order by id");
+       expect(rows.filter((row) => row.status === "acknowledged").map((row) => row.id).sort()).toEqual([...testCase.expectedAcknowledged].sort());
+       expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
++      expect(r.db.injected).toBeGreaterThan(0);
+     });
+   });
+ });
+@@ -469,6 +476,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
+     const result = await s.list([s.ids.a!]);
+     expect(items(result).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
+     expect(JSON.stringify(result)).not.toContain("intruder");
++    expect((s.watchDatabase as InjectingD1).injected).toBeGreaterThan(0);
+   });
+ 
+   it("acknowledge under that token leaves the intruder rows pending", async () => {
+@@ -477,6 +485,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
+     expect(await s.acknowledge([s.ids.a!], given)).toMatchObject({ ok: true, output: { acknowledged: 1 } });
+     const rows = await statusOf(s);
+     expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
++    expect((s.watchDatabase as InjectingD1).injected).toBeGreaterThan(0);
+   });
+ });
+ 
+@@ -518,3 +527,85 @@ describe("R3.8 (b) deny by default: no isConnectionAllowed on the context", () =
+     expect(items(await s.list(undefined)).length).toBe(7);
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #101: an alias that now points at a different account must not show or touch the items stored for the
++// old one, even before the next poll deletes them. The cursor records the id of the connection the name resolved to
++// (`connection_id`). A name whose cursor has a connection_id that differs from the name's current connection id is
++// hidden from list_pending_mail and untouched by acknowledge_mail. A null connection_id (a row from before the patch)
++// and a name with no cursor are not hidden. Everything here goes through the real ActionRunner and its connection
++// service: nothing about how the current id is resolved is assumed.
++// ---------------------------------------------------------------------------------------------------------------
++describe("an alias reused by another account (patch 0015, #101)", () => {
++  const OLD_ID = "00000000-0000-4000-8000-0000000000aa";
++
++  async function withCursors(cursors: { a?: string | null; b?: string | null }) {
++    const s = await setup();
++    const base = { history_id: "1000", last_run_at: iso(T0 - HOUR) };
++    if (cursors.a !== undefined) await insertCursor(s.binding, { connection_name: "a", ...base, connection_id: cursors.a });
++    if (cursors.b !== undefined) await insertCursor(s.binding, { connection_name: "b", ...base, connection_id: cursors.b });
++    return s;
++  }
++
++  it("lists nothing for a name whose cursor records another connection id, and everything else as before", async () => {
++    const s = await withCursors({ a: null, b: OLD_ID });
++    // `a` is recorded under its own current id.
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'a'").bind(s.ids.a).run();
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a", "ghost"]);
++  });
++
++  it("hides the old account's watch_gap item too, and does not delete anything while listing", async () => {
++    const s = await withCursors({ a: null, b: OLD_ID });
++    expect(items(await s.list(undefined)).map((item) => item.id)).not.toContain("gap-b");
++    expect((await statusOf(s)).map((row) => row.id).sort()).toEqual(["a1", "a2", "b1", "b2", "gap-a", "gap-b", "ghost"]);
++    expect(await selectAll(s.binding, "select connection_name from email_watch_cursors order by connection_name")).toEqual([
++      { connection_name: "a" },
++      { connection_name: "b" },
++    ]);
++  });
++
++  it("a cursor with a null connection_id (a pre-patch row) is not hidden", async () => {
++    const s = await withCursors({ a: null, b: null });
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b", "ghost"]);
++  });
++
++  it("a name with no cursor at all is not hidden", async () => {
++    const s = await setup();
++    expect(items(await s.list(undefined))).toHaveLength(7);
++  });
++
++  it("shows the items again once the cursor records the name's current id", async () => {
++    const s = await withCursors({ b: OLD_ID });
++    expect(items(await s.list(undefined)).map((item) => item.id)).not.toContain("b1");
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(s.ids.b).run();
++    expect(items(await s.list(undefined)).map((item) => item.id)).toContain("b1");
++  });
++
++  it("hidden items do not use up the limit, and the category filter and name filter apply to what is left", async () => {
++    const s = await withCursors({ b: OLD_ID });
++    // b2 is the newest item of all and is hidden: limit 1 is a2, not an empty page.
++    expect(items(await s.list(undefined, { limit: 1 })).map((item) => item.id)).toEqual(["a2"]);
++    expect(items(await s.list(undefined, { category: "deploy_failed" })).map((item) => item.id)).toEqual(["a1", "ghost"]);
++    expect(items(await s.list(undefined, { connectionName: "b" }))).toEqual([]);
++    expect(items(await s.list(undefined, { connectionName: "a" })).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++  });
++
++  it("a token scoped to the reused alias's connection sees nothing of the old account's items", async () => {
++    const s = await withCursors({ b: OLD_ID });
++    expect(items(await s.list([s.ids.b!]))).toEqual([]);
++    expect(items(await s.list([s.ids.a!, s.ids.b!])).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++  });
++
++  it("acknowledge_mail changes nothing for a hidden name's items and counts only the visible ones", async () => {
++    const s = await withCursors({ a: null, b: OLD_ID });
++    expect(await s.acknowledge(undefined, ["a1", "b1", "b2", "gap-b"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
++    expect(status).toMatchObject({ a1: "acknowledged", b1: "pending", b2: "pending", "gap-b": "pending" });
++  });
++
++  it("acknowledge_mail still acknowledges the items of a name whose cursor records its current id or null", async () => {
++    const s = await withCursors({ a: null, b: null });
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(s.ids.b).run();
++    expect(await s.acknowledge(undefined, ["a1", "b1"])).toMatchObject({ ok: true, output: { acknowledged: 2 } });
++  });
++});
+diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
+index e4e1438f..5af9c39f 100644
+--- a/src/server/email-watch/migration.test.ts
++++ b/src/server/email-watch/migration.test.ts
+@@ -38,10 +38,10 @@ describe("0019_email_watch migration (sqlite and D1)", () => {
+     expect(names.indexOf("0019_email_watch.sql")).toBe(names.indexOf("0018_connection_retirement.sql") + 1);
+   });
+ 
+-  it("creates email_watch_cursors with exactly the specified columns", async () => {
++  it("creates email_watch_cursors with exactly the specified columns (after every migration: 0022 adds three, patch 0015)", async () => {
+     const found = await columns(open(), "email_watch_cursors");
+     expect(found.map((column) => column.name).sort()).toEqual(
+-      ["catch_up", "connection_name", "history_id", "last_run_at", "page_token"].sort(),
++      ["catch_up", "connection_id", "connection_name", "failing_notice_at", "history_id", "last_run_at", "last_success_at", "page_token"].sort(),
+     );
+     const byName = Object.fromEntries(found.map((column) => [column.name, column]));
+     expect(byName.connection_name!.pk).toBe(1);
+@@ -400,6 +400,116 @@ describe("the purge's distinct connection_name read uses an index (patch 0014, #
+   });
+ });
+ 
++// Patch 0015, #96 and #101: 0022 adds three nullable text columns to email_watch_cursors and backfills last_success_at
++// from last_run_at for the rows that exist. Postgres has the same file name in its own directory.
++describe("0022_email_watch_cursor_state migration (patch 0015)", () => {
++  const NAME = "0022_email_watch_cursor_state.sql";
++  const PREVIOUS = "0021_email_watch_drop_connection_index.sql";
++  const NEW_COLUMNS = ["connection_id", "failing_notice_at", "last_success_at"];
++
++  const sqlOf = (dialect: "sqlite" | "postgresql") =>
++    defaultMigrationSource.readMigrations(dialect).find((migration) => migration.name === NAME)?.sql;
++  const through = (name: string) => defaultMigrationSource.readMigrations("sqlite").filter((entry) => entry.name <= name);
++
++  it("comes right after 0021, in both the D1/SQLite and the Postgres directory", () => {
++    for (const dialect of ["sqlite", "postgresql"] as const) {
++      const names = defaultMigrationSource.readMigrations(dialect).map((migration) => migration.name);
++      expect(names, dialect).toContain(NAME);
++      expect(names.indexOf(NAME), dialect).toBe(names.indexOf(PREVIOUS) + 1);
++    }
++  });
++
++  it("adds three nullable text columns without a default, and keeps the five that were there", async () => {
++    const found = await columns(open(), "email_watch_cursors");
++    const byName = Object.fromEntries(found.map((column) => [column.name, column]));
++    for (const name of NEW_COLUMNS) {
++      expect(byName[name]?.type.toLowerCase(), name).toBe("text");
++      expect(byName[name], name).toMatchObject({ notnull: 0, dflt_value: null, pk: 0 });
++    }
++    expect(byName.connection_name).toMatchObject({ pk: 1 });
++    expect(byName.catch_up).toMatchObject({ notnull: 1, dflt_value: "0" });
++    expect(found).toHaveLength(8);
++  });
++
++  it("applies on top of a database that has 0021 and cursor rows: the rows stay and last_success_at is their last_run_at", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of through(PREVIOUS)) connection.exec(migration.sql);
++      connection.exec(`
++        insert into email_watch_cursors values ('work', '1', null, '2026-11-11T12:00:00.000Z', 0);
++        insert into email_watch_cursors values ('ops', '7', 'p20', '2026-11-09T08:30:00.000Z', 1);
++      `);
++      connection.exec(sqlOf("sqlite")!);
++      expect(
++        connection
++          .prepare("select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id from email_watch_cursors order by connection_name")
++          .all(),
++      ).toEqual([
++        {
++          connection_name: "ops",
++          history_id: "7",
++          page_token: "p20",
++          last_run_at: "2026-11-09T08:30:00.000Z",
++          catch_up: 1,
++          last_success_at: "2026-11-09T08:30:00.000Z",
++          failing_notice_at: null,
++          connection_id: null,
++        },
++        {
++          connection_name: "work",
++          history_id: "1",
++          page_token: null,
++          last_run_at: "2026-11-11T12:00:00.000Z",
++          catch_up: 0,
++          last_success_at: "2026-11-11T12:00:00.000Z",
++          failing_notice_at: null,
++          connection_id: null,
++        },
++      ]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("applies on a database with no cursor rows and leaves a row inserted afterwards with null state columns", async () => {
++    const db = open();
++    await insertCursor(db, { connection_name: "work", history_id: "1", last_run_at: "2026-11-11T12:00:00.000Z" });
++    expect(await selectAll(db, "select last_success_at, failing_notice_at, connection_id from email_watch_cursors")).toEqual([
++      { last_success_at: null, failing_notice_at: null, connection_id: null },
++    ]);
++    await insertCursor(db, {
++      connection_name: "ops",
++      history_id: "2",
++      last_run_at: "2026-11-11T12:00:00.000Z",
++      last_success_at: "2026-11-10T00:00:00.000Z",
++      failing_notice_at: "2026-11-11T00:00:00.000Z",
++      connection_id: "conn-1",
++    });
++    expect(await selectAll(db, "select last_success_at, failing_notice_at, connection_id from email_watch_cursors where connection_name = 'ops'")).toEqual([
++      { last_success_at: "2026-11-10T00:00:00.000Z", failing_notice_at: "2026-11-11T00:00:00.000Z", connection_id: "conn-1" },
++    ]);
++  });
++
++  it("does not touch the items table, its indexes or its rows", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of through(PREVIOUS)) connection.exec(migration.sql);
++      connection.exec(`
++        insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1');
++      `);
++      const itemColumns = () => connection.prepare("pragma table_info(email_watch_items)").all();
++      const indexes = () => connection.prepare("select name from sqlite_master where type = 'index' and tbl_name = 'email_watch_items' order by name").all();
++      const before = { columns: itemColumns(), indexes: indexes() };
++      connection.exec(sqlOf("sqlite")!);
++      expect({ columns: itemColumns(), indexes: indexes() }).toEqual(before);
++      expect(connection.prepare("select id from email_watch_items").all()).toEqual([{ id: "p" }]);
++    } finally {
++      connection.close();
++    }
++  });
++});
++
+ describe("Postgres parity", () => {
+   it("has the same 0019 file name as the D1 migration", () => {
+     const names = defaultMigrationSource.readMigrations("postgresql").map((migration) => migration.name);
+diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
+index 44c0522a..4f55157e 100644
+--- a/src/server/email-watch/rules.ts
++++ b/src/server/email-watch/rules.ts
+@@ -189,9 +189,13 @@ function stripControlCharacters(text: string): string {
+   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+ }
+ 
+-// Every Unicode format character (Cf: soft hyphen, zero-width, directional marks, tag characters, ...) plus the
+-// combining grapheme joiner (U+034F, category Mn), which renders as nothing.
+-const INVISIBLE = /[\p{Cf}\u034f]/gu;
++// Characters that render as nothing or that hide a digit run: every Default_Ignorable_Code_Point (all of Cf, the
++// combining grapheme joiner U+034F, the Hangul fillers, the variation selectors, the Mongolian free variation
++// selectors), the braille blank U+2800, the combining enclosing keycap U+20E3, and any combining mark that follows a
++// decimal digit (and further marks in the same sequence). Marks after letters stay, so "café" keeps its accent.
++const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u2800]|\u20e3/gu;
++// Applied after INVISIBLE, so a mark that only follows the digit once an invisible character is gone is caught too.
++const MARK_AFTER_DIGIT = /(?<=\p{Nd}\p{M}*)\p{M}/gu;
+ // One separator at most between digits: whitespace (incl. no-break spaces), ".", "-", U+2010-U+2015 and U+2212.
+ const CODE_RUN = /\p{Nd}(?:[\s.\u002d\u2010-\u2015\u2212]?\p{Nd}){3,}/gu;
+ 
+@@ -201,7 +205,7 @@ const CODE_RUN = /\p{Nd}(?:[\s.\u002d\u2010-\u2015\u2212]?\p{Nd}){3,}/gu;
+  * digits, have fewer than 4 digits or use a multi-character separator are left alone (documented residual).
+  */
+ export function redactCodes(subject: string): string {
+-  return subject.replace(INVISIBLE, "").replace(CODE_RUN, "[redacted]");
++  return subject.replace(INVISIBLE, "").replace(MARK_AFTER_DIGIT, "").replace(CODE_RUN, "[redacted]");
+ }
+ 
+ function truncate(subject: string): string {
+diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
+index 6c19369a..ad705667 100644
+--- a/src/server/email-watch/test-support.ts
++++ b/src/server/email-watch/test-support.ts
+@@ -435,15 +435,37 @@ export async function insertItem(database: SqlDatabase, row: ItemRow): Promise<v
+     .run();
+ }
+ 
++/**
++ * Seeds a cursor row. The three columns of migration 0022 (patch 0015) are written only when given, so a row seeded
++ * without them is a pre-0022 row: null `last_success_at`, `failing_notice_at` and `connection_id`.
++ */
+ export async function insertCursor(
+   database: SqlDatabase,
+-  row: { connection_name: string; history_id: string; page_token?: string | null; last_run_at: string; catch_up?: number },
++  row: {
++    connection_name: string;
++    history_id: string;
++    page_token?: string | null;
++    last_run_at: string;
++    catch_up?: number;
++    last_success_at?: string | null;
++    failing_notice_at?: string | null;
++    connection_id?: string | null;
++  },
+ ): Promise<void> {
++  const columns: Record<string, unknown> = {
++    connection_name: row.connection_name,
++    history_id: row.history_id,
++    page_token: row.page_token ?? null,
++    last_run_at: row.last_run_at,
++    catch_up: row.catch_up ?? 0,
++  };
++  for (const column of ["last_success_at", "failing_notice_at", "connection_id"] as const) {
++    if (row[column] !== undefined) columns[column] = row[column];
++  }
++  const names = Object.keys(columns);
+   await database
+-    .prepare(
+-      "insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up) values (?, ?, ?, ?, ?)",
+-    )
+-    .bind(row.connection_name, row.history_id, row.page_token ?? null, row.last_run_at, row.catch_up ?? 0)
++    .prepare(`insert into email_watch_cursors (${names.join(", ")}) values (${names.map(() => "?").join(", ")})`)
++    .bind(...Object.values(columns))
+     .run();
+ }
+ 
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index 9d93584b..fba212b5 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -160,7 +160,9 @@ describe("first run", () => {
+     await r.run();
+ 
+     expect(r.runner.calls.map((call) => call.actionId)).toEqual(["gmail.get_profile"]);
+-    expect(await cursorOf(r)).toEqual({
++    // Patch 0015 adds last_success_at, failing_notice_at and connection_id (migration 0022), so the row is no longer
++    // exactly these five columns; it is matched on them and the new columns are pinned in "failing connections".
++    expect(await cursorOf(r)).toMatchObject({
+       connection_name: "work",
+       history_id: "1002",
+       page_token: null,
+@@ -203,14 +205,15 @@ describe("first run", () => {
+ });
+ 
+ describe("what a run asks Gmail for", () => {
+-  it("goes through the runner as the cron caller with outcome-only audit, for every call", async () => {
++  it("goes through the runner as the cron caller with the failures-only audit mode, for every call (patch 0015, #97)", async () => {
+     const r = rig();
+     await seed(r);
+     r.mailboxes.work!.deliver(failed("Deployment failed for a"));
+     await r.run();
+     expect(r.runner.calls.length).toBeGreaterThanOrEqual(3);
+     for (const call of r.runner.calls) {
+-      expect(call).toMatchObject({ caller: "cron", audit: "outcome", connectionName: "work" });
++      // Patch 0015 (#97): was audit: "outcome". "failures" is outcome-only too, and writes no row for a successful run.
++      expect(call).toMatchObject({ caller: "cron", audit: "failures", connectionName: "work" });
+     }
+   });
+ 
+@@ -1106,6 +1109,9 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+     ["a dot between fullwidth digits", "\uff14\uff18\uff12.\uff19\uff11\uff13"],
+     ["a no-break space between Arabic-Indic digits", "\u0664\u0668\u0662\u00a0\u0669\u0661\u0663"],
+     ["a separator after every digit", "4\u00a08.2\u22129\u20131"],
++    // Patch 0015 (#119): 0014 pinned this one as "kept" (a mark and a selector are not format characters). The selector
++    // U+FE0F is now removed everywhere and a mark that follows a digit goes too, so the digits join into one run.
++    ["a combining acute accent U+0301 and a variation selector U+FE0F after a digit", "482\u0301\ufe0f913"],
+   ])("redacts a code written with %s", async (_name, code) => {
+     expect(await storedSubject(google(codeMail(code)))).toBe(REDACTED);
+   });
+@@ -1166,7 +1172,6 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+     ["a colon", "482:913"],
+     ["a plus sign", "482+913"],
+     ["a double vertical line U+2016, just outside the dash range", "482\u2016913"],
+-    ["a combining acute accent U+0301 and a variation selector U+FE0F, which are not format characters", "482\u0301\ufe0f913"],
+     ["an inverse plus-minus U+2213, just after the minus sign", "482\u2213913"],
+     ["a fullwidth hyphen-minus U+FF0D", "\uff14\uff18\uff12\uff0d\uff19\uff11\uff13"],
+     ["superscript digits, which are not decimal digits", "\u00b9\u00b2\u00b3\u2074\u2075"],
+@@ -1251,10 +1256,21 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+     };
+     const SEPARATORS = new Set([" ", "\u00a0", "\u202f", "\u2007", "\u3000", ".", "-", "\u2010", "\u2013", "\u2015", "\u2212"]);
+     // Patch 0014 (#114): every format character goes, not only the zero-width ones. FORMAT_CHARACTERS is a literal list.
+-    const REMOVED = new Set([...ZERO_WIDTH, ...FORMAT_CHARACTERS]);
++    // Patch 0015 (#119): U+FE0F goes everywhere too, and so does a combining mark that follows a decimal digit
++    // (after the removals above, so "4<zero-width><mark>" counts), together with the marks that follow it.
++    const REMOVED = new Set([...ZERO_WIDTH, ...FORMAT_CHARACTERS, "\ufe0f"]);
++    // The combining marks the random alphabets draw from: grave, acute, diaeresis (Mn) and Devanagari sign I (Mc).
++    const MARKS = new Set(["\u0300", "\u0301", "\u0308", "\u093f"]);
+ 
+     function unicodeOracle(raw: string): string {
+-      const text = [...raw].filter((char) => !REMOVED.has(char));
++      const visible = [...raw].filter((char) => !REMOVED.has(char));
++      const text: string[] = [];
++      let afterDigit = false;
++      for (const char of visible) {
++        if (MARKS.has(char) && afterDigit) continue;
++        text.push(char);
++        afterDigit = isDigit(char) || (afterDigit && MARKS.has(char));
++      }
+       let out = "";
+       let i = 0;
+       while (i < text.length) {
+@@ -1350,6 +1366,13 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+       // Patch 0014: format characters of every kind are removed too.
+       expect(unicodeOracle("a 1\u00ad2\u00ad3\u00ad4 b")).toBe("a [redacted] b");
+       expect(unicodeOracle("a 12\u200e3 b")).toBe("a 123 b");
++      // Patch 0015: U+FE0F always goes; a mark right after a digit goes (also one that is only right after it once a
++      // zero-width character is removed), a mark after a letter stays.
++      expect(unicodeOracle("a 4\u03018\u03012\u03019 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 4\u200b\u03018\u200b\u03012\u200b\u03019 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 12\u0301\u03083 b")).toBe("a 123 b");
++      expect(unicodeOracle("a caf\u0065\u0301 123 b")).toBe("a caf\u0065\u0301 123 b");
++      expect(unicodeOracle("a 1\ufe0f2\ufe0f3 b")).toBe("a 123 b");
+     });
+ 
+     it("matches the oracle on 90 random subjects mixing digits, separators and format characters of every kind (patch 0014, #114)", async () => {
+@@ -1374,6 +1397,10 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+         "/",
+         ",",
+         "\u0301",
++        "\u0301",
++        "\u0300",
++        "\u0308",
++        "\u093f",
+         "\ufe0f",
+         ...FORMAT_CHARACTERS,
+         ...FORMAT_CHARACTERS,
+@@ -1448,9 +1475,11 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+       expect(stored).toHaveLength("Deployment failed for my-app".length);
+     });
+ 
+-    it("leaves ordinary text, accents and an emoji with a variation selector alone", async () => {
++    // Patch 0015 (#119): 0014 kept U+FE0F here. It is a default-ignorable code point and is now removed (the emoji
++    // shows as text; accepted). The accents after letters stay.
++    it("leaves ordinary text and accents after letters alone, and removes the variation selector of an emoji", async () => {
+       expect(await storedSubject(failed("Deployment failed for caf\u00e9 e\u0301 \u2764\ufe0f"))).toBe(
+-        "Deployment failed for caf\u00e9 e\u0301 \u2764\ufe0f",
++        "Deployment failed for caf\u00e9 e\u0301 \u2764",
+       );
+     });
+ 
+@@ -1567,6 +1596,161 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+       for (const item of items) expect(item.subject).not.toMatch(/[\u00ad\u200e\u202a\u202c]|\p{Nd}/u);
+     });
+   });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // Patch 0015, #119: the invisible strip covers every Default_Ignorable_Code_Point, U+2800 and U+20E3, plus any
++  // combining mark that directly follows a decimal digit (and the marks after it). Expected values are literals.
++  // -------------------------------------------------------------------------------------------------------------
++  describe("the wider invisible strip (patch 0015, #119)", () => {
++    // Written out from the Unicode character database (DerivedCoreProperties, Default_Ignorable_Code_Point), apart
++    // from the two the spec adds on top of it (U+2800, U+20E3). None of them is in the 0014 lists above.
++    const ADDED_IGNORABLE: [string, string][] = [
++      ["Hangul choseong filler U+115F", "ᅟ"],
++      ["Hangul jungseong filler U+1160", "ᅠ"],
++      ["Hangul filler U+3164", "ㅤ"],
++      ["halfwidth Hangul filler U+FFA0", "ﾠ"],
++      ["Mongolian free variation selector one U+180B", "᠋"],
++      ["Mongolian free variation selector two U+180C", "᠌"],
++      ["Mongolian free variation selector three U+180D", "᠍"],
++      ["Mongolian free variation selector four U+180F", "᠏"],
++      ["variation selector-1 U+FE00", "︀"],
++      ["variation selector-15 U+FE0E", "︎"],
++      ["variation selector-16 U+FE0F", "️"],
++      ["variation selector-17 U+E0100", "\u{e0100}"],
++      ["variation selector-256 U+E01EF", "\u{e01ef}"],
++      ["Khmer inherent vowel U+17B4", "឴"],
++      ["Khmer inherent vowel U+17B5", "឵"],
++      ["the unassigned default-ignorable U+2065", "⁥"],
++      ["braille pattern blank U+2800 (added by the spec)", "⠀"],
++      ["combining enclosing keycap U+20E3 (added by the spec)", "⃣"],
++    ];
++
++    it.each([
++      ["Hangul fillers between the digits", "4ㅤ8ㅤ2ㅤ9"],
++      ["a variation selector inside the code", "48︀29"],
++      ["a Mongolian free variation selector", "4᠋829"],
++      ["a braille blank", "48⠀29"],
++      ["keycap digits", "4️⃣8️⃣2️⃣9️⃣"],
++      ["a combining acute accent after every digit", "4́8́2́9́"],
++      ["a supplementary variation selector", "4\u{e0100}829"],
++      ["a halfwidth Hangul filler beside a separator", "482ﾠ-ﾠ913"],
++      ["a combining grave and diaeresis after one digit (further marks of the same sequence)", "48̀̈2913"],
++      ["a Devanagari vowel sign (a spacing mark) after a digit", "48ि2913"],
++      ["marks after Arabic-Indic digits", "٤́٨́٢́٩"],
++      ["marks after fullwidth digits", "４́８́２́９"],
++      ["a mark that only follows the digit once a zero-width character is gone", "4​́8​́2​́9"],
++      ["a mark that only follows the digit once a Hangul filler is gone", "4ㅤ́8ㅤ́2ㅤ́9"],
++      ["a keycap sequence with a variation selector on only some digits", "4⃣8️⃣2⃣9"],
++    ])("redacts a code written with %s", async (_name, code) => {
++      const stored = await storedSubject(google(codeMail(code)));
++      expect(stored).toBe(REDACTED);
++      expect(stored).not.toMatch(/\p{Nd}/u);
++    });
++
++    it.each(ADDED_IGNORABLE)("removes %s from a stored subject and it cannot split a digit run", async (_name, char) => {
++      expect(await storedSubject(google(codeMail(`4${char}8${char}2${char}9`)))).toBe(REDACTED);
++      expect(await storedSubject(failed(`Deployment${char} failed for my${char}-app`))).toBe("Deployment failed for my-app");
++    });
++
++    it("keycap digits are stored as plain digits when too short to redact, with the keycap marks gone", async () => {
++      expect(await storedSubject(failed("Deployment failed 3️⃣ times"))).toBe("Deployment failed 3 times");
++    });
++
++    it("a mark after a digit is removed even when no code is hidden: the digit stays, the mark goes", async () => {
++      expect(await storedSubject(failed("Deployment failed for build 7́"))).toBe("Deployment failed for build 7");
++      expect(await storedSubject(failed("Deployment failed for build 7́̈ today"))).toBe("Deployment failed for build 7 today");
++    });
++
++    it("keeps a mark that follows a letter (an accent), and marks after a letter that sits next to a digit", async () => {
++      expect(await storedSubject(failed("Deployment failed for café 123"))).toBe("Deployment failed for café 123");
++      expect(await storedSubject(failed("Deployment failed for café 123"))).toBe("Deployment failed for café 123");
++      expect(await storedSubject(failed("Deployment failed for a1é b"))).toBe("Deployment failed for a1é b");
++    });
++
++    it("a mark after a separator after a digit stays: only a mark directly after a digit goes", async () => {
++      expect(await storedSubject(failed("Deployment failed for 12 ́ b"))).toBe("Deployment failed for 12 ́ b");
++    });
++
++    it.each([
++      ["a plain three-digit number", "Your verification code is 123", "Your verification code is 123"],
++      ["123 - 456, a multi-character separator", "Your verification code is 123 - 456", "Your verification code is 123 - 456"],
++      ["a three-digit number with a keycap mark after each digit", "Your verification code is 1️⃣2️⃣3️⃣", "Your verification code is 123"],
++      ["a three-digit number with a mark after each digit", "Your verification code is 1́2́3", "Your verification code is 123"],
++    ])("leaves %s as short as it is", async (_name, subject, expected) => {
++      expect(await storedSubject(google(subject))).toBe(expected);
++    });
++
++    it("is not applied to the text of the rule match: a keycap code mail is still classified and stored as account_security", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(google(codeMail("4️⃣8️⃣2️⃣9️⃣")));
++      r.clock.now += 600_000;
++      await r.run();
++      expect(await itemsOf(r)).toMatchObject([{ category: "account_security", rule_id: "account-security", subject: REDACTED }]);
++    });
++
++    it("codes hidden by every new kind of character merge with a plain code into one item with no digit stored or logged", async () => {
++      const codes = [
++        "482913",
++        "4ㅤ8ㅤ2ㅤ9ㅤ1ㅤ3",
++        "48︀2913",
++        "4᠋82913",
++        "48⠀29⠀1⠀3",
++        "4️⃣8️⃣2️⃣9️⃣1️⃣",
++        "4́8́2́9́1́",
++      ];
++      const r = rig();
++      await seed(r);
++      for (const code of codes) r.mailboxes.work!.deliver(google(codeMail(code)));
++      r.clock.now += 600_000;
++      await r.run();
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]).toMatchObject({ subject: REDACTED, occurrences: codes.length });
++      expect(rows[0]!.dedup_key).toBe(hash("account_security", "accounts.google.com", REDACTED));
++      for (const column of ["subject", "sender_domain", "category", "rule_id"]) {
++        expect(String(rows[0]![column]), column).not.toMatch(/\p{Nd}/u);
++      }
++      expect(r.log.text()).not.toMatch(/482|913|2913|3164|180b/i);
++    });
++
++    it("list_pending_mail returns the redacted subject for keycap and filler codes, and the accent after a letter", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(google(codeMail("4️⃣8️⃣2️⃣9️⃣")));
++      r.mailboxes.work!.deliver(failed("Deployment failed for café 123"));
++      r.clock.now += 600_000;
++      await r.run();
++      const executors = createMailWatchExecutors({
++        database: r.db,
++        enabled: true,
++        profileEmail: async () => OWNER_EMAIL,
++        now: () => r.clock.now,
++      });
++      const result = await executors["mail_watch.list_pending_mail"]!(
++        {},
++        { getCredential: async () => undefined, isConnectionAllowed: async () => true } as ExecutionContext,
++      );
++      expect(result).toMatchObject({ ok: true });
++      const subjects = (result.output as { items: { subject: string }[] }).items.map((item) => item.subject).sort();
++      expect(subjects).toEqual(["Deployment failed for café 123", REDACTED]);
++    });
++
++    it("the 200-character cut and the dedup key see the subject after the wider strip", async () => {
++      const r = rig();
++      await seed(r);
++      const base = "Deployment failed " + "y".repeat(190);
++      r.mailboxes.work!.deliver(failed(`${base}ZZZZZZZZZZ`));
++      r.mailboxes.work!.deliver(failed(`${"ㅤ".repeat(80)}${base}${"⠀".repeat(50)}ZZZZZZZZZZ`));
++      r.clock.now += 600_000;
++      await r.run();
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]!.subject).toBe(base.slice(0, 200));
++      expect(rows[0]!.occurrences).toBe(2);
++      expect(rows[0]!.dedup_key).toBe(hash("deploy_failed", "vercel.com", base.slice(0, 200)));
++    });
++  });
+ });
+ 
+ describe("logs carry no mail content (decision 11)", () => {
+@@ -2092,3 +2276,400 @@ describe("retention sweep limits (patch 0012, #111)", () => {
+     });
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #96 and #98: a connection that keeps failing, and where an unchecked window starts.
++//
++//   email_watch_cursors gains (migration 0022): last_success_at (ISO time of the last poll that read Gmail
++//   successfully: finish, pause or a successful expired-cursor reset; an abort leaves it alone), failing_notice_at
++//   (set when the "could not read" item is inserted, cleared on the next success) and connection_id (see the Worker
++//   tests in cloudflare-email-watch.test.ts).
++//   An aborted poll clears catch_up. When a poll aborts and now - last_success_at >= 24 hours, one pending item is
++//   inserted per failure streak: category watch_gap, rule_id watch-failing, empty sender domain, subject
++//   `Email watch could not read this account since <YYYY-MM-DD HH:MM UTC of last_success_at>`.
++//   Expected values are literals. T0 is 2026-11-11 12:00:00 UTC.
++// ---------------------------------------------------------------------------------------------------------------
++describe("failing connections (patch 0015, #96)", () => {
++  const MIN = 60_000;
++  /** The one successful poll every streak below starts from: an empty poll one minute after the first run. */
++  const LAST_OK = T0 + MIN;
++  const SINCE_T0_PLUS_1 = "Email watch could not read this account since 2026-11-11 12:01 UTC";
++
++  async function afterOneSuccess(names: string[] = ["work"]): Promise<Rig> {
++    const r = rig(names);
++    await seed(r);
++    r.clock.now = LAST_OK;
++    await r.run();
++    return r;
++  }
++
++  const failingItems = (r: Rig, name = "work") => itemsOf(r, `rule_id = 'watch-failing' and connection_name = '${name}'`);
++
++  async function runAt(r: Rig, ms: number): Promise<void> {
++    r.clock.now = ms;
++    await r.run();
++  }
++
++  describe("an aborted poll clears catch_up", () => {
++    const failures: [string, (r: Rig) => void][] = [
++      ["Gmail answers 401 to list_history", (r) => r.mailboxes.work!.failWith("history", 401)],
++      ["Gmail answers 500 to list_history", (r) => r.mailboxes.work!.failWith("history", 500)],
++      ["Gmail answers 429 to list_history", (r) => r.mailboxes.work!.failWith("history", 429)],
++      ["policy refuses list_history", (r) => (r.runner.refuse = (call) => (call.actionId === "gmail.list_history" ? "action_blocked" : undefined))],
++    ];
++
++    it.each(failures)("%s: the cursor keeps its place, catch_up is 0 and no off-interval run is asked for", async (_name, fail) => {
++      const r = await afterOneSuccess();
++      await r.db.prepare("update email_watch_cursors set catch_up = 1 where connection_name = 'work'").run();
++      expect(await r.watcher.needsCatchUp()).toBe(true);
++      fail(r);
++      await runAt(r, T0 + 5 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1000", page_token: null, catch_up: 0, last_run_at: iso(T0 + 5 * MIN) });
++      expect(await r.watcher.needsCatchUp()).toBe(false);
++    });
++
++    it("a message fetch that Gmail refuses with 401 in the middle of a page aborts and clears catch_up too, keeping the page token", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++      await r.db.prepare("update email_watch_cursors set catch_up = 1, page_token = null where connection_name = 'work'").run();
++      r.mailboxes.work!.failWith("message", 401);
++      await runAt(r, T0 + 5 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1000", catch_up: 0 });
++      expect(await r.watcher.needsCatchUp()).toBe(false);
++    });
++
++    it("an expired history whose profile call then fails for a reason other than the budget clears catch_up too", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++      r.mailboxes.work!.expireHistory();
++      r.mailboxes.work!.failWith("profile", 500);
++      await r.db.prepare("update email_watch_cursors set catch_up = 1 where connection_name = 'work'").run();
++      await runAt(r, T0 + 5 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1000", catch_up: 0, last_run_at: iso(T0 + 5 * MIN) });
++      expect(await r.watcher.needsCatchUp()).toBe(false);
++      expect((await itemsOf(r)).filter((row) => row.rule_id === "watch-gap")).toEqual([]);
++    });
++
++    it("keeps retrying on the normal interval: the next run still polls the failing connection", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, T0 + 5 * MIN);
++      r.mailboxes.work!.clearFailures();
++      r.mailboxes.work!.deliver(failed("Deployment failed for later"));
++      await runAt(r, T0 + 15 * MIN);
++      expect((await itemsOf(r, "category = 'deploy_failed'")).map((row) => row.subject)).toEqual(["Deployment failed for later"]);
++    });
++  });
++
++  describe("a connection the budget did not reach still gets catch_up = 1", () => {
++    const names = Array.from({ length: 16 }, (_, index) => `n${String(index + 1).padStart(2, "0")}`);
++
++    /** 16 idle cursors, n01 the oldest to n16 the newest; each poll costs one run, the budget is 15. */
++    async function sixteen(): Promise<Rig> {
++      const r = rig(names);
++      for (const [index, name] of names.entries()) {
++        await insertCursor(r.db, { connection_name: name, history_id: "1000", last_run_at: iso(T0 - (60 - index) * MIN), last_success_at: iso(T0 - (60 - index) * MIN) });
++      }
++      return r;
++    }
++
++    it("the connection after the 15th is flagged and the rest are not", async () => {
++      const r = await sixteen();
++      await runAt(r, T0 + 5 * MIN);
++      expect(r.runner.calls).toHaveLength(15);
++      expect((await cursorOf(r, "n16"))!.catch_up).toBe(1);
++      for (const name of names.slice(0, 15)) expect((await cursorOf(r, name))!.catch_up, name).toBe(0);
++      expect(await r.watcher.needsCatchUp()).toBe(true);
++    });
++
++    it("a failing connection in the same run is not flagged, while the starved one is", async () => {
++      const r = await sixteen();
++      r.mailboxes.n01!.failWith("history", 401);
++      await r.db.prepare("update email_watch_cursors set catch_up = 1 where connection_name = 'n01'").run();
++      await runAt(r, T0 + 5 * MIN);
++      expect((await cursorOf(r, "n01"))!.catch_up).toBe(0);
++      expect((await cursorOf(r, "n16"))!.catch_up).toBe(1);
++    });
++
++    it("an expired history that needs a profile call the budget cannot pay for keeps catch_up = 1 (budget, not failure)", async () => {
++      const r = await sixteen();
++      // n15 is polled with the 15th and last run, its history is gone, and the profile call that follows has no budget.
++      r.mailboxes.n15!.deliver(failed("Deployment failed before the gap"));
++      r.mailboxes.n15!.expireHistory();
++      await runAt(r, T0 + 5 * MIN);
++      expect(r.runner.calls).toHaveLength(15);
++      expect(await cursorOf(r, "n15")).toMatchObject({ history_id: "1000", catch_up: 1 });
++      expect((await itemsOf(r)).filter((row) => row.rule_id === "watch-gap")).toEqual([]);
++    });
++  });
++
++  describe("last_success_at", () => {
++    // Assumption (not stated in the spec): the first run reads Gmail successfully, so it sets last_success_at. The
++    // 0014 gap-notice tests ("Mail between 2026-11-11 12:00 UTC ...") only keep passing if it does.
++    it("is set by the first run", async () => {
++      const r = rig();
++      await r.run();
++      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T0), failing_notice_at: null });
++    });
++
++    it("moves to now on an empty poll and on a poll that stores mail", async () => {
++      const r = rig();
++      await seed(r);
++      await runAt(r, T0 + 10 * MIN);
++      expect((await cursorOf(r))!.last_success_at).toBe(iso(T0 + 10 * MIN));
++      r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++      await runAt(r, T0 + 20 * MIN);
++      expect((await cursorOf(r))!.last_success_at).toBe(iso(T0 + 20 * MIN));
++    });
++
++    it("moves to now on a pause (the budget ran out after Gmail was read)", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.maxPageSize = 8;
++      for (let n = 0; n < 60; n += 1) r.mailboxes.work!.deliver(failed(`Deployment failed for p-${n}`));
++      await runAt(r, T0 + 10 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ catch_up: 1, last_success_at: iso(T0 + 10 * MIN) });
++    });
++
++    it("moves to now on an expired-cursor reset that succeeds", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++      r.mailboxes.work!.expireHistory();
++      await runAt(r, T0 + 10 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T0 + 10 * MIN), failing_notice_at: null });
++    });
++
++    it.each([
++      ["a 401", (r: Rig) => r.mailboxes.work!.failWith("history", 401)],
++      ["a 500", (r: Rig) => r.mailboxes.work!.failWith("history", 500)],
++      ["a policy refusal", (r: Rig) => (r.runner.refuse = () => "action_blocked")],
++    ])("is left alone by an abort (%s) although last_run_at moves", async (_name, fail) => {
++      const r = await afterOneSuccess();
++      fail(r);
++      await runAt(r, T0 + HOUR);
++      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(LAST_OK), last_run_at: iso(T0 + HOUR) });
++    });
++
++    it("is left alone by an expired history whose profile call fails", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++      r.mailboxes.work!.expireHistory();
++      r.mailboxes.work!.failWith("profile", 500);
++      await runAt(r, T0 + HOUR);
++      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(LAST_OK), last_run_at: iso(T0 + HOUR) });
++    });
++  });
++
++  describe("the 24-hour 'could not read' item", () => {
++    it("is not inserted by an abort 23 hours 59 minutes after the last success, nor 1 ms before 24 hours", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + HOUR);
++      await runAt(r, LAST_OK + 23 * HOUR + 59 * MIN);
++      await runAt(r, LAST_OK + DAY - 1);
++      expect(await itemsOf(r)).toEqual([]);
++      expect((await cursorOf(r))!.failing_notice_at).toBeNull();
++    });
++
++    it("is inserted by the first abort at exactly 24 hours, with the pinned columns and no error text", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY - 1);
++      expect(await itemsOf(r)).toEqual([]);
++      await runAt(r, LAST_OK + DAY);
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]).toMatchObject({
++        connection_name: "work",
++        category: "watch_gap",
++        rule_id: "watch-failing",
++        sender_domain: "",
++        subject: SINCE_T0_PLUS_1,
++        status: "pending",
++        acknowledged_at: null,
++        occurrences: 1,
++      });
++      // Not a Gmail id and not empty; there is no message and so no thread.
++      expect(rows[0]!.gmail_message_id).toBeTruthy();
++      expect(rows[0]!.gmail_thread_id ?? "").toBe("");
++      expect(rows[0]!.created_at).toBe(iso(LAST_OK + DAY));
++      expect((await cursorOf(r))!.failing_notice_at).not.toBeNull();
++      expect(r.log.text()).not.toContain("2026-11-11 12:01");
++    });
++
++    it.each([
++      ["a 401 from Gmail", (r: Rig) => r.mailboxes.work!.failWith("history", 401)],
++      ["a 500 from Gmail", (r: Rig) => r.mailboxes.work!.failWith("history", 500)],
++      ["a policy refusal", (r: Rig) => (r.runner.refuse = (call) => (call.actionId === "gmail.list_history" ? "action_blocked" : undefined))],
++      ["a message fetch that fails with 403", (r: Rig) => {
++        r.mailboxes.work!.deliver(failed("Deployment failed for a"));
++        r.mailboxes.work!.failWith("message", 403);
++      }],
++    ])("the subject carries no error text, address or code, whatever failed: %s", async (_name, fail) => {
++      const r = await afterOneSuccess();
++      fail(r);
++      await runAt(r, LAST_OK + DAY);
++      const rows = await failingItems(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]!.subject).toBe(SINCE_T0_PLUS_1);
++      // The fixed columns only: the id, the synthetic message id and the dedup key are random or hashed hex, which
++      // can contain "401" by chance.
++      const dump = JSON.stringify([rows[0]!.subject, rows[0]!.category, rows[0]!.rule_id, rows[0]!.sender_domain]);
++      for (const leak of ["401", "403", "500", "authorization", "action_blocked", "provider_error", "rate_limited", OWNER_EMAIL, "Gmail"]) {
++        expect(dump, leak).not.toContain(leak);
++      }
++    });
++
++    it("further aborts in the same streak insert nothing more, however long it lasts", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY);
++      const first = await failingItems(r);
++      expect(first).toHaveLength(1);
++      for (const hours of [25, 26, 48, 72, 24 * 9]) await runAt(r, LAST_OK + hours * HOUR);
++      const rows = await failingItems(r);
++      expect(rows.map((row) => row.id)).toEqual([first[0]!.id]);
++      expect(rows[0]).toMatchObject({ subject: SINCE_T0_PLUS_1, status: "pending", occurrences: 1 });
++    });
++
++    it("stays one item when the user acknowledges it and the streak goes on", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY);
++      await r.db.prepare("update email_watch_items set status = 'acknowledged', acknowledged_at = ? where rule_id = 'watch-failing'").bind(iso(LAST_OK + DAY)).run();
++      await runAt(r, LAST_OK + 3 * DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++    });
++
++    it("a success clears the streak; a new 24-hour streak inserts a second item that names its own last success", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++
++      r.mailboxes.work!.clearFailures();
++      const recovered = LAST_OK + DAY + HOUR;
++      await runAt(r, recovered);
++      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(recovered), failing_notice_at: null });
++      expect(await failingItems(r)).toHaveLength(1);
++
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, recovered + 23 * HOUR + 59 * MIN);
++      expect(await failingItems(r)).toHaveLength(1);
++      await runAt(r, recovered + DAY);
++      const rows = await failingItems(r);
++      expect(rows.map((row) => row.subject).sort()).toEqual([
++        "Email watch could not read this account since 2026-11-11 12:01 UTC",
++        "Email watch could not read this account since 2026-11-12 13:01 UTC",
++      ]);
++      expect(new Set(rows.map((row) => row.gmail_message_id)).size).toBe(2);
++    });
++
++    it("a failure that never reaches 24 hours before a success leaves no item and no streak mark", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + 10 * HOUR);
++      r.mailboxes.work!.clearFailures();
++      await runAt(r, LAST_OK + 11 * HOUR);
++      r.mailboxes.work!.failWith("history", 401);
++      // 24 hours after the first success, but only 13 after the latest one.
++      await runAt(r, LAST_OK + DAY + 11 * HOUR - 1);
++      expect(await itemsOf(r)).toEqual([]);
++    });
++
++    it("a pause counts as a success: the streak mark is cleared and the clock restarts", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++      r.mailboxes.work!.clearFailures();
++      r.mailboxes.work!.maxPageSize = 8;
++      for (let n = 0; n < 60; n += 1) r.mailboxes.work!.deliver(failed(`Deployment failed for q-${n}`));
++      await runAt(r, LAST_OK + DAY + HOUR);
++      expect(await cursorOf(r)).toMatchObject({ catch_up: 1, last_success_at: iso(LAST_OK + DAY + HOUR), failing_notice_at: null });
++    });
++
++    it("one connection's streak does not give another connection an item", async () => {
++      const r = await afterOneSuccess(["work", "ops"]);
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, LAST_OK + DAY);
++      expect((await failingItems(r, "work")).length).toBe(1);
++      expect(await failingItems(r, "ops")).toEqual([]);
++      expect((await cursorOf(r, "ops"))!.last_success_at).toBe(iso(LAST_OK + DAY));
++    });
++
++    it("two overlapping invocations that both abort at 24 hours insert one item between them", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      r.clock.now = LAST_OK + DAY;
++      await Promise.all([r.run(), secondWatcher(r).run()]);
++      expect(await failingItems(r)).toHaveLength(1);
++    });
++
++    it("a second abort in the same minute after the item was inserted inserts nothing (a duplicate event)", async () => {
++      const r = await afterOneSuccess();
++      r.mailboxes.work!.failWith("history", 401);
++      r.clock.now = LAST_OK + DAY;
++      await r.run();
++      await r.run();
++      expect(await failingItems(r)).toHaveLength(1);
++    });
++  });
++});
++
++describe("the gap starts at the last successful read (patch 0015, #98)", () => {
++  const MIN = 60_000;
++  const LAST_OK = T0 + MIN;
++
++  it("names the minute of the last success, not of the last failed attempt, after days of aborts", async () => {
++    const r = rig();
++    await seed(r);
++    r.clock.now = LAST_OK;
++    await r.run();
++    r.mailboxes.work!.failWith("history", 401);
++    for (const days of [1, 2, 3]) {
++      r.clock.now = LAST_OK + days * DAY + 7 * MIN;
++      await r.run();
++    }
++    expect((await cursorOf(r))!.last_run_at).toBe(iso(LAST_OK + 3 * DAY + 7 * MIN));
++
++    r.mailboxes.work!.clearFailures();
++    r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++    r.mailboxes.work!.expireHistory();
++    r.clock.now = LAST_OK + 3 * DAY + 20 * MIN;
++    await r.run();
++
++    const gaps = await itemsOf(r, "rule_id = 'watch-gap'");
++    expect(gaps).toHaveLength(1);
++    expect(gaps[0]!.subject).toBe("Mail between 2026-11-11 12:01 UTC and now was not checked");
++    expect(gaps[0]).toMatchObject({ category: "watch_gap", sender_domain: "", status: "pending", connection_name: "work" });
++    // The reset is a success: the streak is over.
++    expect(await cursorOf(r)).toMatchObject({ history_id: "1001", last_success_at: iso(LAST_OK + 3 * DAY + 20 * MIN), failing_notice_at: null });
++  });
++
++  it("with no failure in between the start is still the previous successful poll", async () => {
++    const r = rig();
++    await seed(r);
++    await r.db.prepare("update email_watch_cursors set last_success_at = ? where connection_name = 'work'").bind(iso(T0 - 2 * DAY + 5 * MIN)).run();
++    r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++    r.mailboxes.work!.expireHistory();
++    r.clock.now = T0 + HOUR;
++    await r.run();
++    expect((await itemsOf(r, "rule_id = 'watch-gap'"))[0]!.subject).toBe("Mail between 2026-11-09 12:05 UTC and now was not checked");
++  });
++
++  it("an expired history right after a failed reset still starts at the last success", async () => {
++    const r = rig();
++    await seed(r);
++    r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++    r.mailboxes.work!.expireHistory();
++    r.mailboxes.work!.failWith("profile", 500);
++    r.clock.now = T0 + 2 * DAY;
++    await r.run();
++    expect(await itemsOf(r, "rule_id = 'watch-gap'")).toEqual([]);
++    r.mailboxes.work!.clearFailures();
++    r.clock.now = T0 + 3 * DAY;
++    await r.run();
++    expect((await itemsOf(r, "rule_id = 'watch-gap'"))[0]!.subject).toBe("Mail between 2026-11-11 12:00 UTC and now was not checked");
++  });
++});
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index c8c0c5d1..5a10b0e4 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -17,6 +17,8 @@ const DAY_MS = 86_400_000;
+ const PENDING_RETENTION_MS = 14 * DAY_MS;
+ const ACKNOWLEDGED_RETENTION_MS = 7 * DAY_MS;
+ const DEDUP_WINDOW_MS = DAY_MS;
++/** A connection that has not been read successfully for this long gets one "could not read" item per streak. */
++const FAILING_AFTER_MS = DAY_MS;
+ const SKIPPED_LABELS = new Set(["DRAFT", "SENT", "SPAM", "TRASH"]);
+ const METADATA_HEADERS = ["From", "Subject", "Authentication-Results", "X-GitHub-Reason"];
+ 
+@@ -38,6 +40,12 @@ interface Cursor {
+   pageToken: string | null;
+   lastRunAt: string;
+   catchUp: boolean;
++  /** Last poll that read Gmail successfully; null on a row older than migration 0022 that was never backfilled. */
++  lastSuccessAt: string | null;
++  /** Set while a failure streak has its "could not read" item. */
++  failingNoticeAt: string | null;
++  /** The Gmail connection the name resolved to when the cursor was written; null before patch 0015. */
++  connectionId: string | null;
+ }
+ 
+ interface CursorRow {
+@@ -46,6 +54,9 @@ interface CursorRow {
+   page_token: string | null;
+   last_run_at: string;
+   catch_up: number;
++  last_success_at: string | null;
++  failing_notice_at: string | null;
++  connection_id: string | null;
+ }
+ 
+ /** What one Gmail action run came back as. Nothing in it is logged. */
+@@ -66,7 +77,7 @@ type PollStep =
+   | { state: "pause"; pageToken: string | null }
+   /** Gmail no longer has the history the cursor points at. */
+   | { state: "reset_expired" }
+-  /** A refusal or a Gmail failure: leave the cursor alone. */
++  /** A refusal or a Gmail failure: leave the position alone, stop the off-interval retries. */
+   | { state: "abort"; code: string };
+ 
+ interface Budget {
+@@ -92,12 +103,14 @@ interface HistoryMessage {
+ export class EmailWatcher {
+   private readonly database: D1DatabaseBinding;
+   private readonly gmail: WatchGmailClient;
++  private readonly runner: WatchActionRunner;
+   private readonly connections: readonly string[];
+   private readonly logger: RuntimeLogger;
+   private readonly now: () => number;
+ 
+   constructor(options: EmailWatcherOptions) {
+     this.database = options.database;
++    this.runner = options.runner;
+     this.gmail = createWatchGmailClient(options.runner, options.policy);
+     this.connections = options.connections;
+     this.logger = options.logger;
+@@ -142,9 +155,12 @@ export class EmailWatcher {
+       .map((entry) => entry.name);
+   }
+ 
+-  private async pollConnection(name: string, cursor: Cursor | undefined, budget: Budget): Promise<void> {
++  private async pollConnection(name: string, stored: Cursor | undefined, budget: Budget): Promise<void> {
++    const resolved = await this.resolveConnection(name, stored);
++    if (resolved.kind === "stop") return;
++    const cursor = resolved.cursor;
+     if (!cursor) {
+-      await this.startConnection(name, budget);
++      await this.startConnection(name, budget, resolved.connectionId);
+       return;
+     }
+     const counts: PageCounts = { fetched: 0, stored: 0, merged: 0 };
+@@ -158,8 +174,51 @@ export class EmailWatcher {
+     }
+   }
+ 
++  /**
++   * Which Gmail connection the name points at now, checked against the cursor (no Gmail call; the connection store
++   * only). A cursor with no recorded id adopts the current one. A cursor for another id, or for a name that no longer
++   * resolves, is dropped with its items, so an alias reused by a different account starts fresh. Any other failure
++   * to resolve aborts this poll and deletes nothing.
++   */
++  private async resolveConnection(
++    name: string,
++    cursor: Cursor | undefined,
++  ): Promise<{ kind: "stop" } | { kind: "go"; cursor: Cursor | undefined; connectionId: string | null }> {
++    const resolve = this.runner.resolveGmailConnectionId?.bind(this.runner);
++    if (!resolve) return { kind: "go", cursor, connectionId: null };
++    let current: string | undefined;
++    try {
++      current = await resolve(name);
++    } catch (error) {
++      const code = `resolve_${errorName(error)}`;
++      if (cursor) await this.abort(name, cursor, code);
++      else this.logSkip(name, code);
++      return { kind: "stop" };
++    }
++    if (cursor && current !== undefined && cursor.connectionId === null) {
++      await this.database
++        .prepare("update email_watch_cursors set connection_id = ? where connection_name = ? and connection_id is null")
++        .bind(current, name)
++        .run();
++      return { kind: "go", cursor: { ...cursor, connectionId: current }, connectionId: current };
++    }
++    if (cursor && current !== undefined && cursor.connectionId === current) {
++      return { kind: "go", cursor, connectionId: current };
++    }
++    if (cursor) {
++      await this.database.prepare("delete from email_watch_items where connection_name = ?").bind(name).run();
++      await this.database.prepare("delete from email_watch_cursors where connection_name = ?").bind(name).run();
++      this.logger.warn({ connectionName: name }, "email watch dropped what it had stored for a name that points elsewhere now");
++    }
++    if (current === undefined) {
++      if (!cursor) this.logSkip(name, "connection_not_found");
++      return { kind: "stop" };
++    }
++    return { kind: "go", cursor: undefined, connectionId: current };
++  }
++
+   /** First run for a connection: remember where the mailbox is now and read nothing (no backfill). */
+-  private async startConnection(name: string, budget: Budget): Promise<void> {
++  private async startConnection(name: string, budget: Budget, connectionId: string | null): Promise<void> {
+     const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
+     const historyId = reply.kind === "ok" ? readString(reply.output.historyId) : undefined;
+     if (!historyId) {
+@@ -168,9 +227,11 @@ export class EmailWatcher {
+     }
+     await this.database
+       .prepare(
+-        "insert or ignore into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up) values (?, ?, null, ?, 0)",
++        `insert or ignore into email_watch_cursors
++           (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
++         values (?, ?, null, ?, 0, ?, null, ?)`,
+       )
+-      .bind(name, historyId, this.nowIso())
++      .bind(name, historyId, this.nowIso(), this.nowIso(), connectionId)
+       .run();
+   }
+ 
+@@ -182,7 +243,6 @@ export class EmailWatcher {
+     budget: Budget,
+     counts: PageCounts,
+   ): Promise<PollStep> {
+-    if (budget.remaining < 2) return { state: "pause", pageToken };
+     let list = await this.listPage(name, cursor, pageToken, budget, MAX_PAGE_SIZE);
+     if (list.kind === "no_budget") return { state: "pause", pageToken };
+     if (list.kind === "failed") {
+@@ -260,8 +320,7 @@ export class EmailWatcher {
+         await this.moveCursor(cursor, { historyId: cursor.historyId, pageToken: step.pageToken, catchUp: true });
+         return;
+       case "abort":
+-        this.logSkip(name, step.code);
+-        await this.touch(name);
++        await this.abort(name, cursor, step.code);
+         return;
+       case "reset_expired":
+         await this.resetExpired(name, cursor, budget);
+@@ -276,13 +335,17 @@ export class EmailWatcher {
+     const profile = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
+     const historyId = profile.kind === "ok" ? readString(profile.output.historyId) : undefined;
+     if (!historyId) {
+-      this.logSkip(name, profile.kind === "failed" ? profile.code : "no_history_id");
+-      await this.touch(name, profile.kind === "no_budget");
++      if (profile.kind === "no_budget") {
++        this.logSkip(name, "no_budget");
++        await this.touch(name, true);
++      } else {
++        await this.abort(name, cursor, profile.kind === "failed" ? profile.code : "no_history_id");
++      }
+       return;
+     }
+-    // Only the invocation that moves the cursor leaves the gap item.
++    // Only the invocation that moves the cursor leaves the gap item. The window starts at the last successful read.
+     const moved = await this.moveCursor(cursor, { historyId, pageToken: null, catchUp: false });
+-    if (moved) await this.insertGapItem(name, cursor.lastRunAt);
++    if (moved) await this.insertGapItem(name, cursor.lastSuccessAt ?? cursor.lastRunAt);
+     this.logger.warn({ connectionName: name }, "email watch cursor expired and was reset");
+   }
+ 
+@@ -369,21 +432,26 @@ export class EmailWatcher {
+     return (merged.meta.changes ?? 0) > 0 ? "merged" : "none";
+   }
+ 
+-  private async insertGapItem(name: string, lastCheckedAt: string): Promise<void> {
+-    const subject = `Mail between ${formatMinute(lastCheckedAt)} and now was not checked`;
++  private insertGapItem(name: string, lastCheckedAt: string): Promise<void> {
++    return this.insertPendingGap(name, "watch-gap", `Mail between ${formatMinute(lastCheckedAt)} and now was not checked`);
++  }
++
++  /** A pending watch_gap item with no message behind it (no sender, no text but a fixed sentence and a time). */
++  private async insertPendingGap(name: string, ruleId: string, subject: string): Promise<void> {
+     const at = this.nowIso();
+     await this.database
+       .prepare(
+         `insert into email_watch_items
+            (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id,
+             received_at, created_at, status, acknowledged_at, dedup_key, occurrences)
+-         values (?, ?, ?, null, '', ?, 'watch_gap', 'watch-gap', ?, ?, 'pending', null, ?, 1)`,
++         values (?, ?, ?, null, '', ?, 'watch_gap', ?, ?, ?, 'pending', null, ?, 1)`,
+       )
+       .bind(
+         crypto.randomUUID(),
+         name,
+         `gap-${crypto.randomUUID()}`,
+         subject,
++        ruleId,
+         at,
+         at,
+         await dedupKey("watch_gap", name, subject),
+@@ -406,21 +474,40 @@ export class EmailWatcher {
+   ): Promise<boolean> {
+     const result = await this.database
+       .prepare(
+-        `update email_watch_cursors set history_id = ?, page_token = ?, last_run_at = ?, catch_up = ?
++        `update email_watch_cursors set history_id = ?, page_token = ?, last_run_at = ?, catch_up = ?,
++           last_success_at = ?, failing_notice_at = null
+          where connection_name = ? and history_id = ? and page_token is ?`,
+       )
+-      .bind(next.historyId, next.pageToken, this.nowIso(), next.catchUp ? 1 : 0, old.connectionName, old.historyId, old.pageToken)
++      .bind(next.historyId, next.pageToken, this.nowIso(), next.catchUp ? 1 : 0, this.nowIso(), old.connectionName, old.historyId, old.pageToken)
+       .run();
+     return (result.meta.changes ?? 0) > 0;
+   }
+ 
++  /**
++   * A poll that could not read Gmail. The cursor keeps its place and goes back to the normal interval (catch_up is
++   * cleared: a connection that keeps failing is not retried every minute). After 24 hours without a successful read
++   * the first abort of the streak leaves one pending "could not read" item.
++   */
++  private async abort(name: string, cursor: Cursor, code: string): Promise<void> {
++    this.logSkip(name, code);
++    await this.touch(name, false);
++    const since = cursor.lastSuccessAt ?? cursor.lastRunAt;
++    if (cursor.failingNoticeAt !== null || this.now() - Date.parse(since) < FAILING_AFTER_MS) return;
++    // Claim the streak first, so two overlapping invocations leave one item.
++    const claimed = await this.database
++      .prepare("update email_watch_cursors set failing_notice_at = ? where connection_name = ? and failing_notice_at is null")
++      .bind(this.nowIso(), name)
++      .run();
++    if ((claimed.meta.changes ?? 0) > 0) {
++      await this.insertPendingGap(name, "watch-failing", `Email watch could not read this account since ${formatMinute(since)}`);
++    }
++  }
++
+   /** Record that the connection was tried, so one that keeps failing does not stay first in line. */
+-  private async touch(name: string, catchUp = false): Promise<void> {
++  private async touch(name: string, catchUp: boolean): Promise<void> {
+     await this.database
+-      .prepare(
+-        `update email_watch_cursors set last_run_at = ?${catchUp ? ", catch_up = 1" : ""} where connection_name = ?`,
+-      )
+-      .bind(this.nowIso(), name)
++      .prepare("update email_watch_cursors set last_run_at = ?, catch_up = ? where connection_name = ?")
++      .bind(this.nowIso(), catchUp ? 1 : 0, name)
+       .run();
+   }
+ 
+@@ -508,7 +595,10 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
+ 
+ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cursor>> {
+   const { results } = await database
+-    .prepare("select connection_name, history_id, page_token, last_run_at, catch_up from email_watch_cursors")
++    .prepare(
++      `select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id
++       from email_watch_cursors`,
++    )
+     .all<CursorRow>();
+   return new Map(
+     results.map((row) => [
+@@ -519,6 +609,9 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
+         pageToken: row.page_token,
+         lastRunAt: row.last_run_at,
+         catchUp: row.catch_up === 1,
++        lastSuccessAt: row.last_success_at,
++        failingNoticeAt: row.failing_notice_at,
++        connectionId: row.connection_id,
+       },
+     ]),
+   );
+diff --git a/src/server/storage/postgres/runtime-store.test.ts b/src/server/storage/postgres/runtime-store.test.ts
+index d95922c7..7bd5f8a5 100644
+--- a/src/server/storage/postgres/runtime-store.test.ts
++++ b/src/server/storage/postgres/runtime-store.test.ts
+@@ -168,6 +168,7 @@ describe("PostgreSQL migrations with PGlite", () => {
+           { name: "0019_email_watch.sql" },
+           { name: "0020_email_watch_indexes.sql" },
+           { name: "0021_email_watch_drop_connection_index.sql" },
++          { name: "0022_email_watch_cursor_state.sql" },
+         ],
+       });
+ 
+@@ -276,8 +277,12 @@ describe("PostgreSQL email watch connection index (patch 0014, #114)", () => {
+          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1')`,
+       );
+ 
+-      await migratePostgresDatabase({ pool });
+-      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      // Patch 0015: 0022 is the last migration now, so this test stops at 0021.
++      const through0021: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name <= NAME),
++      };
++      await migratePostgresDatabase({ pool, migrations: through0021 });
++      await expect(migratePostgresDatabase({ pool, migrations: through0021 })).resolves.toBeUndefined();
+       expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).at(-1)).toBe(NAME);
+       expect((await pool.query("select id from email_watch_items")).rows).toEqual([{ id: "p" }]);
+ 
+@@ -350,6 +355,7 @@ describe("PostgreSQL migrations with a custom migration source", () => {
+           { name: "0019_email_watch.sql" },
+           { name: "0020_email_watch_indexes.sql" },
+           { name: "0021_email_watch_drop_connection_index.sql" },
++          { name: "0022_email_watch_cursor_state.sql" },
+           { name: "9998_custom.sql" },
+         ],
+       });
+@@ -804,3 +810,86 @@ describe("PostgreSQL SaaS storage with PGlite", () => {
+     },
+   );
+ });
++
++describe("PostgreSQL email watch cursor state (patch 0015, #96 and #101)", () => {
++  let testServer: PGliteTestServer;
++
++  beforeAll(async () => {
++    testServer = await startPGliteTestServer();
++  });
++
++  afterAll(async () => {
++    await testServer.close();
++  });
++
++  const PREVIOUS = "0021_email_watch_drop_connection_index.sql";
++  const NAME = "0022_email_watch_cursor_state.sql";
++
++  it("0022 applies after 0021 on a database that holds cursor rows, adds three nullable text columns and backfills last_success_at from last_run_at", async () => {
++    const pool = new Pool({ connectionString: testServer.url, max: 1 });
++    try {
++      const through0021: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name <= PREVIOUS),
++      };
++      await migratePostgresDatabase({ pool, migrations: through0021 });
++      await pool.query(
++        `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up) values
++           ('work', '1', null, '2026-11-11T12:00:00.000Z', 0),
++           ('ops', '7', 'p20', '2026-11-09T08:30:00.000Z', 1)`,
++      );
++
++      await migratePostgresDatabase({ pool });
++      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).slice(-2)).toEqual([PREVIOUS, NAME]);
++      await expect(assertPostgresSchemaReady(pool)).resolves.toBeUndefined();
++
++      const columns = (
++        await pool.query(
++          "select column_name, data_type, is_nullable, column_default from information_schema.columns where table_name = 'email_watch_cursors' and column_name in ('last_success_at', 'failing_notice_at', 'connection_id') order by column_name",
++        )
++      ).rows;
++      expect(columns).toEqual([
++        { column_name: "connection_id", data_type: "text", is_nullable: "YES", column_default: null },
++        { column_name: "failing_notice_at", data_type: "text", is_nullable: "YES", column_default: null },
++        { column_name: "last_success_at", data_type: "text", is_nullable: "YES", column_default: null },
++      ]);
++      expect(
++        (
++          await pool.query(
++            "select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id from email_watch_cursors order by connection_name",
++          )
++        ).rows,
++      ).toEqual([
++        {
++          connection_name: "ops",
++          history_id: "7",
++          page_token: "p20",
++          last_run_at: "2026-11-09T08:30:00.000Z",
++          catch_up: 1,
++          last_success_at: "2026-11-09T08:30:00.000Z",
++          failing_notice_at: null,
++          connection_id: null,
++        },
++        {
++          connection_name: "work",
++          history_id: "1",
++          page_token: null,
++          last_run_at: "2026-11-11T12:00:00.000Z",
++          catch_up: 0,
++          last_success_at: "2026-11-11T12:00:00.000Z",
++          failing_notice_at: null,
++          connection_id: null,
++        },
++      ]);
++
++      await pool.query(
++        "insert into email_watch_cursors (connection_name, history_id, last_run_at, connection_id) values ('new', '2', '2026-11-12T00:00:00.000Z', 'conn-1')",
++      );
++      expect((await pool.query("select last_success_at, failing_notice_at, connection_id from email_watch_cursors where connection_name = 'new'")).rows).toEqual([
++        { last_success_at: null, failing_notice_at: null, connection_id: "conn-1" },
++      ]);
++    } finally {
++      await pool.end();
++    }
++  });
++});
+diff --git a/src/server/storage/sqlite/runtime-store.test.ts b/src/server/storage/sqlite/runtime-store.test.ts
+index ebd19271..7aed6f62 100644
+--- a/src/server/storage/sqlite/runtime-store.test.ts
++++ b/src/server/storage/sqlite/runtime-store.test.ts
+@@ -64,6 +64,7 @@ describe("SqliteRuntimeDatabase", () => {
+       "0019_email_watch.sql",
+       "0020_email_watch_indexes.sql",
+       "0021_email_watch_drop_connection_index.sql",
++      "0022_email_watch_cursor_state.sql",
+     ];
+     expect(entries.filter((entry) => entry.message === "sqlite migration started")).toEqual(
+       migrations.map((migration) => ({ fields: { migration }, message: "sqlite migration started" })),
+-- 
+2.34.1
+
