@@ -1,24 +1,23 @@
-SplitMind patch 0023 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0020).
+SplitMind patch 0023 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0022).
 Upstream issue: not filed yet.
-Email watch tidy-ups from the 0016 reviews (#127): a test D1 that throws instead of reporting 0 changes, and a dead branch removed.
+Email watch tidy-ups from the 0016 reviews (#127): a test D1 that throws instead of reporting 0 changes, and a loud guard for an unreachable branch.
 
-From c63b8d5224416ba3f0ded406a82e3e8270213c0d Mon Sep 17 00:00:00 2001
+From fb92a540f67158b16d27b7bbb3f8d3644be6b915 Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
-Date: Sun, 15 Nov 2026 12:38:17 -0500
-Subject: [PATCH] fix(email-watch): loud test D1 batch, drop dead no_budget
- branch (#127)
+Date: Sun, 15 Nov 2026 12:49:09 -0500
+Subject: [PATCH] fix(email-watch): loud test D1 batch, loud unreachable
+ no_budget guard (#127)
 
 Test D1: a batch entry from a statement wrapper without readOutcome throws
-when meta.changes is read, instead of reporting 0. startConnection loses its
-unreachable no_budget branch (run() only polls while budget remains and
-nothing before the first Gmail call spends it). Adds a pin that the failing
-notice claim works on a cursor with a null fingerprint.
+when meta.changes is read, instead of reporting 0. startConnection throws if
+get_profile reports no_budget, which run() makes unreachable. Adds a pin that
+the failing notice claim works on a cursor with a null fingerprint.
 ---
  src/server/email-watch/watcher.test.ts      |  59 ++++++++
  src/server/email-watch/watcher.ts           |   5 +-
  src/server/storage/d1/test-database.test.ts | 152 ++++++++++++++++++++
  src/server/storage/d1/test-database.ts      |  18 ++-
- 4 files changed, 226 insertions(+), 8 deletions(-)
+ 4 files changed, 228 insertions(+), 6 deletions(-)
  create mode 100644 src/server/storage/d1/test-database.test.ts
 
 diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
@@ -89,21 +88,22 @@ index fad909bc..e2b8176c 100644
 +  });
 +});
 diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
-index e22b2750..fd9abc99 100644
+index e22b2750..f3e40dc0 100644
 --- a/src/server/email-watch/watcher.ts
 +++ b/src/server/email-watch/watcher.ts
-@@ -244,10 +244,7 @@ export class EmailWatcher {
+@@ -244,9 +244,10 @@ export class EmailWatcher {
      stub: Cursor | undefined,
    ): Promise<void> {
      const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
--    if (reply.kind === "no_budget") {
++    // No budget check here: run() only polls a name while budget remains, and nothing before this call spends it.
+     if (reply.kind === "no_budget") {
 -      this.logSkip(name, "no_budget");
 -      return;
--    }
-+    // No budget check here: run() only polls a name while budget remains, and nothing before this call spends it.
++      // Unreachable today. Fail loudly (run() logs it) so a change that spends budget earlier does not leave a stub.
++      throw new Error("startConnection: no_budget is unreachable; run() polls only while budget remains");
+     }
      const historyId = reply.kind === "ok" ? readString(reply.output.historyId) : undefined;
      if (!historyId) {
-       const code = reply.kind === "failed" ? reply.code : "no_history_id";
 diff --git a/src/server/storage/d1/test-database.test.ts b/src/server/storage/d1/test-database.test.ts
 new file mode 100644
 index 00000000..42a9b465

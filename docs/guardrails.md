@@ -418,11 +418,12 @@ the acknowledged-expiry delete and each table's purge are independent, so a fail
 not stop the others, except that a failed (not missing) items purge skips the cursor purge for that sweep, so
 items are never left without a cursor. The purge of unwatched accounts has no limit on the number of watched
 accounts (D1 allows 100 bound parameters per statement): it reads the distinct account names in each table and
-deletes the unwatched ones in chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
-they delete. The distinct-names read scans the unique `(connection_name, gmail_message_id)` index of
-`email_watch_items` (a covering-index scan, not a table scan), so it reads one index entry per stored item; with 14-day
-retention of machine mail only, that stays small. Migration `0021_email_watch_drop_connection_index.sql` drops 0020's
-`(connection_name)` index, which duplicated the unique index for this read.
+deletes the unwatched ones in chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration
+0020, so they read about the rows they delete. The distinct-names read scans the unique `(connection_name,
+gmail_message_id)` index of `email_watch_items` (a covering-index scan, not a table scan), so it reads one index entry
+per stored item; with 14-day retention of machine mail only, that stays small. Migration
+`0021_email_watch_drop_connection_index.sql` drops 0020's `(connection_name)` index, which duplicated the unique index
+for this read.
 
 **Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)
 returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
