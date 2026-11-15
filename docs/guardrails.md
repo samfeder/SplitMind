@@ -249,7 +249,9 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      gate that could return some of them to `read` is tracked in #137.
    - **Startup warnings:** an entry that can never match (an uppercase letter in the provider id, `*` in either
      part, or a provider that is not in the catalog) is kept but logged once, naming the entry. Malformed entries
-     are ignored with a warning. Nothing throws. Valid entries log nothing.
+     are ignored with a warning. Nothing throws. Valid entries log nothing. Each warning is logged once per isolate
+     per config (#135): the app and the email watch share one parsed list, so a cron run does not repeat them. The
+     "not in the catalog" warning is Worker-only: the Node entry parses the setting before it has a catalog (#136).
    - **Not covered yet:** the `call_tool` and `execute_tool` pass-throughs are not audited for this rule; #134
      tracks it.
    - **What it trusts:** the catalog's `operationType` labels. Patch 0019 corrects the known mislabels (presigned
