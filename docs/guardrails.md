@@ -229,6 +229,13 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      remove existing webhooks, so none are orphaned.
    - `list_connections` and `/v1/apps/services/:service` add `readOnly: true` to listed connections, so agents
      can pick the right account.
+   - Guidance agrees with enforcement (#94): when a connection is selected (`connectionName` on
+     `get_action_guide`, the default connection for `search_actions`, `?connectionName=`, `?alias=` or the
+     `x-oo-connector-alias` header on the console `agent.md` route), the policy shown for a write, destructive or
+     unlabelled action is `Denied:` with the same message. With no connection selected, nothing changes.
+   - **After deploying patch 0019,** revoke the "MCP OAuth" runtime tokens and reconnect claude.ai and Claude Code.
+     Existing read-only grants keep the action ids from consent time (#95), so they do not pick up the relabelled
+     actions. Do this in the same step as the re-issue the 0017 deploy already asks for (#130).
    - **What it trusts:** the catalog's `operationType` labels. Patch 0019 corrects the known mislabels (presigned
      URL generators, one-time verifications and similar actions that were labelled `read` but write), so keep it
      with 0018. An action nobody has audited can still carry a wrong label.

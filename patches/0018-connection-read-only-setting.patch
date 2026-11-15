@@ -1,11 +1,11 @@
 SplitMind patch 0018 for OpenConnector v1.9.2.
-Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md (#31).
+Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md (#31, #94).
 Replace this line with the upstream issue or pull request link once it exists.
 History: numbered 0007 until it was renumbered to follow patch 0017.
 
-From 946e006bc006f0142225c72c1bf512c2db1d06ea Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sam Feder <noreply@splitmind.invalid>
-Date: Tue, 10 Nov 2026 16:33:14 -0500
+Date: Sun, 15 Nov 2026 11:08:14 -0500
 Subject: [PATCH] feat(connections): per-connection read-only setting
 
 OOMOL_CONNECT_READ_ONLY_CONNECTIONS lists <providerId>:<connectionName>
@@ -21,6 +21,14 @@ every call that is not a read, for every caller:
 - Triggers: reconcile and resource (they create or delete provider
   webhooks) are refused with 403. read, options, source and receive still
   work, and cleanup and maintenance still remove existing webhooks.
+- Guidance agrees with enforcement (#94): when a connection is selected
+  (get_action_guide connectionName, the default connection for
+  search_actions, ?connectionName=, ?alias= or x-oo-connector-alias on the
+  console agent.md route), the capability policy and agent.md report a
+  write, destructive or unlabelled action as not allowed, with the same
+  message and deployment check as execute_action. Both call the same rule
+  (applyReadOnlyToDecision, built on refuseAction). With no connection
+  selected, output is unchanged.
 
 list_connections and /v1/apps/services/:service add readOnly: true to
 listed connections and omit the field otherwise. Matching is exact and
@@ -28,13 +36,14 @@ case-sensitive. Malformed entries are ignored with one warning each. Unset
 or empty changes nothing.
 ---
  src/connection-service.ts                     |    6 +
- src/core/read-only-connections.ts             |   76 ++
- src/mcp.ts                                    |    5 +-
+ src/core/read-only-connections.ts             |   91 ++
+ src/mcp.ts                                    |   19 +-
  src/server/actions/action-runner.ts           |   15 +
+ src/server/api/console-catalog-routes.ts      |   12 +-
  src/server/api/runtime-api.ts                 |    5 +-
  src/server/api/runtime-app-routes.ts          |    8 +-
- .../cloudflare-read-only-connections.test.ts  | 1098 +++++++++++++++++
- ...loudflare-read-only-untyped-action.test.ts |  208 ++++
+ .../cloudflare-read-only-connections.test.ts  | 1411 +++++++++++++++++
+ ...loudflare-read-only-untyped-action.test.ts |  208 +++
  src/server/cloudflare.ts                      |    3 +
  src/server/cloudflare/cloudflare-env.ts       |    1 +
  src/server/connect-app.ts                     |    3 +
@@ -42,7 +51,7 @@ or empty changes nothing.
  src/server/index.ts                           |    2 +
  src/server/proxy/proxy-runner.ts              |   20 +
  src/triggers/trigger-runner.ts                |   19 +
- 15 files changed, 1468 insertions(+), 5 deletions(-)
+ 16 files changed, 1817 insertions(+), 10 deletions(-)
  create mode 100644 src/core/read-only-connections.ts
  create mode 100644 src/server/cloudflare-read-only-connections.test.ts
  create mode 100644 src/server/cloudflare-read-only-untyped-action.test.ts
@@ -86,10 +95,10 @@ index 032d48cd..1ba61a22 100644
    async listConnections(): Promise<ConnectionSummary[]> {
 diff --git a/src/core/read-only-connections.ts b/src/core/read-only-connections.ts
 new file mode 100644
-index 00000000..cd08e532
+index 00000000..a5534860
 --- /dev/null
 +++ b/src/core/read-only-connections.ts
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,91 @@
 +import type { ActionPolicyDecision } from "./action-policy.ts";
 +
 +/**
@@ -118,6 +127,21 @@ index 00000000..cd08e532
 +  ): ActionPolicyDecision | undefined;
 +  /** Refuse any request on a read-only connection, whatever its kind (proxy requests, Trigger writes). */
 +  refuseAll(connection: ConnectionIdentity | undefined): ActionPolicyDecision | undefined;
++}
++
++/**
++ * The decision `execute_action` would reach for an action on a selected connection: the policy decision stands when
++ * it already refuses, otherwise the read-only rule (`refuseAction`) applies. Guidance (`get_action_guide`,
++ * `search_actions`, `agent.md`) calls this so it cannot disagree with enforcement.
++ */
++export function applyReadOnlyToDecision(
++  decision: ActionPolicyDecision,
++  readOnlyConnections: ReadOnlyConnections | undefined,
++  connection: ConnectionIdentity | undefined,
++  operationType: string | undefined,
++): ActionPolicyDecision {
++  if (!decision.allowed) return decision;
++  return readOnlyConnections?.refuseAction(connection, operationType) ?? decision;
 +}
 +
 +export const noReadOnlyConnections: ReadOnlyConnections = createReadOnlyConnections(new Set());
@@ -167,10 +191,26 @@ index 00000000..cd08e532
 +  };
 +}
 diff --git a/src/mcp.ts b/src/mcp.ts
-index 2ab21ceb..f5acaff5 100644
+index 2ab21ceb..de346f62 100644
 --- a/src/mcp.ts
 +++ b/src/mcp.ts
-@@ -202,7 +202,10 @@ async function listConnections(options: IMcpServerOptions, service: string | und
+@@ -2,6 +2,7 @@ import type { CatalogStore, RuntimeActionDefinition } from "./catalog-store.ts";
+ import type { ConnectionService, ConnectionSummary } from "./connection-service.ts";
+ import type { ActionPolicyDecision, ActionPolicySnapshot } from "./core/action-policy.ts";
+ import type { ActionSearchIndexProvider } from "./core/action-search.ts";
++import type { ReadOnlyConnections } from "./core/read-only-connections.ts";
+ import type { AuthType, CredentialProfile, JsonSchema } from "./core/types.ts";
+ import type { ActionRunner, ActionRunResult } from "./server/actions/action-runner.ts";
+ import type { RuntimeGrant } from "./server/storage/runtime-token-service.ts";
+@@ -11,6 +12,7 @@ import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+ import * as z from "zod/v4";
+ import { ConnectionError } from "./connection-service.ts";
+ import { createActionSearchIndexProvider, searchActions as searchActionIndex } from "./core/action-search.ts";
++import { applyReadOnlyToDecision } from "./core/read-only-connections.ts";
+ import { describeSchemaType, readSchemaProperties, readSchemaRequired } from "./core/json-schema.ts";
+ import { renderActionMarkdown } from "./server/api/action-markdown.ts";
+ 
+@@ -202,7 +204,10 @@ async function listConnections(options: IMcpServerOptions, service: string | und
      return successPayload(
        connections
          .filter((connection) => connection.authType === "no_auth" || policy.evaluateConnection(connection.id).allowed)
@@ -182,6 +222,46 @@ index 2ab21ceb..f5acaff5 100644
      );
    } catch (error) {
      return connectionErrorPayload(error, policy);
+@@ -273,7 +278,12 @@ async function searchActions(
+     description: action.description,
+     operationType: action.operationType,
+     capability: summarizeActionCapability(
+-      describeActionCapability(action, policy, await getSelectedConnectionSummary(options, action.service, undefined)),
++      describeActionCapability(
++        action,
++        policy,
++        await getSelectedConnectionSummary(options, action.service, undefined),
++        options.connections.readOnlyConnections,
++      ),
+     ),
+     inputSummary: summarizeInputSchema(action.inputSchema),
+   }));
+@@ -303,7 +313,7 @@ async function getActionGuide(
+     if (!connectionDecision.allowed) {
+       return errorPayload(connectionDecision.code, connectionDecision.message);
+     }
+-    const capability = describeActionCapability(action, policy, connection);
++    const capability = describeActionCapability(action, policy, connection, options.connections.readOnlyConnections);
+     return successPayload({
+       capability,
+       markdown: renderActionMarkdown(action, {
+@@ -401,6 +411,7 @@ function describeActionCapability(
+   action: RuntimeActionDefinition,
+   policy: ActionPolicySnapshot,
+   connection: ConnectionSummary | undefined,
++  readOnlyConnections: ReadOnlyConnections | undefined,
+ ): ActionCapability {
+   return {
+     operationType: action.operationType,
+@@ -408,7 +419,7 @@ function describeActionCapability(
+     authTypes: action.execution.requiredAuthTypes,
+     requiredScopes: action.requiredScopes,
+     providerPermissions: action.providerPermissions,
+-    policy: policy.evaluate(action),
++    policy: applyReadOnlyToDecision(policy.evaluate(action), readOnlyConnections, connection, action.operationType),
+     connection: evaluateConnectionGrant(policy, connection).allowed ? connection : undefined,
+   };
+ }
 diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
 index 5f5f4b70..d552126e 100644
 --- a/src/server/actions/action-runner.ts
@@ -218,6 +298,39 @@ index 5f5f4b70..d552126e 100644
            const executor =
              action.execution.locallyExecutable && connection.kind === "local"
                ? await this.options.providerLoader.loadActionExecutor(
+diff --git a/src/server/api/console-catalog-routes.ts b/src/server/api/console-catalog-routes.ts
+index 2dece532..da677e78 100644
+--- a/src/server/api/console-catalog-routes.ts
++++ b/src/server/api/console-catalog-routes.ts
+@@ -7,6 +7,7 @@ import type { Context } from "hono";
+ import { Hono } from "hono";
+ import { ConnectionError } from "../../connection-service.ts";
+ import { searchActions } from "../../core/action-search.ts";
++import { applyReadOnlyToDecision } from "../../core/read-only-connections.ts";
+ import { renderActionMarkdown } from "./action-markdown.ts";
+ import { jsonError, notFound, readConnectionName as defaultReadConnectionName } from "./http-utils.ts";
+ import { mapConnectionErrorStatus } from "./runtime-api.ts";
+@@ -98,11 +99,18 @@ export function createConsoleCatalogRoutes({
+     if (!action) return notFound(context);
+ 
+     try {
+-      const policy = (await getPolicySnapshot(context)).evaluate(action);
++      const snapshot = await getPolicySnapshot(context);
++      const connection = await connections.getConnectionSummary(action.service, readConnectionName(context));
++      const policy = applyReadOnlyToDecision(
++        snapshot.evaluate(action),
++        connections.readOnlyConnections,
++        connection,
++        action.operationType,
++      );
+       return context.text(
+         renderActionMarkdown(action, {
+           transport: { kind: "http", origin: publicOrigin },
+-          connection: await connections.getConnectionSummary(action.service, readConnectionName(context)),
++          connection,
+           policy,
+         }),
+         200,
 diff --git a/src/server/api/runtime-api.ts b/src/server/api/runtime-api.ts
 index bffb7ed9..76761569 100644
 --- a/src/server/api/runtime-api.ts
@@ -276,10 +389,10 @@ index 05d1d658..3a23f64e 100644
      } catch (error) {
 diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
 new file mode 100644
-index 00000000..6da31aef
+index 00000000..31950724
 --- /dev/null
 +++ b/src/server/cloudflare-read-only-connections.test.ts
-@@ -0,0 +1,1098 @@
+@@ -0,0 +1,1411 @@
 +import type { AssetsBinding, D1DatabaseBinding } from "./cloudflare/cloudflare-bindings.ts";
 +import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
 +
@@ -1123,6 +1236,302 @@ index 00000000..6da31aef
 +  });
 +});
 +
++// Guidance must agree with enforcement (#94). `get_action_guide`, `search_actions` and the `agent.md` catalog guide
++// describe what `execute_action` would do, so on a read-only connection they must report a write, destructive or
++// unlabelled action as not allowed, with the very message and `deployment` source that execution refuses with.
++//
++// How each surface takes a connection: `get_action_guide` has `connectionName`; `agent.md` takes `?connectionName=`
++// (admin console route `/api/actions/:id/agent.md`; the runtime API has no agent.md route); `search_actions` has no
++// connection argument at all, so it can only describe the connection it would default to, `notion:default`.
++describe("read-only connections: guidance agrees with enforcement (#94)", () => {
++  const READ_ACTION = "notion.retrieve_page";
++  const WRITE_ACTION = "notion.append_block";
++  const DESTRUCTIVE_ACTION = "notion.delete_block";
++  const UNLABELLED_ACTION = "notion.create_comment"; // the catalog entry loses its operationType in these tests
++  const UNLABELLED_INPUT = {
++    parent: { type: "page_id", page_id: "page-1" },
++    rich_text: [{ type: "text", text: { content: "hi" } }],
++  };
++
++  const guide = async (site: Site, actionId: string, connectionName?: string) => {
++    const result = (await site.mcpCall("get_action_guide", {
++      actionId,
++      ...(connectionName ? { connectionName } : {}),
++    })) as { ok: boolean; data: { capability: { policy: Policy }; markdown: string } };
++    expect(result.ok, JSON.stringify(result)).toBe(true);
++    return { policy: result.data.capability.policy, markdown: result.data.markdown };
++  };
++  type Policy = { allowed: boolean; code?: string; message?: string; checks: { source: string; rule?: string }[] };
++
++  const agentMd = async (site: Site, actionId: string, connectionName?: string) => {
++    const response = await site.admin(
++      `/api/actions/${actionId}/agent.md${connectionName ? `?connectionName=${connectionName}` : ""}`,
++    );
++    expect(response.status).toBe(200);
++    // Examples embed the Worker origin, which differs per boot; everything else is compared as served.
++    return (await response.text()).replace(/https:\/\/read-only-\d+\.example\.com/g, "https://ORIGIN");
++  };
++
++  const searchPolicies = async (site: Site) => {
++    const result = (await site.mcpCall("search_actions", { service: "notion", limit: 50 })) as {
++      ok: boolean;
++      data: { id: string; capability: { policy: Policy } }[];
++    };
++    expect(result.ok, JSON.stringify(result)).toBe(true);
++    return new Map(result.data.map((action) => [action.id, action.capability.policy]));
++  };
++
++  const executeMessage = async (site: Site, actionId: string, input: unknown, connectionName?: string) => {
++    const result = await site.mcpExecute({ actionId, input, ...(connectionName ? { connectionName } : {}) });
++    expect(result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    return (result.error as { message: string }).message;
++  };
++
++  const bootNotion = (options: Parameters<typeof boot>[0]) => boot({ unlabelled: [UNLABELLED_ACTION], ...options });
++
++  describe("get_action_guide with an explicit connectionName", () => {
++    it("reports a write action on the read-only connection as not allowed, with execute_action's message", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const refusal = await executeMessage(site, WRITE_ACTION, NOTION_WRITE.input, "a");
++      const { policy, markdown } = await guide(site, WRITE_ACTION, "a");
++
++      expect(policy).toMatchObject({
++        allowed: false,
++        code: "action_blocked",
++        message: 'Connection "notion:a" is read-only; write actions are refused.',
++      });
++      expect(policy.message).toBe(refusal);
++      expect(policy.checks.map((check) => check.source)).toContain("deployment");
++      expect(markdown).toContain(`Denied: ${refusal}`);
++    });
++
++    it("reports the same write action on another connection of the provider as allowed", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const { policy, markdown } = await guide(site, WRITE_ACTION, "b");
++
++      expect(policy.allowed).toBe(true);
++      expect(policy.checks.filter((check) => check.source === "deployment")).toEqual([]);
++      expect(markdown).toContain("Allowed by the current execution policy.");
++      expect(markdown).not.toContain("Denied:");
++    });
++
++    it("reports a read action on the read-only connection as allowed", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const { policy, markdown } = await guide(site, READ_ACTION, "a");
++
++      expect(policy.allowed).toBe(true);
++      expect(markdown).toContain("Allowed by the current execution policy.");
++      expect(markdown).not.toContain("Denied:");
++    });
++
++    it.each([
++      ["destructive", DESTRUCTIVE_ACTION, NOTION_DESTRUCTIVE.input],
++      ["unlabelled (no operationType)", UNLABELLED_ACTION, UNLABELLED_INPUT],
++    ])("reports a %s action on the read-only connection as not allowed", async (_label, actionId, input) => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const refusal = await executeMessage(site, actionId, input, "a");
++      const { policy } = await guide(site, actionId, "a");
++
++      expect(policy).toMatchObject({ allowed: false, code: "action_blocked" });
++      expect(policy.message).toBe(refusal);
++      expect(policy.checks.map((check) => check.source)).toContain("deployment");
++    });
++
++    it("reports the unlabelled action as allowed on a connection that is not read-only", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      expect((await guide(site, UNLABELLED_ACTION, "b")).policy.allowed).toBe(true);
++    });
++
++    it("treats the guide's connection selection like execution: only the exact provider:name pair is read-only", async () => {
++      const site = await bootNotion({ readOnly: "slack:a, notion:ab" });
++      expect((await guide(site, WRITE_ACTION, "a")).policy.allowed).toBe(true);
++      expect((await guide(site, WRITE_ACTION, "b")).policy.allowed).toBe(true);
++    });
++  });
++
++  describe("get_action_guide and search_actions through the default connection", () => {
++    it("get_action_guide without connectionName describes a read-only default connection as refusing writes", async () => {
++      const site = await bootNotion({ readOnly: "notion:default", connections: ["default", "b"] });
++      const refusal = await executeMessage(site, WRITE_ACTION, NOTION_WRITE.input);
++      const { policy } = await guide(site, WRITE_ACTION);
++
++      expect(policy).toMatchObject({ allowed: false, code: "action_blocked" });
++      expect(policy.message).toBe(refusal);
++      expect(refusal).toContain('"notion:default"');
++      expect(policy.checks.map((check) => check.source)).toContain("deployment");
++      expect((await guide(site, READ_ACTION)).policy.allowed).toBe(true);
++    });
++
++    it("search_actions reports write, destructive and unlabelled actions as not allowed when the default is read-only", async () => {
++      const site = await bootNotion({ readOnly: "notion:default", connections: ["default", "b"] });
++      const policies = await searchPolicies(site);
++      const refusal = await executeMessage(site, WRITE_ACTION, NOTION_WRITE.input);
++
++      for (const id of [WRITE_ACTION, DESTRUCTIVE_ACTION, UNLABELLED_ACTION]) {
++        expect(policies.get(id), id).toMatchObject({ allowed: false, code: "action_blocked", message: refusal });
++        expect(policies.get(id)!.checks.map((check) => check.source), id).toContain("deployment");
++      }
++      expect(policies.get(READ_ACTION)?.allowed).toBe(true);
++    });
++
++    it("search_actions blocks exactly the non-read actions: every notion action agrees with its catalog label", async () => {
++      const site = await bootNotion({ readOnly: "notion:default", connections: ["default", "b"] });
++      const policies = await searchPolicies(site);
++      const labels = notionOperationTypes();
++
++      expect(policies.size).toBe(Object.keys(labels).length);
++      for (const [id, operationType] of Object.entries(labels)) {
++        expect(policies.get(id)?.allowed, `${id} (${operationType ?? "unlabelled"})`).toBe(operationType === "read");
++      }
++    });
++
++    it("search_actions leaves writes allowed when the default connection is not the read-only one", async () => {
++      const site = await bootNotion({ readOnly: "notion:b", connections: ["default", "b"] });
++      const policies = await searchPolicies(site);
++
++      for (const id of [WRITE_ACTION, DESTRUCTIVE_ACTION, UNLABELLED_ACTION, READ_ACTION]) {
++        expect(policies.get(id)?.allowed, id).toBe(true);
++      }
++    });
++  });
++
++  describe("GET /api/actions/:actionId/agent.md (console catalog route)", () => {
++    it("shows a write action as denied when the read-only connection is selected, with execute_action's message", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const refusal = await executeMessage(site, WRITE_ACTION, NOTION_WRITE.input, "a");
++      const markdown = await agentMd(site, WRITE_ACTION, "a");
++
++      expect(markdown).toContain(`Denied: ${refusal}`);
++      expect(markdown).toContain("deployment");
++      expect(markdown).not.toContain("Allowed by the current execution policy.");
++    });
++
++    it("shows a write action as allowed for another connection, and a read action as allowed for the read-only one", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++
++      for (const markdown of [await agentMd(site, WRITE_ACTION, "b"), await agentMd(site, READ_ACTION, "a")]) {
++        expect(markdown).toContain("Allowed by the current execution policy.");
++        expect(markdown).not.toContain("Denied:");
++      }
++    });
++
++    it.each([
++      ["destructive", DESTRUCTIVE_ACTION],
++      ["unlabelled (no operationType)", UNLABELLED_ACTION],
++    ])("shows a %s action as denied on the read-only connection", async (_label, actionId) => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const markdown = await agentMd(site, actionId, "a");
++
++      expect(markdown).toContain("Denied: Connection \"notion:a\" is read-only");
++    });
++
++    it("selects the connection by the alias header and query alias too, as the route allows", async () => {
++      const site = await bootNotion({ readOnly: "notion:a" });
++      const byHeader = await site.admin(`/api/actions/${WRITE_ACTION}/agent.md`, {
++        headers: { "x-oo-connector-alias": "a" },
++      });
++      const byAlias = await site.admin(`/api/actions/${WRITE_ACTION}/agent.md?alias=a`);
++
++      expect(await byHeader.text()).toContain("Denied: Connection \"notion:a\" is read-only");
++      expect(await byAlias.text()).toContain("Denied: Connection \"notion:a\" is read-only");
++    });
++
++    it("shows a write action as denied when no connection is named and the default is read-only", async () => {
++      const site = await bootNotion({ readOnly: "notion:default", connections: ["default", "b"] });
++
++      expect(await agentMd(site, WRITE_ACTION)).toContain("Denied: Connection \"notion:default\" is read-only");
++      expect(await agentMd(site, READ_ACTION)).toContain("Allowed by the current execution policy.");
++    });
++  });
++
++  describe("control: no connection selected and no default", () => {
++    // Three named connections only (no `default`), so nothing is selected by a name or by default.
++    const NO_DEFAULT = { connections: ["a", "b"] };
++
++    it.each([["notion:a"], ["notion:default"], [undefined]])(
++      "get_action_guide, search_actions and agent.md are identical to an unconfigured deployment (read-only: %s)",
++      async (readOnly) => {
++        const configured = await bootNotion({ readOnly, ...NO_DEFAULT });
++        const unconfigured = await bootNotion({ readOnly: undefined, ...NO_DEFAULT });
++
++        for (const id of [WRITE_ACTION, DESTRUCTIVE_ACTION, UNLABELLED_ACTION, READ_ACTION]) {
++          const result = await configured.mcpCall("get_action_guide", { actionId: id });
++          const baseline = await unconfigured.mcpCall("get_action_guide", { actionId: id });
++          expect(result, id).toEqual(baseline);
++          expect(await agentMd(configured, id), id).toBe(await agentMd(unconfigured, id));
++        }
++        expect([...(await searchPolicies(configured))]).toEqual([...(await searchPolicies(unconfigured))]);
++        for (const policy of (await searchPolicies(configured)).values()) {
++          expect(policy.allowed).toBe(true);
++          expect(policy.checks.filter((check) => check.source === "deployment")).toEqual([]);
++        }
++      },
++    );
++
++    it("an unconnected provider is unchanged too", async () => {
++      const configured = await bootNotion({ readOnly: "notion:a", connections: [] });
++      const unconfigured = await bootNotion({ readOnly: undefined, connections: [] });
++
++      expect(await configured.mcpCall("get_action_guide", { actionId: WRITE_ACTION })).toEqual(
++        await unconfigured.mcpCall("get_action_guide", { actionId: WRITE_ACTION }),
++      );
++      expect([...(await searchPolicies(configured))]).toEqual([...(await searchPolicies(unconfigured))]);
++    });
++
++    it("with nothing configured, a guide for any connection allows every action", async () => {
++      const site = await bootNotion({ readOnly: undefined });
++      for (const id of [WRITE_ACTION, DESTRUCTIVE_ACTION, UNLABELLED_ACTION, READ_ACTION]) {
++        expect((await guide(site, id, "a")).policy.allowed, id).toBe(true);
++        expect(await agentMd(site, id, "a"), id).toContain("Allowed by the current execution policy.");
++      }
++    });
++  });
++
++  describe("consistency: the guidance answer is what execute_action does", () => {
++    // Independent oracle: a connection is blocked when it is read-only and the catalog label is not `read`.
++    const ACTIONS = [
++      { id: READ_ACTION, input: NOTION_READ.input, blockedOnA: false },
++      { id: WRITE_ACTION, input: NOTION_WRITE.input, blockedOnA: true },
++      { id: DESTRUCTIVE_ACTION, input: NOTION_DESTRUCTIVE.input, blockedOnA: true },
++      { id: UNLABELLED_ACTION, input: UNLABELLED_INPUT, blockedOnA: true },
++    ];
++    const cases = ACTIONS.flatMap((action) =>
++      ["a", "b"].map((connection) => ({ ...action, connection, blocked: connection === "a" && action.blockedOnA })),
++    );
++
++    it.each(cases.map((c) => [`${c.id} on ${c.connection}`, c] as const))(
++      "%s: get_action_guide and agent.md match execute_action",
++      async (_label, c) => {
++        const site = await bootNotion({ readOnly: "notion:a" });
++        const markdown = await agentMd(site, c.id, c.connection);
++        const { policy } = await guide(site, c.id, c.connection);
++        const executed = await site.mcpExecute({ actionId: c.id, input: c.input, connectionName: c.connection });
++
++        expect(policy.allowed).toBe(!c.blocked);
++        expect(executed.ok).toBe(!c.blocked);
++        expect(markdown.includes("Denied:")).toBe(c.blocked);
++        if (c.blocked) {
++          expect(executed).toMatchObject({ ok: false, error: { code: "action_blocked", message: policy.message } });
++          expect(markdown).toContain(`Denied: ${policy.message}`);
++        }
++      },
++    );
++
++    it("search_actions matches execute_action for the default connection, action by action", async () => {
++      const site = await bootNotion({ readOnly: "notion:default", connections: ["default", "b"] });
++      const policies = await searchPolicies(site);
++
++      for (const action of ACTIONS) {
++        const executed = await site.mcpExecute({ actionId: action.id, input: action.input });
++        expect(policies.get(action.id)?.allowed, action.id).toBe(executed.ok);
++        if (!executed.ok) {
++          expect((executed.error as { message: string }).message).toBe(policies.get(action.id)?.message);
++        }
++      }
++    });
++  });
++});
++
 +// ---------------------------------------------------------------------------------------------------------------------
 +// Harness
 +// ---------------------------------------------------------------------------------------------------------------------
@@ -1140,6 +1549,8 @@ index 00000000..6da31aef
 +  awsConnections?: string[];
 +  /** GitHub connection names to create (api_key, secret-<name>). Used by the Trigger tests. */
 +  githubConnections?: string[];
++  /** Notion action ids whose `operationType` is removed from the served catalog, to model an unlabelled action. */
++  unlabelled?: string[];
 +}
 +
 +interface Site {
@@ -1169,7 +1580,7 @@ index 00000000..6da31aef
 +async function boot(options: BootOptions): Promise<Site> {
 +  const origin = `https://read-only-${++bootCounter}.example.com`;
 +  const database = new SqliteD1Database();
-+  const assets = memoryAssets(notionCatalog());
++  const assets = memoryAssets(notionCatalog(options.unlabelled ?? []));
 +  const site = createSite(origin, database, assets, options.readOnly, {});
 +
 +  for (const name of options.connections ?? ["a", "b"]) {
@@ -1342,12 +1753,27 @@ index 00000000..6da31aef
 +  return token;
 +}
 +
-+function notionCatalog(): Record<string, unknown> {
++/** Notion's catalog `operationType` per action id, read straight from the catalog file (undefined: unlabelled). */
++function notionOperationTypes(unlabelled: string[] = [UNLABELLED_ID]): Record<string, string | undefined> {
++  const provider = JSON.parse(
++    readFileSync(new URL("../../catalog/apps/notion.json", import.meta.url), "utf8"),
++  ) as { actions: { id: string; operationType?: string }[] };
++  return Object.fromEntries(
++    provider.actions.map((action) => [action.id, unlabelled.includes(action.id) ? undefined : action.operationType]),
++  );
++}
++
++const UNLABELLED_ID = "notion.create_comment";
++
++function notionCatalog(unlabelled: string[] = []): Record<string, unknown> {
 +  const load = (name: string) =>
 +    JSON.parse(readFileSync(new URL(`../../catalog/apps/${name}.json`, import.meta.url), "utf8")) as {
 +      actions: Record<string, unknown>[];
 +    };
 +  const provider = load("notion");
++  for (const action of provider.actions) {
++    if (unlabelled.includes(action.id as string)) delete action.operationType;
++  }
 +  const github = load("github");
 +  const feishu = load("feishu_app_bot");
 +  const linear = load("linear");
