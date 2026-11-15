@@ -217,7 +217,8 @@ apply: an account whose policy refuses one of the three is skipped for that run.
 `OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 15 Gmail action runs (each can cost two subrequests on Workers Free, which allows 50); more mail than that is read over the next
 minutes.
 
-**What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`):
+**What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`, one of which
+`0021_email_watch_drop_connection_index.sql` drops again):
 
 - `email_watch_cursors`: per account, the Gmail history id it has read up to, a page token while it is part-way
   through a backlog, the last run time and a catch-up flag.
@@ -239,15 +240,16 @@ request titles are written by anyone. Mail from github.com that carries that hea
 only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
 
 **Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
-contain a verification code. Before a subject is stored, and before its duplicate key is computed, zero-width
-characters (U+200B, U+200C, U+200D, U+2060, U+FEFF) are removed, then every run of 4 or more digits is replaced with
+contain a verification code. Before a subject is stored, and before its duplicate key is computed, all Unicode
+format characters (category Cf: soft hyphen, zero-width characters, directional marks, tag characters and more) and
+U+034F (combining grapheme joiner) are removed, then every run of 4 or more digits is replaced with
 `[redacted]`, in every category. A digit is any Unicode decimal digit (fullwidth and Arabic-Indic included). Neighbouring
 digits may be separated by nothing or by exactly one separator: whitespace (including no-break spaces), a dot, a
 hyphen, a dash (U+2010 to U+2015) or a minus (U+2212), so `123456`, `123 456`, `482.913` and `482–913` are all
 redacted. Years, invoice numbers, decimals such as `1.234` and IP-like strings with 4 or more digits are redacted too,
 and two code mails with different codes count as one item. **Residual:** these are not redacted: codes that mix
-letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`), and digits split by
-invisible characters other than the zero-width ones removed (a soft hyphen or a directional mark, for example; #114).
+letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`). A zero-width joiner
+(U+200D) is a format character, so emoji joined with it are split into separate emoji in the stored subject.
 Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
@@ -270,11 +272,16 @@ days, then deletes all items and cursors of any account that is not in the curre
 `OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS` list (an empty or unset list purges everything; malformed entries count as
 not watched). So removing an account, or turning the watch off, purges what was stored for it within one interval.
 The sweep uses D1 only: no Gmail call, no KV write, no run-log row. If the tables do not exist yet it does nothing;
-any other failure is logged once per sweep by error name and the other cron work still runs. Each table is handled
-on its own, so a missing table does not stop the purge of the other. The purge of unwatched accounts has no limit on
-the number of watched accounts (D1 allows 100 bound parameters per statement): it reads the distinct account names in
-each table and deletes the unwatched ones in chunks of 50. **Cost:** with the indexes from migration 0020, each sweep
-reads about the rows it deletes plus the distinct account names.
+any other failure is logged once per sweep by error name and the other cron work still runs. Only the first error
+of a sweep is logged; later, different errors in the same sweep are not logged, on purpose. The pending-expiry delete,
+the acknowledged-expiry delete and each table's purge are independent, so a failure (or a missing table) in one does
+not stop the others. The purge of unwatched accounts has no limit on the number of watched accounts (D1 allows 100
+bound parameters per statement): it reads the distinct account names in each table and deletes the unwatched ones in
+chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
+they delete. The distinct-names read scans the unique `(connection_name, gmail_message_id)` index of
+`email_watch_items` (a covering-index scan, not a table scan), so it reads one index entry per stored item; with 14-day
+retention of machine mail only, that stays small. Migration `0021_email_watch_drop_connection_index.sql` drops 0020's
+`(connection_name)` index, which duplicated the unique index for this read.
 
 **Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)
 returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
