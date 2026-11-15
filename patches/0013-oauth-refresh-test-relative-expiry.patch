@@ -1,0 +1,88 @@
+SplitMind patch 0013 for OpenConnector v1.9.2.
+The oauth-credential-refresh-service tests that have a provider runtime return a refreshed
+token hard-code expiresAt 2026-12-29, a date that is about to pass, after which the tests
+fail. This makes the expiry 45 days from now. Candidate for upstream. SplitMind issue #109.
+Upstream issue: not filed yet.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 12:00:00 +0000
+Subject: [PATCH] test(oauth): use a relative expiry in the credential refresh tests
+
+The provider-runtime refresh tests returned the fixed expiresAt 2026-12-29T00:00:00.000Z.
+Once that date passes, a stored credential would count as expired and the tests would
+fail. The fixture is now one module-level constant, 45 days from Date.now(), and the
+assertions compare against the same value.
+
+---
+diff --git a/src/oauth/oauth-credential-refresh-service.test.ts b/src/oauth/oauth-credential-refresh-service.test.ts
+index 670d255a..a3f74324 100644
+--- a/src/oauth/oauth-credential-refresh-service.test.ts
++++ b/src/oauth/oauth-credential-refresh-service.test.ts
+@@ -7,6 +7,9 @@ import { OAuthCredentialRefreshService } from "./oauth-credential-refresh-servic
+ 
+ type OAuthCredential = Extract<ResolvedCredential, { authType: "oauth2" }>;
+ 
++// A future expiry the provider runtime hands back, 45 days out so it never ages into the past.
++const providerExpiresAt = new Date(Date.now() + 45 * 86_400_000).toISOString();
++
+ const clientConfigs = {
+   getOAuthDefinition: () => ({
+     type: "oauth2",
+@@ -62,7 +65,7 @@ describe("OAuthCredentialRefreshService", () => {
+             return {
+               accessToken: "provider-refreshed-token",
+               tokenType: "Bearer",
+-              expiresAt: "2026-12-29T00:00:00.000Z",
++              expiresAt: providerExpiresAt,
+               metadata: { oauthAuthorizationId: "runtime-supplied", refreshedBy: "provider-runtime" },
+             };
+           },
+@@ -91,7 +94,7 @@ describe("OAuthCredentialRefreshService", () => {
+             return {
+               accessToken: "provider-refreshed-token",
+               tokenType: "Bearer",
+-              expiresAt: "2026-12-29T00:00:00.000Z",
++              expiresAt: providerExpiresAt,
+               metadata: { oauthAuthorizationId: "runtime-supplied" },
+             };
+           },
+@@ -129,7 +132,7 @@ describe("OAuthCredentialRefreshService", () => {
+             return {
+               accessToken: "provider-refreshed-token",
+               tokenType: "Bearer",
+-              expiresAt: "2026-12-29T00:00:00.000Z",
++              expiresAt: providerExpiresAt,
+               metadata: { refreshedBy: "provider-runtime" },
+             };
+           },
+@@ -143,7 +146,7 @@ describe("OAuthCredentialRefreshService", () => {
+     );
+ 
+     expect(refreshed.metadata.expires_in).toBe(3600);
+-    expect(refreshed.expiresAt).toBe("2026-12-29T00:00:00.000Z");
++    expect(refreshed.expiresAt).toBe(providerExpiresAt);
+   });
+ 
+   it("prefers the lifetime a provider runtime reports without an expiry", async () => {
+@@ -187,7 +190,7 @@ describe("OAuthCredentialRefreshService", () => {
+               accessToken: "provider-refreshed-token",
+               refreshToken: "provider-refreshed-token",
+               tokenType: "Bearer",
+-              expiresAt: "2026-12-29T00:00:00.000Z",
++              expiresAt: providerExpiresAt,
+               providerSecret: { rotated: true },
+               metadata: { refreshedBy: "provider-runtime" },
+             };
+@@ -209,7 +212,7 @@ describe("OAuthCredentialRefreshService", () => {
+       authType: "oauth2",
+       accessToken: "provider-refreshed-token",
+       refreshToken: "provider-refreshed-token",
+-      expiresAt: "2026-12-29T00:00:00.000Z",
++      expiresAt: providerExpiresAt,
+       profile: credential.profile,
+       metadata: {
+         permissions: "read,write",
+-- 
+2.34.1
+
