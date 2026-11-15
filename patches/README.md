@@ -33,11 +33,18 @@ Rules:
 
 A test that hard-codes a date breaks every merge the day that date passes (patch 0010 and 0013 are two cases). The
 `bootstrap` CI job runs `node scripts/check-vendor-dates.ts` after bootstrap. It reads every `*.test.ts` and `*.spec.ts`
-under `vendor/open-connector/src` and fails on any date literal (`"2026-12-28"`, `"2026-12-28T00:00:00Z"`,
-`new Date(2027, 0, 5)`, `Date.UTC(2027, 0, 5)`) from yesterday to 400 days from now. Past dates and far-future sentinels
-such as 2099 are fine. The same job has a 15-minute timeout.
+under `vendor/open-connector/src`, `vendor/open-connector/web/src` and `vendor/open-connector/scripts` (whichever exist)
+and fails on any date from yesterday to 400 days from now, in these forms:
+
+- ISO strings in quotes or backticks: `"2026-12-28"`, `"2026-12-28T00:00:00Z"`, `"2026-12-28 10:00:00"`, and a date
+  right after an interpolation, `` `${x}2026-12-28` ``;
+- slash dates in quotes or backticks, month 1-based: `"2026/12/29"`, `"2027/1/5"`;
+- `new Date(2027, 0, 5)` and `Date.UTC(2027, 0, 5)`, month 0-based, and the two-argument `new Date(2027, 0)` and `Date.UTC(2027, 0)` (day 1).
+
+Impossible dates (`"2026-02-30"`, `new Date(2026, 12, 40)`) are ignored. Epoch-millisecond numbers are not checked: too
+many false positives. Past dates and far-future sentinels such as 2099 are fine. The same job has a 15-minute timeout.
 
 When it fires after an OpenConnector upgrade, the upgrade brought in a fixture that will expire. Make the date relative
 to `Date.now()` in a new patch (see 0010 and 0013) and keep the assertion on the same value. If the date is fixed on
-purpose and harmless, add `// date-guard: ok` to that line in the patch. Run it locally with `scripts/bootstrap.sh`
+purpose and harmless, add `// date-guard: ok` to that line in the patch; it skips every date on that line. Run it locally with `scripts/bootstrap.sh`
 then `node scripts/check-vendor-dates.ts`.

@@ -17,7 +17,9 @@ explains how to move that pin.
 
 - `scripts/bootstrap.sh` checks out that exact commit, applies every
   `patches/*.patch` in name order, and installs dependencies. Re-running it is
-  safe: patches that are already applied are skipped.
+  safe: patches that are already applied are skipped. If a patch is missing
+  from the middle of the stack (a later one is applied), it stops and prints
+  the reset command; reset the submodule and run bootstrap again.
 
 ## Upgrade steps
 
