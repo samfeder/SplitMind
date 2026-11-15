@@ -1,8 +1,9 @@
-SplitMind patch 0007 for OpenConnector v1.9.2.
+SplitMind patch 0018 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md (#31).
 Replace this line with the upstream issue or pull request link once it exists.
+History: numbered 0007 until it was renumbered to follow patch 0017.
 
-From c8a751f039629abff873c4783e1f623ae77ed00b Mon Sep 17 00:00:00 2001
+From 946e006bc006f0142225c72c1bf512c2db1d06ea Mon Sep 17 00:00:00 2001
 From: Sam Feder <noreply@splitmind.invalid>
 Date: Tue, 10 Nov 2026 16:33:14 -0500
 Subject: [PATCH] feat(connections): per-connection read-only setting
@@ -32,7 +33,7 @@ or empty changes nothing.
  src/server/actions/action-runner.ts           |   15 +
  src/server/api/runtime-api.ts                 |    5 +-
  src/server/api/runtime-app-routes.ts          |    8 +-
- .../cloudflare-read-only-connections.test.ts  | 1095 +++++++++++++++++
+ .../cloudflare-read-only-connections.test.ts  | 1098 +++++++++++++++++
  ...loudflare-read-only-untyped-action.test.ts |  208 ++++
  src/server/cloudflare.ts                      |    3 +
  src/server/cloudflare/cloudflare-env.ts       |    1 +
@@ -41,7 +42,7 @@ or empty changes nothing.
  src/server/index.ts                           |    2 +
  src/server/proxy/proxy-runner.ts              |   20 +
  src/triggers/trigger-runner.ts                |   19 +
- 15 files changed, 1465 insertions(+), 5 deletions(-)
+ 15 files changed, 1468 insertions(+), 5 deletions(-)
  create mode 100644 src/core/read-only-connections.ts
  create mode 100644 src/server/cloudflare-read-only-connections.test.ts
  create mode 100644 src/server/cloudflare-read-only-untyped-action.test.ts
@@ -182,10 +183,10 @@ index 2ab21ceb..f5acaff5 100644
    } catch (error) {
      return connectionErrorPayload(error, policy);
 diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
-index f1c5d13a..0ee5823d 100644
+index 5f5f4b70..d552126e 100644
 --- a/src/server/actions/action-runner.ts
 +++ b/src/server/actions/action-runner.ts
-@@ -115,9 +115,16 @@ export class ActionRunner {
+@@ -125,9 +125,16 @@ export class ActionRunner {
          input.signal?.throwIfAborted();
          const connectionPolicy =
            summary?.authType === "no_auth" ? undefined : input.policy.evaluateConnection(summary?.id);
@@ -202,7 +203,7 @@ index f1c5d13a..0ee5823d 100644
          } else if (summary?.authType === "marketplace" && !this.options.marketplace?.supportsAction(action.id)) {
            result = {
              ok: false,
-@@ -141,6 +148,14 @@ export class ActionRunner {
+@@ -151,6 +158,14 @@ export class ActionRunner {
              policy = targetPolicy;
              throw new ConnectionError(targetPolicy.code, targetPolicy.message);
            }
@@ -275,10 +276,10 @@ index 05d1d658..3a23f64e 100644
      } catch (error) {
 diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
 new file mode 100644
-index 00000000..632607b7
+index 00000000..6da31aef
 --- /dev/null
 +++ b/src/server/cloudflare-read-only-connections.test.ts
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1098 @@
 +import type { AssetsBinding, D1DatabaseBinding } from "./cloudflare/cloudflare-bindings.ts";
 +import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
 +
@@ -712,6 +713,7 @@ index 00000000..632607b7
 +      { connectionId: await site.connectionId("a") },
 +    );
 +
++    expect(response.status).toBe(403);
 +    await expect(response.json()).resolves.toMatchObject({ success: false, errorCode: "action_blocked" });
 +    expect(providerCalls).toEqual([]);
 +  });
@@ -721,6 +723,7 @@ index 00000000..632607b7
 +    const token = await site.createRuntimeToken([], { allowedProxies: ["notion"] });
 +    const response = await proxyRequest(site, token, { endpoint: "/pages/page-1", method: "GET" });
 +
++    expect(response.status).toBe(403);
 +    await expect(response.json()).resolves.toMatchObject({ success: false, errorCode: "action_blocked" });
 +    expect(providerCalls).toEqual([]);
 +  });
@@ -762,8 +765,9 @@ index 00000000..632607b7
 +// Triggers bypass ActionRunner: TriggerRunner (src/triggers/trigger-runner.ts) resolves the connection itself and
 +// reaches the provider through the connection's proxy executor. The rule on a read-only connection:
 +//   - refused: `reconcile` (creates or deletes a webhook) and `resource` (subscribes or unsubscribes a resource);
-+//   - allowed: `read` (polling), `options`, `receive` (verifies an inbound delivery) and `source` (local identity
-+//     and signature checks), because none of them changes anything on the provider;
++//   - allowed: `read` (polling), `options`, `receive` (verifies an inbound delivery) and `source` (identity
++//     verification, which does call the provider with GETs, plus one Fireflies GraphQL query, but changes
++//     nothing on it), because none of them changes anything on the provider;
 +//   - allowed: cleanup of an existing subscription (admin cancel route and the maintenance job), because removing
 +//     a webhook SplitMind itself created is housekeeping, not a caller's write.
 +describe("read-only connections: Triggers", () => {
@@ -999,7 +1003,7 @@ index 00000000..632607b7
 +
 +    it("the admin cancel route still deletes the webhook after the connection is made read-only", async () => {
 +      const site = await writableGithub();
-+      const { id, token } = await reconcileWork(site);
++      const { id } = await reconcileWork(site);
 +      expect(githubHooks).toHaveLength(1);
 +      providerCalls = [];
 +
@@ -1589,10 +1593,10 @@ index 00000000..56b43115
 +  };
 +}
 diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
-index 3557be05..1af503a6 100644
+index a3d37c9f..881d0aed 100644
 --- a/src/server/cloudflare.ts
 +++ b/src/server/cloudflare.ts
-@@ -8,6 +8,7 @@ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
+@@ -9,6 +9,7 @@ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
  
  import { ActionPolicyService, parseActionPolicyList } from "../core/action-policy.ts";
  import { PromiseCache } from "../core/promise-cache.ts";
@@ -1600,15 +1604,15 @@ index 3557be05..1af503a6 100644
  import {
    parseEgressTrustedHosts,
    parsePrivateNetworkAccessFlag,
-@@ -174,6 +175,7 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
-       blockedTriggers: parseActionPolicyList(env.OOMOL_CONNECT_BLOCKED_TRIGGERS),
-     }),
+@@ -273,6 +274,7 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
+     requireRuntimeAuth: Boolean(env.OAUTH_KV),
+     actionPolicy: createActionPolicy(env),
      allowedCustomOAuth: parseActionPolicyList(env.OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH),
 +    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS),
      logger: workerLogger,
      computeRuntimeAuthConfigured: false,
      // Cloudflare compresses on egress itself: Response defaults to
-@@ -239,6 +241,7 @@ function createCacheKey(env: CloudflareEnv, publicOrigin: string): string {
+@@ -338,6 +340,7 @@ function createCacheKey(env: CloudflareEnv, publicOrigin: string): string {
      blockedTriggers: env.OOMOL_CONNECT_BLOCKED_TRIGGERS ?? "",
      blockedProxies: env.OOMOL_CONNECT_BLOCKED_PROXIES ?? "",
      allowedCustomOAuth: env.OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH ?? "",
@@ -1617,10 +1621,10 @@ index 3557be05..1af503a6 100644
      transitFileMaxBytes: env.OOMOL_CONNECT_TRANSIT_FILE_MAX_BYTES ?? "",
      runLimit: env.OOMOL_CONNECT_RUN_LIMIT ?? "",
 diff --git a/src/server/cloudflare/cloudflare-env.ts b/src/server/cloudflare/cloudflare-env.ts
-index f5c9c0df..188798d8 100644
+index d9381817..332f75c8 100644
 --- a/src/server/cloudflare/cloudflare-env.ts
 +++ b/src/server/cloudflare/cloudflare-env.ts
-@@ -12,6 +12,7 @@ export interface CloudflareEnv {
+@@ -20,6 +20,7 @@ export interface CloudflareEnv {
    OOMOL_CONNECT_ENCRYPTION_KEY?: string;
    OOMOL_CONNECT_ALLOWED_ACTIONS?: string;
    OOMOL_CONNECT_BLOCKED_ACTIONS?: string;

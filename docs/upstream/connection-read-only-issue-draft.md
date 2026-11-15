@@ -3,7 +3,7 @@
 **Status: draft only, not filed.** Filing is a public post from Sam's account (#37). Once filed, link it from
 [docs/guardrails.md](../guardrails.md) section 5 and close E6.4 (#31). Written against OpenConnector `v1.9.2`.
 
-**SplitMind carries this as patch 0007** (`patches/0007-connection-read-only-setting.patch`), as a deployment
+**SplitMind carries this as patch 0018** (`patches/0018-connection-read-only-setting.patch`), as a deployment
 setting rather than a per-connection field: `OOMOL_CONNECT_READ_ONLY_CONNECTIONS`, a list of
 `<providerId>:<connectionName>` entries, so it needs no storage migration in the D1, SQLite and Postgres backends.
 If you file this, say that a per-connection check has to cover three paths, not only actions, or it can be walked
@@ -57,7 +57,7 @@ around:
 
 ---
 
-## Mislabelled actions (separate issue, SplitMind patch 0008)
+## Mislabelled actions (separate issue, SplitMind patch 0019)
 
 **Title:** `fix(catalog): actions that write are labelled operationType "read"`
 

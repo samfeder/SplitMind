@@ -208,12 +208,12 @@ the period your plan allows.
 
 ## 5. Read-only accounts (E6.4)
 
-OpenConnector v1.9.2 has no per-connection read-only switch, so SplitMind carries one as patch 0007
+OpenConnector v1.9.2 has no per-connection read-only switch, so SplitMind carries one as patch 0018
 ([patches/README.md](../patches/README.md)). The upstream issue is drafted in
 [docs/upstream/connection-read-only-issue-draft.md](upstream/connection-read-only-issue-draft.md). Option 0 is the
 switch; options 1 to 4 are workarounds that still apply and stack with it.
 
-0. **Mark the connection read-only (patch 0007).** Set `OOMOL_CONNECT_READ_ONLY_CONNECTIONS` to a comma- or
+0. **Mark the connection read-only (patch 0018).** Set `OOMOL_CONNECT_READ_ONLY_CONNECTIONS` to a comma- or
    whitespace-separated list of `<providerId>:<connectionName>` entries, for example
    `notion:<alias-a>, slack:<alias-b>`. It is a deployment setting like `OOMOL_CONNECT_BLOCKED_ACTIONS` (a Worker
    variable, not stored per connection), and it applies to every caller: MCP OAuth clients such as claude.ai,
@@ -229,9 +229,9 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      remove existing webhooks, so none are orphaned.
    - `list_connections` and `/v1/apps/services/:service` add `readOnly: true` to listed connections, so agents
      can pick the right account.
-   - **What it trusts:** the catalog's `operationType` labels. Patch 0008 corrects the known mislabels (presigned
+   - **What it trusts:** the catalog's `operationType` labels. Patch 0019 corrects the known mislabels (presigned
      URL generators, one-time verifications and similar actions that were labelled `read` but write), so keep it
-     with 0007. An action nobody has audited can still carry a wrong label.
+     with 0018. An action nobody has audited can still carry a wrong label.
    - **It keys on the connection name.** Connecting the same account again under another name gives a writable
      connection, so restrict who can add connections (the admin token) if that matters.
    - **Webhooks created before the connection was marked read-only** can no longer be renewed or deactivated by

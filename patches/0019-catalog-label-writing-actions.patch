@@ -1,8 +1,9 @@
-SplitMind patch 0008 for OpenConnector v1.9.2.
+SplitMind patch 0019 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md, section "Mislabelled actions" (#31).
 Replace this line with the upstream issue or pull request link once it exists.
+History: numbered 0008 until it was renumbered to follow patch 0017.
 
-From 438349dc83c07fe5c10ec53ecc62ab54636090b2 Mon Sep 17 00:00:00 2001
+From 5183b42bd59c0717bf755416a43699e35e6088cc Mon Sep 17 00:00:00 2001
 From: Sam Feder <noreply@splitmind.invalid>
 Date: Tue, 10 Nov 2026 17:01:25 -0500
 Subject: [PATCH] fix(catalog): label actions that write as write or
@@ -338,10 +339,10 @@ index 8d5d260b..798d3f7e 100644
      inputSchema: input({ idOrName: projectIdOrName, domain: s.nonEmptyString("Domain name.") }, ["idOrName", "domain"]),
      outputSchema: s.object({ domain }, { required: ["domain"] }),
 diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
-index 632607b7..271b8164 100644
+index 6da31aef..2ea0595d 100644
 --- a/src/server/cloudflare-read-only-connections.test.ts
 +++ b/src/server/cloudflare-read-only-connections.test.ts
-@@ -838,6 +838,40 @@ describe("read-only connections: Triggers", () => {
+@@ -841,6 +841,40 @@ describe("read-only connections: Triggers", () => {
    });
  });
  
