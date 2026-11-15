@@ -1,31 +1,33 @@
 SplitMind patch 0016 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0015).
 Upstream issue: not filed yet.
 Email watch: #125 stale abort after a success, stub cursors for names that never started, migration 0023, sweep ordering, quieter alias-change warn.
-From bd279717b4e23e71b56095669d046730dac615b4 Mon Sep 17 00:00:00 2001
+From 18aad919f8952127558fba1e0fc9f3308d890a10 Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
-Date: Sun, 15 Nov 2026 09:41:03 -0500
+Date: Sun, 15 Nov 2026 09:59:46 -0500
 Subject: [PATCH] fix(email-watch): stale-abort guard, stub cursors, sweep
  ordering (#125)
 
 Stale abort after a success leaves no item; a name whose first get_profile
 fails gets a stub cursor and a 'could not start reading' item after 24 hours;
-migration 0023 adds cursor created_at; a failed items purge skips the cursor
-purge; the alias-change warn only when rows were dropped.
+the stub upgrade and the failing-notice claim only touch the stub this poll
+read (connection_id guard); migration 0023 adds cursor created_at; a failed
+items purge skips the cursor purge; the alias-change warn only when rows were
+dropped.
 ---
  .../0023_email_watch_cursor_created_at.sql    |   5 +
  .../0023_email_watch_cursor_created_at.sql    |   5 +
- src/server/cloudflare-email-watch.test.ts     | 192 ++++-
+ src/server/cloudflare-email-watch.test.ts     | 192 +++-
  src/server/cloudflare/cloudflare-bindings.ts  |   2 +-
  src/server/email-watch/account-fingerprint.ts |   3 +-
  src/server/email-watch/migration.test.ts      | 128 ++-
  src/server/email-watch/rules.ts               |   1 +
  src/server/email-watch/test-support.ts        |   8 +-
- src/server/email-watch/watcher.test.ts        | 767 +++++++++++++++++-
- src/server/email-watch/watcher.ts             | 107 ++-
+ src/server/email-watch/watcher.test.ts        | 866 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             | 108 ++-
  src/server/storage/d1/test-database.ts        |  21 +-
  .../storage/postgres/runtime-store.test.ts    |  68 +-
  .../storage/sqlite/runtime-store.test.ts      |   1 +
- 13 files changed, 1273 insertions(+), 35 deletions(-)
+ 13 files changed, 1373 insertions(+), 35 deletions(-)
  create mode 100644 migrations/0023_email_watch_cursor_created_at.sql
  create mode 100644 migrations/postgresql/0023_email_watch_cursor_created_at.sql
 
@@ -488,7 +490,7 @@ index 8a2f6a34..3f03c71a 100644
    }
    const names = Object.keys(columns);
 diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
-index 7dfcbe82..eb796b6c 100644
+index 7dfcbe82..fad909bc 100644
 --- a/src/server/email-watch/watcher.test.ts
 +++ b/src/server/email-watch/watcher.test.ts
 @@ -540,12 +540,15 @@ describe("policy refusals skip the connection for that run", () => {
@@ -531,7 +533,7 @@ index 7dfcbe82..eb796b6c 100644
      });
  
      it("another failure in the cursors table is logged once by error name, and the items are still purged and expired", async () => {
-@@ -2783,3 +2789,754 @@ describe("the cursor records the account the name resolved to (patch 0015, #101)
+@@ -2783,3 +2789,853 @@ describe("the cursor records the account the name resolved to (patch 0015, #101)
      expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T0), last_run_at: iso(T0 + 10 * 60_000) });
    });
  });
@@ -1286,8 +1288,107 @@ index 7dfcbe82..eb796b6c 100644
 +    expect(results[0]!.results).toHaveLength(2);
 +  });
 +});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0016 review follow-up: a stub is only upgraded, and its failing notice only claimed, while it still holds the
++// connection_id this invocation read. Invocation A reads stub S1 (fingerprint X); before A's write the name is purged
++// and re-stubbed as S2 (fingerprint Y). A must leave S2 alone.
++// ---------------------------------------------------------------------------------------------------------------
++describe("a stale stub write does not touch a stub made for another account (patch 0016 review)", () => {
++  const MIN = 60_000;
++  const OTHER = "d".repeat(64);
++  const FIRST = T0 + 59_000;
++
++  /** One failed first attempt at FIRST leaves stub S1 for fingerprint X (the runner's default for "work"). */
++  async function withStub(): Promise<Rig> {
++    const r = rig();
++    r.mailboxes.work!.failWith("profile", 500);
++    r.clock.now = FIRST;
++    await r.run();
++    expect((await cursorOf(r))?.history_id, "precondition: S1 exists").toBe("");
++    return r;
++  }
++
++  /** What another invocation did meanwhile: the name was purged and stubbed again for fingerprint Y at `createdMs`. */
++  async function restubbed(r: Rig, createdMs: number): Promise<void> {
++    await r.db.prepare("delete from email_watch_cursors where connection_name = 'work'").run();
++    await r.db
++      .prepare(
++        `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id, created_at)
++         values ('work', '', null, ?, 0, null, null, ?, ?)`,
++      )
++      .bind(iso(createdMs), OTHER, iso(createdMs))
++      .run();
++  }
++
++  /** Holds nothing: runs `during` once, after the first get_profile answered and before A writes anything. */
++  function afterProfile(r: Rig, during: () => Promise<void>): void {
++    r.runner.afterRun = async (call) => {
++      if (call.actionId !== "gmail.get_profile") return;
++      r.runner.afterRun = undefined;
++      await during();
++    };
++  }
++
++  it("an upgrade after a successful profile call leaves S2 a stub: history_id '' and last_success_at null", async () => {
++    const r = await withStub();
++    r.mailboxes.work!.clearFailures();
++    r.clock.now = FIRST + 10 * MIN;
++    afterProfile(r, () => restubbed(r, FIRST + 5 * MIN));
++    await r.run();
++    expect(r.runner.afterRun, "A reached its get_profile call").toBeUndefined();
++    expect(await cursorOf(r)).toMatchObject({
++      history_id: "",
++      last_success_at: null,
++      failing_notice_at: null,
++      connection_id: OTHER,
++      created_at: iso(FIRST + 5 * MIN),
++    });
++  });
++
++  it("control: with nothing swapped the same profile call does upgrade the stub", async () => {
++    const r = await withStub();
++    r.mailboxes.work!.clearFailures();
++    r.clock.now = FIRST + 10 * MIN;
++    await r.run();
++    expect(await cursorOf(r)).toMatchObject({ history_id: "1000", last_success_at: iso(FIRST + 10 * MIN), connection_id: r.runner.fingerprintOf("work") });
++  });
++
++  it("a failing-notice claim leaves S2 without failing_notice_at and inserts no item", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR; // S1 is over 24 hours old, so A's abort will try to claim
++    afterProfile(r, () => restubbed(r, FIRST + DAY));
++    await r.run();
++    expect(r.runner.afterRun, "A reached its get_profile call").toBeUndefined();
++    expect(await cursorOf(r)).toMatchObject({ history_id: "", connection_id: OTHER, failing_notice_at: null, last_success_at: null });
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toEqual([]);
++  });
++
++  it("control: with nothing swapped the same abort claims and leaves exactly one item", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR;
++    await r.run();
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toHaveLength(1);
++    expect((await cursorOf(r))!.failing_notice_at).toBe(iso(FIRST + DAY + HOUR));
++  });
++
++  it("S2 still gets its own notice after its own 24 hours, from its own created_at", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR;
++    afterProfile(r, () => restubbed(r, FIRST + DAY));
++    await r.run();
++    r.runner.resolved.work = OTHER;
++    await r.run(); // the name now resolves to Y: S2 matches, A's stale write is long over
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toEqual([]);
++    r.clock.now = FIRST + 2 * DAY;
++    await r.run();
++    expect((await itemsOf(r, "rule_id = 'watch-failing'")).map((row) => row.subject)).toEqual([
++      "Email watch could not start reading this account (trying since 2026-11-12 12:00 UTC)",
++    ]);
++  });
++});
 diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
-index 9f75e8c1..ddbe7d1f 100644
+index 9f75e8c1..e22b2750 100644
 --- a/src/server/email-watch/watcher.ts
 +++ b/src/server/email-watch/watcher.ts
 @@ -46,6 +46,8 @@ interface Cursor {
@@ -1337,7 +1438,7 @@ index 9f75e8c1..ddbe7d1f 100644
        this.logger.warn({ connectionName: name }, "email watch dropped what it had stored for a name that points elsewhere now");
      }
      if (current === undefined) {
-@@ -226,21 +232,65 @@ export class EmailWatcher {
+@@ -226,21 +232,66 @@ export class EmailWatcher {
      return { kind: "go", cursor: undefined, connectionId: current };
    }
  
@@ -1373,14 +1474,15 @@ index 9f75e8c1..ddbe7d1f 100644
 +    }
 +    const now = this.nowIso();
 +    if (stub) {
-+      // Only while it is still a stub: an overlapping invocation may have started it already.
++      // Only while it is still the stub this invocation read: another invocation may have started it, or purged it and
++      // left a new stub for another account.
 +      await this.database
 +        .prepare(
 +          `update email_watch_cursors set history_id = ?, page_token = null, last_run_at = ?, catch_up = 0,
 +             last_success_at = ?, failing_notice_at = null
-+           where connection_name = ? and history_id = ''`,
++           where connection_name = ? and history_id = '' and connection_id is ?`,
 +        )
-+        .bind(historyId, now, now, name)
++        .bind(historyId, now, now, name, stub.connectionId)
 +        .run();
        return;
      }
@@ -1409,7 +1511,7 @@ index 9f75e8c1..ddbe7d1f 100644
        .run();
    }
  
-@@ -495,20 +545,28 @@ export class EmailWatcher {
+@@ -495,20 +546,28 @@ export class EmailWatcher {
    /**
     * A poll that could not read Gmail. The cursor keeps its place and goes back to the normal interval (catch_up is
     * cleared: a connection that keeps failing is not retried every minute). After 24 hours without a successful read
@@ -1430,9 +1532,9 @@ index 9f75e8c1..ddbe7d1f 100644
 -      .bind(this.nowIso(), name)
 +      .prepare(
 +        `update email_watch_cursors set failing_notice_at = ?
-+         where connection_name = ? and failing_notice_at is null and last_success_at is ?`,
++         where connection_name = ? and failing_notice_at is null and last_success_at is ? and connection_id is ?`,
 +      )
-+      .bind(this.nowIso(), name, cursor.lastSuccessAt)
++      .bind(this.nowIso(), name, cursor.lastSuccessAt, cursor.connectionId)
        .run();
      if ((claimed.meta.changes ?? 0) > 0) {
 -      await this.insertPendingGap(name, "watch-failing", `Email watch could not read this account since ${formatMinute(since)}`);
@@ -1443,7 +1545,7 @@ index 9f75e8c1..ddbe7d1f 100644
      }
    }
  
-@@ -564,8 +622,19 @@ export async function sweepEmailWatchRetention(
+@@ -564,8 +623,19 @@ export async function sweepEmailWatchRetention(
        .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
        .run();
    });
@@ -1464,7 +1566,7 @@ index 9f75e8c1..ddbe7d1f 100644
    }
    if (failure !== undefined) logger.error({ errorName: errorName(failure) }, "email watch retention sweep failed");
  }
-@@ -590,6 +659,11 @@ async function purgeUnwatched(
+@@ -590,6 +660,11 @@ async function purgeUnwatched(
    }
  }
  
@@ -1476,7 +1578,7 @@ index 9f75e8c1..ddbe7d1f 100644
  function isMissingTable(error: unknown): boolean {
    return error instanceof Error && /no such table/i.test(error.message);
  }
-@@ -605,7 +679,7 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
+@@ -605,7 +680,7 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
  async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cursor>> {
    const { results } = await database
      .prepare(
@@ -1485,7 +1587,7 @@ index 9f75e8c1..ddbe7d1f 100644
         from email_watch_cursors`,
      )
      .all<CursorRow>();
-@@ -621,6 +695,7 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
+@@ -621,6 +696,7 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
          lastSuccessAt: row.last_success_at,
          failingNoticeAt: row.failing_notice_at,
          connectionId: row.connection_id,

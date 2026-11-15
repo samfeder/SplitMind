@@ -22,8 +22,9 @@ const OPT_OUT = "date-guard: ok";
 const isoPattern = /(?<=["'`]|\$\{[^}]*\})(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}[^"'`]*)?(?=["'`])/g;
 // A slash date directly inside quotes, e.g. "2026/12/29" or "2027/1/5". The month is 1-based.
 const slashPattern = /(?<=["'`])(\d{4})\/(\d{1,2})\/(\d{1,2})(?=["'`])/g;
+// A block comment is matched by the unrolled form, which cannot run past its own `*/` or backtrack badly.
 // new Date(2027, 0, 5 ...), Date.UTC(2027, 0, 5 ...) and the two-argument new Date(2027, 0) (day 1), also with a trailing comma or block comments before the `)`. The month is 0-based.
-const numericPattern = /\b(?:new Date|Date\.UTC)\(\s*(\d{4})\s*,\s*(\d{1,2})\b(?:\s*,\s*(\d{1,2})\b[^)]*|(?:\s|\/\*[\s\S]*?\*\/)*,?(?:\s|\/\*[\s\S]*?\*\/)*)\)/g;
+const numericPattern = /\b(?:new Date|Date\.UTC)\(\s*(\d{4})\s*,\s*(\d{1,2})\b(?:\s*,\s*(\d{1,2})\b[^)]*|(?:(?:\s|\/\*[^*]*\*+(?:[^*/][^*]*\*+)*\/)*,)?(?:\s|\/\*[^*]*\*+(?:[^*/][^*]*\*+)*\/)*)\)/g;
 
 // Returns the day number, or undefined when year, month and day do not map back to themselves (2026-02-30, day 0).
 function dayNumber(year: number, month0: number, day: number): number | undefined {
