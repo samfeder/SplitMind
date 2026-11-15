@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { findExpiringDates, vendorScanDirs } from "../scripts/check-vendor-dates.ts";
 
@@ -174,6 +175,87 @@ describe("findExpiringDates: numeric Date forms (month is 0-based)", () => {
 
     it("an opt-out on the line still skips it", () => {
       expect(scan("new Date(2026, 11,) // date-guard: ok")).toEqual([]);
+    });
+
+    // Review follow-up: the pattern must not backtrack badly, and a comment must not swallow code after it.
+    describe("no catastrophic backtracking, and comments stay comments", () => {
+      const LIMIT_MS = 200;
+      const scanner = pathToFileURL(resolve("scripts/check-vendor-dates.ts")).href;
+      // A pattern that backtracks badly blocks the thread and a vitest timeout cannot interrupt it, so each timing
+      // runs in a child process with a hard kill. The child measures only findExpiringDates, with performance.now().
+      const childSource = [
+        'import { readFileSync } from "node:fs";',
+        "const { findExpiringDates } = await import(process.argv[1]);",
+        'const text = readFileSync(0, "utf8");',
+        "const start = performance.now();",
+        'const found = findExpiringDates([{ path: "src/a.test.ts", text }], new Date("2026-11-15T00:00:00Z"));',
+        "console.log(JSON.stringify({ ms: performance.now() - start, count: found.length }));",
+      ].join("\n");
+      function timed(text: string): { count: number; ms: number } {
+        const run = spawnSync(process.execPath, ["--input-type=module", "-e", childSource, scanner], { input: text, encoding: "utf8", timeout: 10_000 });
+        if (run.error || run.status !== 0) {
+          throw new Error(`the scan did not finish within 10 s (${run.error?.message ?? `status ${run.status}`}): ${run.stderr.slice(0, 200)}`);
+        }
+        return JSON.parse(run.stdout.trim().split("\n").at(-1)!) as { count: number; ms: number };
+      }
+      const comments = (count: number) => " /* c */".repeat(count);
+
+      it("30 block comments before the closing paren: still flagged, within 200 ms", () => {
+        const { count, ms } = timed(`const d = new Date(2026, 11${comments(30)});`);
+        expect(count).toBe(1);
+        expect(ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("30 block comments and then something that is not a closing paren: no finding, within 200 ms", () => {
+        for (const tail of [" d);", ";", " /* never closed )"]) {
+          const { count, ms } = timed(`const d = new Date(2026, 11${comments(30)}${tail}`);
+          expect(count, tail).toBe(0);
+          expect(ms, tail).toBeLessThan(LIMIT_MS);
+        }
+      });
+
+      it("30 block comments after a trailing comma, closed and not closed, within 200 ms", () => {
+        const closed = timed(`new Date(2026, 11,${comments(30)})`);
+        expect(closed.count).toBe(1);
+        expect(closed.ms).toBeLessThan(LIMIT_MS);
+        const open = timed(`new Date(2026, 11,${comments(30)} d)`);
+        expect(open.count).toBe(0);
+        expect(open.ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("40,000 spaces between the month and the closing paren: still flagged, within 200 ms", () => {
+        const { count, ms } = timed(`new Date(2026, 11${" ".repeat(40_000)})`);
+        expect(count).toBe(1);
+        expect(ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("40,000 spaces and then something that is not a closing paren: no finding, within 200 ms", () => {
+        for (const tail of ["d)", ";", ""]) {
+          const { count, ms } = timed(`new Date(2026, 11${" ".repeat(40_000)}${tail}`);
+          expect(count, JSON.stringify(tail)).toBe(0);
+          expect(ms, JSON.stringify(tail)).toBeLessThan(LIMIT_MS);
+        }
+      });
+
+      it("a comment ends at its own */: code after it is not part of it (no false positive from a later comment's */)", () => {
+        // Month 0 of 2026 is outside the window, so this form can only be a finding by accident; the same shape with
+        // month 11 (inside the window) is the one that shows the false positive.
+        expect(scan("new Date(2026, 0 /* Jan */, d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11 /* Dec */, d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11 /* Dec */ d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11, /* day */ d); /* x */)")).toEqual([]);
+      });
+
+      it("a real comment-closed call is still flagged, and so is a trailing comma", () => {
+        expect(scan("new Date(2026, 11 /* Dec */)")).toHaveLength(1);
+        expect(scan("new Date(2026, 11,)")).toHaveLength(1);
+      });
+
+      it("a call followed by a comment on the same line is flagged once, naming only the call", () => {
+        const found = scan("const a = new Date(2026, 11 /* Dec */); /* later */");
+        expect(found).toHaveLength(1);
+        expect(found[0].literal).toBe("new Date(2026, 11 /* Dec */)");
+      });
     });
   });
 });
