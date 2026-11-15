@@ -61,6 +61,14 @@
     // MCP OAuth for claude.ai (pinned decision 3). OAuth is on only while this binding exists.
     { "binding": "OAUTH_KV", "id": "<oauth-kv-namespace-id>" },
   ],
+  // Budgets the unauthenticated MCP OAuth client registrations, which write to OAUTH_KV (patches/0017, #78).
+  // Workers Free allows 1,000 KV writes a day, so the Worker limits these itself. Sign-in writes nothing before the
+  // administrator token, so it does not use the budget.
+  // The class is exported from the Worker's main module, hence no script_name. SQLite-backed, the only kind on Free.
+  "durable_objects": {
+    "bindings": [{ "name": "MCP_OAUTH_ANONYMOUS_WRITES", "class_name": "McpOAuthAnonymousWriteBudget" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["McpOAuthAnonymousWriteBudget"] }],
   "vars": {
     "TRANSIT_FILES_BACKEND": "kv",
     // Transit files (e.g. a downloaded Gmail attachment) are served at an unguessable but unauthenticated URL, so
@@ -87,6 +95,12 @@
     // and Claude Code's loopback callback (any port). Any other client's registration is refused, so a look-alike
     // "Claude" can't be sent to your consent page. Add a client's documented callback here to allow it.
     "OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,http://localhost/callback,http://127.0.0.1/callback",
+    // Daily limits on client registrations (patches/0017): at most 100 a day in total and 20 a day per client
+    // address (IPv6: per /64), both per UTC day. Over a limit, new registrations are refused until 00:00 UTC.
+    // claude.ai and Claude Code use CIMD and don't register, and clients already connected keep refreshing.
+    // Raise a value and redeploy to open it up.
+    "OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY": "100",
+    "OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY": "20",
     // Proposed, not pinned: tokens already default to no trigger access; this makes it explicit.
     // "OOMOL_CONNECT_BLOCKED_TRIGGERS": "*",
   },

@@ -68,6 +68,22 @@ Both drafts reference OpenConnector `v1.9.2` (`2748be7`). Before filing, re-chec
 
 ---
 
+## Draft 3: Budget for anonymous MCP OAuth writes to KV (Cloudflare)
+
+Not filed. Interim patch: `patches/0017-mcp-oauth-anonymous-kv-write-budget.patch` (SplitMind #78).
+
+> **Problem.** Unauthenticated requests write to `OAUTH_KV`: `POST /oauth/mcp/register` (a client record), `GET /oauth/mcp/authorize` when a consent page is shown by creating a transaction first (reachable with an attacker-hosted CIMD client that needs no registration), and `POST /oauth/mcp/token` with a `client_assertion` (a replay marker written after the signature check, which a CIMD client's own `jwks` satisfies). On Workers Free (1,000 KV writes a day) anyone can use the day's writes up in minutes, after which token refreshes for connected clients fail until midnight UTC.
+>
+> **Proposal.** (1) When a Durable Object namespace is bound as `MCP_OAUTH_ANONYMOUS_WRITES` (class `McpOAuthAnonymousWriteBudget`, exported from the Worker, SQLite-backed so it works on Free), registrations (after the redirect allowlist) take a slot from it. Two limits per UTC day, checked and taken in one call: `OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY` (default 100) and `..._PER_IP_PER_DAY` (default 20, keyed on `CF-Connecting-IP`, IPv6 by /64). Over a limit, registration is rejected with `invalid_client_metadata` and a `Retry-After`, with no KV write. If the budget cannot answer, the request is rejected (fail closed). Without the binding, there is no registration cap. (2) The authorize GET renders the consent form with no transaction: the form posts to the same URL, and the POST re-validates the request from its own URL and calls `completeAuthorization` directly after the owner's check, so sign-in writes nothing anonymously. (3) Token requests carrying `client_assertion` are refused with 401 `invalid_client`.
+>
+> **Why a Durable Object.** The Workers Rate Limiting binding counts per location, so it is not strict, and KV counters would spend the writes this protects. One instance serializes the check and the increment.
+>
+> **Trade-off.** An attacker can spend the budget and block new registrations until 00:00 UTC. Clients that use CIMD never register, and existing connections keep refreshing.
+>
+> **Tests.** Through `worker.fetch` with a fake namespace: both limits, allowlist rejections use no slot, the authorize GET writes nothing, UTC rollover, failure rejects with no KV write, no binding means no limit, invalid variables fall back, IPv6 /64 keys, assertions refused. A unit test covers the budget over a fake `storage`, including concurrent calls.
+
+---
+
 ## Interim patch for SplitMind `patches/`
 
 File: `patches/0002-mcp-oauth-configurable-lifetimes-and-redirect-allowlist.patch`. It implements both drafts together, since both change the same handler signature. If upstream wants them split, split at PR time.

@@ -74,6 +74,47 @@ POST /v1/actions/slack.list_channels
 `wrangler.template.jsonc` (the deploy script derives the catalog trim from it), run `npm run deploy`, then connect
 the account. See [adding a provider](adding-a-provider.md).
 
+### Budget for anonymous KV writes (patch 0017, #78)
+
+Workers Free allows 1,000 KV writes a day, and two unauthenticated requests could write to `OAUTH_KV`: registering a
+client (`POST /oauth/mcp/register`) and a token request that carries a client assertion (the library stores a replay
+marker). Starting a sign-in (`GET /oauth/mcp/authorize`) used to store a consent transaction as well. If anyone could
+use the day's writes up, connected clients could not refresh their tokens. Patch 0017 closes all three:
+
+- **Registration is budgeted.** One Durable Object (`MCP_OAUTH_ANONYMOUS_WRITES`) counts registrations per UTC day, so
+  the limit is exact:
+
+  | Setting | Default | Effect |
+  |---|---|---|
+  | `OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY` | `100` | Registrations accepted in total. |
+  | `OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_IP_PER_DAY` | `20` | The same, per client address (`CF-Connecting-IP`; IPv6 counts per /64). |
+
+  Registrations the redirect allowlist refuses use no slot. Over the budget, a registration answers
+  `400 invalid_client_metadata` with a `Retry-After` of the seconds left until 00:00 UTC, and nothing is written. If
+  the counter cannot answer, the registration is refused and an error is logged. An over-budget refusal logs one
+  warning that names the limit that refused (`global` or `per_address`, `global` if both are reached) and neither the
+  address nor the client; a counter failure logs an error; a registration the allowlist refuses logs nothing.
+- **Sign-in writes nothing before the administrator token.** `GET /oauth/mcp/authorize` only shows the consent page.
+  The page posts back to the same URL, and the Worker stores the authorization (and writes anything) only after
+  checking the administrator token, for Allow and for Deny. An anonymous request therefore never writes, and sign-in
+  never touches the budget.
+  A wrong or missing token logs one warning, `{ event: "mcp_oauth_consent_token_refused" }`, with no token, address or client in it.
+- **Client assertions are refused.** A token request with `client_assertion` or `client_assertion_type` gets
+  `401 invalid_client`, since this gateway has no use for them (one warning line, no client_id). Token bodies are
+  also capped at 64 KiB.
+
+Trade-off: an attacker can spend the registration budget and block new registrations until 00:00 UTC. claude.ai and
+Claude Code sign in with CIMD (a client metadata URL) and do not register, so real sign-ins are unaffected, and
+connections that already exist keep refreshing. Clients that do register (some other MCP clients) wait until the
+budget resets.
+
+The way out is to raise the variable: change the value in `wrangler.template.jsonc` and redeploy with
+`npm run deploy`. A value that is empty, not a whole number or below 1 means the default.
+
+The token-endpoint refusal and the body cap run whether or not the `MCP_OAUTH_ANONYMOUS_WRITES` binding exists. Without
+the binding only the registration budget is off. To undo the Durable Object, see the
+[rollback runbook](runbooks/mcp-oauth-budget-rollback.md).
+
 ## 2. Writes must name an account (decision 8, E6.1)
 
 OpenConnector treats a call with no `connectionName` as a call to the connection literally named `default`
