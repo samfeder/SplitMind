@@ -239,15 +239,16 @@ request titles are written by anyone. Mail from github.com that carries that hea
 only. GitHub account mail without it (a new sign-in, say) can still match `account_security`.
 
 **Subjects can be sensitive.** A stored subject is whatever the sender wrote, and a security notice's subject may
-contain a verification code. Before a subject is stored, and before its duplicate key is computed, zero-width
-characters (U+200B, U+200C, U+200D, U+2060, U+FEFF) are removed, then every run of 4 or more digits is replaced with
+contain a verification code. Before a subject is stored, and before its duplicate key is computed, all Unicode
+format characters (category Cf: soft hyphen, zero-width characters, directional marks, tag characters and more) and
+U+034F (combining grapheme joiner) are removed, then every run of 4 or more digits is replaced with
 `[redacted]`, in every category. A digit is any Unicode decimal digit (fullwidth and Arabic-Indic included). Neighbouring
 digits may be separated by nothing or by exactly one separator: whitespace (including no-break spaces), a dot, a
 hyphen, a dash (U+2010 to U+2015) or a minus (U+2212), so `123456`, `123 456`, `482.913` and `482–913` are all
 redacted. Years, invoice numbers, decimals such as `1.234` and IP-like strings with 4 or more digits are redacted too,
 and two code mails with different codes count as one item. **Residual:** these are not redacted: codes that mix
-letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`), and digits split by
-invisible characters other than the zero-width ones removed (a soft hyphen or a directional mark, for example; #114).
+letters and digits, have fewer than 4 digits, or use a multi-character separator (`123 - 456`). A zero-width joiner
+(U+200D) is a format character, so emoji joined with it are split into separate emoji in the stored subject.
 Treat `email_watch_items` like the run log: private, and kept only for the retention period below.
 
 **Forged mail is not surfaced.** A rule can match only when the **first** `Authentication-Results` header on the
@@ -270,10 +271,14 @@ days, then deletes all items and cursors of any account that is not in the curre
 `OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS` list (an empty or unset list purges everything; malformed entries count as
 not watched). So removing an account, or turning the watch off, purges what was stored for it within one interval.
 The sweep uses D1 only: no Gmail call, no KV write, no run-log row. If the tables do not exist yet it does nothing;
-any other failure is logged once per sweep by error name and the other cron work still runs. Each table is handled
-on its own, so a missing table does not stop the purge of the other. The purge of unwatched accounts has no limit on
+any other failure is logged once per sweep by error name and the other cron work still runs. Only the first error
+of a sweep is logged; later, different errors in the same sweep are not logged, on purpose. The pending-expiry delete,
+the acknowledged-expiry delete and each table's purge are independent, so a failure (or a missing table) in one does
+not stop the others. The purge of unwatched accounts has no limit on
 the number of watched accounts (D1 allows 100 bound parameters per statement): it reads the distinct account names in
-each table and deletes the unwatched ones in chunks of 50. **Cost:** with the indexes from migration 0020, each sweep
+each table and deletes the unwatched ones in chunks of 50. **Cost:** with the two status indexes from migration 0020 (the `(connection_name)` index it also created is dropped by
+`0021_email_watch_drop_connection_index.sql`, because the unique `(connection_name, gmail_message_id)` index already
+serves that read), each sweep
 reads about the rows it deletes plus the distinct account names.
 
 **Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)

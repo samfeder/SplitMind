@@ -1,0 +1,972 @@
+SplitMind patch 0014 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0012).
+Upstream issue: not filed yet.
+Email watch tidy-ups: #114 format-character redaction, redundant index, independent expiry deletes.
+From 9149bcd5820acd5b537d6aad70dfbce3d0600fe2 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 07:48:13 -0500
+Subject: [PATCH] fix(email-watch): strip all format characters, drop redundant
+ index, tidy sweep (#114)
+
+#114: code redaction removes every Unicode format character (Cf) and U+034F
+before matching. Migration 0021 drops the (connection_name) index that the
+unique (connection_name, gmail_message_id) index already covers. The pending
+and acknowledged expiry deletes fail independently, with one error log per
+sweep. BindLimitedD1.batch applies the bind limit to each statement.
+---
+ ...0021_email_watch_drop_connection_index.sql |   3 +
+ ...0021_email_watch_drop_connection_index.sql |   3 +
+ src/server/email-watch/migration.test.ts      | 183 +++++++-
+ src/server/email-watch/rules.ts               |   8 +-
+ src/server/email-watch/test-support.ts        |  12 +-
+ src/server/email-watch/watcher.test.ts        | 437 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             |  12 +-
+ .../storage/postgres/runtime-store.test.ts    |  69 ++-
+ .../storage/sqlite/runtime-store.test.ts      |   1 +
+ 9 files changed, 713 insertions(+), 15 deletions(-)
+ create mode 100644 migrations/0021_email_watch_drop_connection_index.sql
+ create mode 100644 migrations/postgresql/0021_email_watch_drop_connection_index.sql
+
+diff --git a/migrations/0021_email_watch_drop_connection_index.sql b/migrations/0021_email_watch_drop_connection_index.sql
+new file mode 100644
+index 00000000..8b8fcd55
+--- /dev/null
++++ b/migrations/0021_email_watch_drop_connection_index.sql
+@@ -0,0 +1,3 @@
++-- Email watch (patch 0014). The (connection_name) index duplicates the leading column of the unique
++-- (connection_name, gmail_message_id) index, so it only costs writes. Migration 0020 is left as it was.
++drop index if exists email_watch_items_connection;
+diff --git a/migrations/postgresql/0021_email_watch_drop_connection_index.sql b/migrations/postgresql/0021_email_watch_drop_connection_index.sql
+new file mode 100644
+index 00000000..8b8fcd55
+--- /dev/null
++++ b/migrations/postgresql/0021_email_watch_drop_connection_index.sql
+@@ -0,0 +1,3 @@
++-- Email watch (patch 0014). The (connection_name) index duplicates the leading column of the unique
++-- (connection_name, gmail_message_id) index, so it only costs writes. Migration 0020 is left as it was.
++drop index if exists email_watch_items_connection;
+diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
+index 44900481..e4e1438f 100644
+--- a/src/server/email-watch/migration.test.ts
++++ b/src/server/email-watch/migration.test.ts
+@@ -148,9 +148,10 @@ describe("0020_email_watch_indexes migration (patch 0012, #111)", () => {
+   });
+ 
+   it("creates plain indexes on email_watch_items (status, created_at), (status, acknowledged_at) and (connection_name)", () => {
++    // Patch 0014 (#114): 0021 drops the (connection_name) index again, so this applies the migrations up to 0020 only.
+     const connection = new DatabaseSync(":memory:");
+     try {
+-      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      for (const migration of defaultMigrationSource.readMigrations("sqlite").filter((entry) => entry.name <= NAME)) connection.exec(migration.sql);
+       const indexes = indexesOf(connection, "email_watch_items");
+       expect(hasIndex(indexes, ["status", "created_at"])).toBe(true);
+       expect(hasIndex(indexes, ["status", "acknowledged_at"])).toBe(true);
+@@ -160,13 +161,13 @@ describe("0020_email_watch_indexes migration (patch 0012, #111)", () => {
+     }
+   });
+ 
+-  it("is visible through the D1 test database too: sqlite_master lists the three indexes on email_watch_items", async () => {
++  it("is visible through the D1 test database too: sqlite_master lists the two status indexes on email_watch_items", async () => {
+     const rows = await selectAll<{ name: string; sql: string | null }>(
+       open(),
+       "select name, sql from sqlite_master where type = 'index' and tbl_name = 'email_watch_items' and sql is not null",
+     );
+     const normalised = rows.map((row) => String(row.sql).replace(/\s+/g, " ").toLowerCase());
+-    for (const columns of ["(status, created_at)", "(status, acknowledged_at)", "(connection_name)"]) {
++    for (const columns of ["(status, created_at)", "(status, acknowledged_at)"]) {
+       expect(normalised.filter((sql) => sql.includes(columns)).length, columns).toBeGreaterThanOrEqual(1);
+     }
+   });
+@@ -223,6 +224,182 @@ describe("0020_email_watch_indexes migration (patch 0012, #111)", () => {
+   });
+ });
+ 
++// Patch 0014, #114: (connection_name) alone is redundant next to the unique (connection_name, gmail_message_id) index,
++// whose leftmost column it is. 0021 drops it. 0020 stays as it was, because it may already be applied somewhere.
++describe("0021_email_watch_drop_connection_index migration (patch 0014, #114)", () => {
++  const NAME = "0021_email_watch_drop_connection_index.sql";
++  const PREVIOUS = "0020_email_watch_indexes.sql";
++
++  interface IndexRow {
++    name: string;
++    unique: number;
++    origin: string;
++  }
++  interface Index {
++    name: string;
++    columns: string[];
++    unique: boolean;
++    origin: string;
++  }
++
++  function indexesOf(connection: { prepare(sql: string): { all(): unknown[] } }, table: string): Index[] {
++    return (connection.prepare(`pragma index_list(${table})`).all() as IndexRow[]).map((row) => ({
++      name: row.name,
++      columns: (connection.prepare(`pragma index_xinfo("${row.name}")`).all() as { seqno: number; name: string | null; key: number }[])
++        .filter((column) => column.key === 1)
++        .sort((a, b) => a.seqno - b.seqno)
++        .map((column) => String(column.name)),
++      unique: row.unique === 1,
++      origin: row.origin,
++    }));
++  }
++
++  const find = (indexes: Index[], columns: string[], unique = false) =>
++    indexes.filter((index) => index.unique === unique && index.columns.join(",") === columns.join(","));
++
++  const migrationsUpTo = (name: string) => defaultMigrationSource.readMigrations("sqlite").filter((entry) => entry.name <= name);
++
++  it("comes right after 0020_email_watch_indexes, in both the D1/SQLite and the Postgres directory", () => {
++    for (const dialect of ["sqlite", "postgresql"] as const) {
++      const names = defaultMigrationSource.readMigrations(dialect).map((migration) => migration.name);
++      expect(names, dialect).toContain(NAME);
++      expect(names.indexOf(NAME), dialect).toBe(names.indexOf(PREVIOUS) + 1);
++    }
++  });
++
++  it("after every migration, email_watch_items keeps the two status indexes and has no index on connection_name alone", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(find(indexes, ["status", "created_at"])).toHaveLength(1);
++      expect(find(indexes, ["status", "acknowledged_at"])).toHaveLength(1);
++      expect(find(indexes, ["connection_name"])).toEqual([]);
++      expect(find(indexes, ["connection_name"], true)).toEqual([]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("keeps the unique (connection_name, gmail_message_id) index and the other indexes from 0019", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite")) connection.exec(migration.sql);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(find(indexes, ["connection_name", "gmail_message_id"], true)).toHaveLength(1);
++      expect(find(indexes, ["status", "received_at"])).toHaveLength(1);
++      expect(find(indexes, ["dedup_key", "created_at"])).toHaveLength(1);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("is visible through the D1 test database: sqlite_master has no index on (connection_name) alone and still has the unique one", async () => {
++    const rows = await selectAll<{ sql: string | null }>(
++      open(),
++      "select sql from sqlite_master where type = 'index' and tbl_name = 'email_watch_items' and sql is not null",
++    );
++    const normalised = rows.map((row) => String(row.sql).replace(/\s+/g, " ").toLowerCase());
++    expect(normalised.filter((sql) => sql.endsWith("(connection_name)"))).toEqual([]);
++    expect(normalised.filter((sql) => sql.includes("(status, created_at)"))).toHaveLength(1);
++    expect(normalised.filter((sql) => sql.includes("(status, acknowledged_at)"))).toHaveLength(1);
++  });
++
++  it("the unique constraint still rejects a second item for the same connection and message once 0021 is applied", async () => {
++    const db = open();
++    await insertItem(db, itemRow({ id: "a", gmail_message_id: "g1" }));
++    await expect(insertItem(db, itemRow({ id: "b", gmail_message_id: "g1" }))).rejects.toThrow(/unique/i);
++  });
++
++  it("applies on top of a database that has 0020 and rows: the connection index goes, every row stays", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of migrationsUpTo(PREVIOUS)) connection.exec(migration.sql);
++      expect(find(indexesOf(connection, "email_watch_items"), ["connection_name"])).toHaveLength(1);
++      connection.exec(`
++        insert into email_watch_cursors values ('work', '1', null, '2026-11-11T12:00:00.000Z', 0);
++        insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1'),
++                 ('a', 'work', 'g2', 't2', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-10T12:00:00.000Z', 'acknowledged', '2026-11-11T12:00:00.000Z', 'k2');
++      `);
++      connection.exec(defaultMigrationSource.readMigrations("sqlite").find((entry) => entry.name === NAME)!.sql);
++      expect(connection.prepare("select id from email_watch_items order by id").all()).toEqual([{ id: "a" }, { id: "p" }]);
++      expect(connection.prepare("select connection_name from email_watch_cursors").all()).toEqual([{ connection_name: "work" }]);
++      const indexes = indexesOf(connection, "email_watch_items");
++      expect(find(indexes, ["connection_name"])).toEqual([]);
++      expect(find(indexes, ["status", "created_at"])).toHaveLength(1);
++      expect(find(indexes, ["status", "acknowledged_at"])).toHaveLength(1);
++      expect(find(indexes, ["connection_name", "gmail_message_id"], true)).toHaveLength(1);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("does not fail on a database where the 0020 connection index is already gone (drop if exists), and can run twice", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of migrationsUpTo("0019_email_watch.sql")) connection.exec(migration.sql);
++      const sql = defaultMigrationSource.readMigrations("sqlite").find((entry) => entry.name === NAME)!.sql;
++      expect(() => connection.exec(sql)).not.toThrow();
++      expect(() => connection.exec(sql)).not.toThrow();
++      expect(find(indexesOf(connection, "email_watch_items"), ["connection_name", "gmail_message_id"], true)).toHaveLength(1);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("leaves 0020 itself unchanged: it still creates all three indexes, the redundant one included", () => {
++    const sql = defaultMigrationSource.readMigrations("sqlite").find((entry) => entry.name === PREVIOUS)!.sql;
++    expect(sql).toMatch(/create index email_watch_items_status_created on email_watch_items \(status, created_at\)/);
++    expect(sql).toMatch(/create index email_watch_items_status_acknowledged on email_watch_items \(status, acknowledged_at\)/);
++    expect(sql).toMatch(/create index email_watch_items_connection on email_watch_items \(connection_name\)/);
++    const postgres = defaultMigrationSource.readMigrations("postgresql").find((entry) => entry.name === PREVIOUS)!.sql;
++    expect(postgres).toMatch(/create index email_watch_items_connection on email_watch_items \(connection_name\)/);
++  });
++
++  it("the Postgres file drops the index 0020 created, by name, only if it exists", () => {
++    const sql = defaultMigrationSource.readMigrations("postgresql").find((entry) => entry.name === NAME)?.sql;
++    expect(sql).toBeDefined();
++    expect(sql).toMatch(/drop\s+index\s+if\s+exists\s+(?:\w+\.)?email_watch_items_connection\s*;/i);
++    expect(sql).not.toMatch(/drop\s+table/i);
++  });
++});
++
++// Patch 0014, #114 (cost claim): the purge reads the distinct connection names of email_watch_items. With
++// (connection_name) alone dropped, the unique (connection_name, gmail_message_id) index must still answer that read,
++// so the plan must name an index and never be a bare table scan. The SQL is the purge's statement in watcher.ts; the
++// watcher.test.ts counterpart captures the statement the sweep actually runs.
++describe("the purge's distinct connection_name read uses an index (patch 0014, #114)", () => {
++  const DISTINCT_READ = "select distinct connection_name from email_watch_items";
++
++  function plan(migrationNames: (name: string) => boolean): string[] {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of defaultMigrationSource.readMigrations("sqlite").filter((entry) => migrationNames(entry.name))) {
++        connection.exec(migration.sql);
++      }
++      return (connection.prepare(`EXPLAIN QUERY PLAN ${DISTINCT_READ}`).all() as { detail: string }[]).map((row) => row.detail);
++    } finally {
++      connection.close();
++    }
++  }
++
++  const usesAnIndex = (lines: string[]) => {
++    const scans = lines.filter((line) => line.includes("email_watch_items"));
++    return scans.length > 0 && scans.every((line) => /USING (COVERING )?INDEX/.test(line));
++  };
++
++  it("with every migration applied (0021 included), the plan reads an index and not the bare table", () => {
++    const lines = plan(() => true);
++    expect(usesAnIndex(lines), lines.join("\n")).toBe(true);
++  });
++
++  it("with the migrations through 0020 (both connection indexes present), the plan reads an index too", () => {
++    const lines = plan((name) => name <= "0020_email_watch_indexes.sql");
++    expect(usesAnIndex(lines), lines.join("\n")).toBe(true);
++  });
++});
++
+ describe("Postgres parity", () => {
+   it("has the same 0019 file name as the D1 migration", () => {
+     const names = defaultMigrationSource.readMigrations("postgresql").map((migration) => migration.name);
+diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
+index a5581063..44c0522a 100644
+--- a/src/server/email-watch/rules.ts
++++ b/src/server/email-watch/rules.ts
+@@ -189,17 +189,19 @@ function stripControlCharacters(text: string): string {
+   return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+ }
+ 
+-const ZERO_WIDTH = /\u200b|\u200c|\u200d|\u2060|\ufeff/g;
++// Every Unicode format character (Cf: soft hyphen, zero-width, directional marks, tag characters, ...) plus the
++// combining grapheme joiner (U+034F, category Mn), which renders as nothing.
++const INVISIBLE = /[\p{Cf}\u034f]/gu;
+ // One separator at most between digits: whitespace (incl. no-break spaces), ".", "-", U+2010-U+2015 and U+2212.
+ const CODE_RUN = /\p{Nd}(?:[\s.\u002d\u2010-\u2015\u2212]?\p{Nd}){3,}/gu;
+ 
+ /**
+- * Remove zero-width characters, then replace every run of 4 or more Unicode decimal digits, where one separator
++ * Remove invisible format characters, then replace every run of 4 or more Unicode decimal digits, where one separator
+  * character may sit between neighbouring digits, so a one-time code is never stored. Codes that mix letters and
+  * digits, have fewer than 4 digits or use a multi-character separator are left alone (documented residual).
+  */
+ export function redactCodes(subject: string): string {
+-  return subject.replace(ZERO_WIDTH, "").replace(CODE_RUN, "[redacted]");
++  return subject.replace(INVISIBLE, "").replace(CODE_RUN, "[redacted]");
+ }
+ 
+ function truncate(subject: string): string {
+diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
+index 025d5d56..6c19369a 100644
+--- a/src/server/email-watch/test-support.ts
++++ b/src/server/email-watch/test-support.ts
+@@ -460,6 +460,9 @@ export interface ExecutedStatement {
+   bound: number;
+ }
+ 
++/** Bind count of every statement a BindLimitedD1 handed out, so any instance can check it at batch time. */
++const boundCounts = new WeakMap<object, number>();
++
+ /**
+  * A D1 database that behaves like the real one in the one way SQLite does not: binding more than `limit` values
+  * to one statement throws, as D1 does ("too many SQL variables"). Records every statement that gets executed.
+@@ -477,6 +480,8 @@ export class BindLimitedD1 implements D1DatabaseBinding {
+   }
+ 
+   batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null }[]> {
++    // Check every statement first: none may run when one is oversized.
++    for (const statement of statements) this.checkBound(boundCounts.get(statement) ?? 0);
+     return this.inner.batch(statements.map((statement) => this.originals.get(statement) ?? statement));
+   }
+ 
+@@ -484,11 +489,15 @@ export class BindLimitedD1 implements D1DatabaseBinding {
+     return this.wrap(this.inner.prepare(query), query, 0);
+   }
+ 
++  private checkBound(count: number): void {
++    if (count > this.limit) throw new Error(`D1_ERROR: too many SQL variables (${count} bound, limit ${this.limit})`);
++  }
++
+   private wrap(statement: D1PreparedStatementBinding, query: string, bound: number): D1PreparedStatementBinding {
+     const record = () => this.executed.push({ query, bound });
+     const wrapped = {
+       bind: (...values: unknown[]) => {
+-        if (values.length > this.limit) throw new Error(`D1_ERROR: too many SQL variables (${values.length} bound, limit ${this.limit})`);
++        this.checkBound(values.length);
+         return this.wrap(statement.bind(...values), query, values.length);
+       },
+       first: (...args: []) => (record(), statement.first(...args)),
+@@ -496,6 +505,7 @@ export class BindLimitedD1 implements D1DatabaseBinding {
+       run: () => (record(), statement.run()),
+     } as D1PreparedStatementBinding;
+     this.originals.set(wrapped, statement);
++    boundCounts.set(wrapped, bound);
+     return wrapped;
+   }
+ }
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index 79e11fb2..9d93584b 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -39,6 +39,8 @@
+ import { createHash } from "node:crypto";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { ActionPolicyService } from "../../core/action-policy.ts";
++import type { ExecutionContext } from "../../core/types.ts";
++import { createMailWatchExecutors } from "../../providers/mail_watch/executors.ts";
+ import type { D1DatabaseBinding } from "../cloudflare/cloudflare-bindings.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+ import {
+@@ -1077,6 +1079,14 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+   const REDACTED = "Your verification code is [redacted]";
+   const codeMail = (code: string) => `Your verification code is ${code}`;
+   const ZERO_WIDTH = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"];
++  // Patch 0014 (#114): the Unicode format characters (category Cf) other than the five above, written out as literals
++  // from the Unicode character database, plus U+034F (a combining mark that joins nothing and shows nothing).
++  const FORMAT_CHARACTERS = [
++    "\u00ad", "\u034f", "\u061c", "\u180e", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
++    "\u2061", "\u2062", "\u2063", "\u2064", "\u2066", "\u2067", "\u2068", "\u2069", "\u206a", "\u206f",
++    "\ufff9", "\ufffa", "\ufffb", "\u0600", "\u06dd", "\u070f",
++    "\u{1d173}", "\u{e0001}", "\u{e0031}", "\u{e007f}",
++  ];
+   const DASHES = ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015"];
+ 
+   it.each([
+@@ -1155,9 +1165,8 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+     ["an underscore", "482_913"],
+     ["a colon", "482:913"],
+     ["a plus sign", "482+913"],
+-    ["a soft hyphen U+00AD", "482\u00ad913"],
+     ["a double vertical line U+2016, just outside the dash range", "482\u2016913"],
+-    ["a right-to-left mark U+200F", "482\u200f913"],
++    ["a combining acute accent U+0301 and a variation selector U+FE0F, which are not format characters", "482\u0301\ufe0f913"],
+     ["an inverse plus-minus U+2213, just after the minus sign", "482\u2213913"],
+     ["a fullwidth hyphen-minus U+FF0D", "\uff14\uff18\uff12\uff0d\uff19\uff11\uff13"],
+     ["superscript digits, which are not decimal digits", "\u00b9\u00b2\u00b3\u2074\u2075"],
+@@ -1241,7 +1250,8 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+       return DIGIT_BASES.some((base) => point >= base && point <= base + 9);
+     };
+     const SEPARATORS = new Set([" ", "\u00a0", "\u202f", "\u2007", "\u3000", ".", "-", "\u2010", "\u2013", "\u2015", "\u2212"]);
+-    const REMOVED = new Set(ZERO_WIDTH);
++    // Patch 0014 (#114): every format character goes, not only the zero-width ones. FORMAT_CHARACTERS is a literal list.
++    const REMOVED = new Set([...ZERO_WIDTH, ...FORMAT_CHARACTERS]);
+ 
+     function unicodeOracle(raw: string): string {
+       const text = [...raw].filter((char) => !REMOVED.has(char));
+@@ -1337,6 +1347,224 @@ describe("one-time codes in subjects are never stored (patch 0011, #105)", () =>
+       expect(unicodeOracle("a \u0664\u0668\u0662\u0669 b")).toBe("a [redacted] b");
+       expect(unicodeOracle("a 1.234 b")).toBe("a [redacted] b");
+       expect(unicodeOracle("a 1.2.3 b")).toBe("a 1.2.3 b");
++      // Patch 0014: format characters of every kind are removed too.
++      expect(unicodeOracle("a 1\u00ad2\u00ad3\u00ad4 b")).toBe("a [redacted] b");
++      expect(unicodeOracle("a 12\u200e3 b")).toBe("a 123 b");
++    });
++
++    it("matches the oracle on 90 random subjects mixing digits, separators and format characters of every kind (patch 0014, #114)", async () => {
++      let state = 114114;
++      const next = (bound: number) => {
++        state = (state * 1103515245 + 12345) % 2147483648;
++        return Math.floor(state / 65536) % bound;
++      };
++      const alphabet = [
++        ..."0123456789",
++        ..."0123456789",
++        ..."0123456789",
++        ..."0123456789",
++        ..."0123456789".split("").map((d) => String.fromCodePoint(0xff10 + Number(d))),
++        " ",
++        "\u00a0",
++        ".",
++        "-",
++        "\u2013",
++        "\u2212",
++        "a",
++        "/",
++        ",",
++        "\u0301",
++        "\ufe0f",
++        ...FORMAT_CHARACTERS,
++        ...FORMAT_CHARACTERS,
++        ...ZERO_WIDTH,
++      ];
++      const cases: string[] = [];
++      for (let index = 0; index < 90; index += 1) {
++        let tail = "";
++        for (let step = 0, length = 4 + next(14); step < length; step += 1) tail += alphabet[next(alphabet.length)];
++        const id = String.fromCharCode(97 + (index % 26)) + String.fromCharCode(97 + Math.floor(index / 26));
++        cases.push(`Deployment failed ${id}x${tail}x`);
++      }
++      const r = rig();
++      await seed(r);
++      const byMessage = new Map<string, string>();
++      for (let batch = 0; batch < 8; batch += 1) {
++        for (const subject of cases.slice(batch * 12, batch * 12 + 12)) byMessage.set(r.mailboxes.work!.deliver(failed(subject)), subject);
++        r.clock.now += 600_000;
++        await r.run();
++      }
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(90);
++      for (const row of rows) {
++        const original = byMessage.get(row.gmail_message_id)!;
++        expect(row.subject, JSON.stringify(original)).toBe(unicodeOracle(original));
++      }
++      const changed = cases.filter((subject) => unicodeOracle(subject) !== subject).length;
++      const redacted = cases.filter((subject) => unicodeOracle(subject).includes("[redacted]")).length;
++      expect(changed).toBeGreaterThan(60);
++      expect(redacted).toBeGreaterThan(15);
++      expect(cases.length - redacted).toBeGreaterThan(5);
++    });
++  });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // Patch 0014, #114: every Unicode format character (Cf) and U+034F is removed before matching, so none of them
++  // can hide a digit run. Expected values are literals.
++  // -------------------------------------------------------------------------------------------------------------
++  describe("all invisible format characters are removed (patch 0014, #114)", () => {
++    it.each([
++      ["soft hyphens between every digit", "1\u00ad2\u00ad3\u00ad4"],
++      ["a left-to-right mark in the middle", "48\u200e2913"],
++      ["a left-to-right embedding and a pop directional formatting", "482\u202a913\u202c"],
++      ["invisible separators between the digits", "4\u20638\u20632\u20639"],
++      ["a Mongolian vowel separator", "48\u180e29"],
++      ["a combining grapheme joiner", "48\u034f2913"],
++      ["an isolate wrapped around a six-digit code", "\u2066482913\u2069"],
++      ["a right-to-left override pair", "\u202e482913\u202c"],
++      ["an Arabic letter mark", "48\u061c2913"],
++      ["a byte order mark and a word joiner", "4\ufeff8\u20602913"],
++      ["a tag digit (an astral format character) between digits", "48\u{e0031}2913"],
++      ["a format character beside a separator", "482\u00ad-\u00ad913"],
++      ["a format character after a fullwidth digit", "\uff14\u200e\uff18\uff12\uff19"],
++    ])("redacts a code with %s, leaving no digit of it", async (_name, code) => {
++      const stored = await storedSubject(google(codeMail(code)));
++      expect(stored).toBe(REDACTED);
++      expect(stored).not.toMatch(/\p{Nd}/u);
++    });
++
++    it.each(FORMAT_CHARACTERS.map((char) => [`U+${char.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`, char]))(
++      "removes the format character %s from a stored subject, and it cannot split a digit run",
++      async (_name, char) => {
++        expect(await storedSubject(google(codeMail(`4${char}8${char}2${char}9`)))).toBe(REDACTED);
++        expect(await storedSubject(failed(`Deployment${char} failed for my${char}-app`))).toBe("Deployment failed for my-app");
++      },
++    );
++
++    it("no format character is left anywhere in a stored subject", async () => {
++      const everything = FORMAT_CHARACTERS.join("") + ZERO_WIDTH.join("");
++      const stored = await storedSubject(failed(`Deployment ${everything}failed${everything} for${everything} my-app`));
++      expect(stored).toBe("Deployment failed for my-app");
++      expect(stored).toHaveLength("Deployment failed for my-app".length);
++    });
++
++    it("leaves ordinary text, accents and an emoji with a variation selector alone", async () => {
++      expect(await storedSubject(failed("Deployment failed for caf\u00e9 e\u0301 \u2764\ufe0f"))).toBe(
++        "Deployment failed for caf\u00e9 e\u0301 \u2764\ufe0f",
++      );
++    });
++
++    it("splits an emoji ZWJ sequence into its emoji (accepted: U+200D is a format character)", async () => {
++      expect(await storedSubject(failed("Deployment failed \u{1f469}\u200d\u{1f4bb}"))).toBe("Deployment failed \u{1f469}\u{1f4bb}");
++    });
++
++    it.each([
++      ["a plain three-digit number", "Your verification code is 123", "Your verification code is 123"],
++      ["a three-digit number split by a soft hyphen", "Your verification code is 12\u00ad3", "Your verification code is 123"],
++      ["a three-digit number with a directional mark after it", "Your verification code is 123\u200e", "Your verification code is 123"],
++      ["123 - 456, a multi-character separator", "Your verification code is 123 - 456", "Your verification code is 123 - 456"],
++      ["123 - 456 with format characters around the hyphen", "Your verification code is 123\u200e - \u200e456", "Your verification code is 123 - 456"],
++      ["two three-digit numbers split by a combining grapheme joiner and a space pair", "Your verification code is 123\u034f  456", "Your verification code is 123  456"],
++    ])("leaves %s unredacted", async (_name, subject, expected) => {
++      expect(await storedSubject(google(subject))).toBe(expected);
++    });
++
++    it("the verification code rule still matches when the code is hidden by format characters", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(google(codeMail("48\u200e2913")));
++      r.clock.now += 600_000;
++      await r.run();
++      expect(await itemsOf(r)).toMatchObject([
++        { category: "account_security", rule_id: "account-security", sender_domain: "accounts.google.com", subject: REDACTED },
++      ]);
++    });
++
++    it("mails whose codes differ and are hidden in different ways merge into one item with no digit stored or logged", async () => {
++      const codes = ["1\u00ad2\u00ad3\u00ad4", "48\u200e2913", "552\u202a901\u202c", "7\u20636\u20633\u20630\u20639", "93\u180e117", "60\u034f4419", "\u2066818205\u2069"];
++      const r = rig();
++      await seed(r);
++      for (const code of codes) r.mailboxes.work!.deliver(google(codeMail(code)));
++      r.clock.now += 600_000;
++      await r.run();
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]).toMatchObject({ subject: REDACTED, occurrences: codes.length });
++      expect(rows[0]!.dedup_key).toBe(hash("account_security", "accounts.google.com", REDACTED));
++      for (const column of ["subject", "sender_domain", "category", "rule_id"]) {
++        expect(String(rows[0]![column]), column).not.toMatch(/\p{Nd}/u);
++      }
++      expect(r.log.text()).not.toMatch(/1234|482|913|552|901|76309|93117|604419|818205/);
++    });
++
++    it("a subject with soft hyphens and directional marks merges with the same subject without them", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(failed("Deployment failed for my-app"));
++      r.mailboxes.work!.deliver(failed("Deployment\u00ad failed\u200e for \u2066my-app\u2069"));
++      r.clock.now += 600_000;
++      await r.run();
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]).toMatchObject({ subject: "Deployment failed for my-app", occurrences: 2 });
++      expect(rows[0]!.dedup_key).toBe(hash("deploy_failed", "vercel.com", "Deployment failed for my-app"));
++    });
++
++    it("removes format characters before the 200-character cut: invisible padding does not push visible text out", async () => {
++      const prefix = "Deployment failed ";
++      const visible = "x".repeat(170);
++      const padding = "\u00ad".repeat(60);
++      const stored = await storedSubject(failed(`${prefix}${visible}${padding}END`));
++      expect(stored).toBe(`${prefix}${visible}END`);
++      expect(stored).toHaveLength(191);
++    });
++
++    it("applies the 200-character cut and the dedup key to the subject with format characters removed", async () => {
++      const r = rig();
++      await seed(r);
++      const base = "Deployment failed " + "y".repeat(190);
++      r.mailboxes.work!.deliver(failed(`${base}ZZZZZZZZZZ`));
++      r.mailboxes.work!.deliver(failed(`${"\u200e".repeat(80)}${base}${"\u2063".repeat(50)}ZZZZZZZZZZ`));
++      r.clock.now += 600_000;
++      await r.run();
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]!.subject).toBe(base.slice(0, 200));
++      expect(rows[0]!.occurrences).toBe(2);
++      expect(rows[0]!.dedup_key).toBe(hash("deploy_failed", "vercel.com", base.slice(0, 200)));
++    });
++
++    it("the gap notice is untouched", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(failed("Deployment failed before the gap"));
++      r.mailboxes.work!.expireHistory();
++      r.clock.now += 600_000;
++      await r.run();
++      expect((await itemsOf(r))[0]!.subject).toBe("Mail between 2026-11-11 12:00 UTC and now was not checked");
++    });
++
++    it("list_pending_mail returns the redacted subject with the format characters gone", async () => {
++      const r = rig();
++      await seed(r);
++      r.mailboxes.work!.deliver(google(codeMail("48\u200e2913")));
++      r.mailboxes.work!.deliver(failed("Deployment\u00ad failed\u202a for my-app\u202c"));
++      r.clock.now += 600_000;
++      await r.run();
++      const executors = createMailWatchExecutors({
++        database: r.db,
++        enabled: true,
++        profileEmail: async () => OWNER_EMAIL,
++        now: () => r.clock.now,
++      });
++      const result = await executors["mail_watch.list_pending_mail"]!(
++        {},
++        { getCredential: async () => undefined, isConnectionAllowed: async () => true } as ExecutionContext,
++      );
++      expect(result).toMatchObject({ ok: true });
++      const items = (result.output as { items: { subject: string }[] }).items;
++      expect(items.map((item) => item.subject).sort()).toEqual(["Deployment failed for my-app", REDACTED]);
++      for (const item of items) expect(item.subject).not.toMatch(/[\u00ad\u200e\u202a\u202c]|\p{Nd}/u);
+     });
+   });
+ });
+@@ -1659,5 +1887,208 @@ describe("retention sweep limits (patch 0012, #111)", () => {
+       expect(expiry).toHaveLength(1);
+       expect(await planOf(sqlite, expiry[0]!)).toMatch(/SEARCH email_watch_items USING (COVERING )?INDEX \S+ \(status=\? AND acknowledged_at<\?\)/);
+     });
++
++    // Patch 0014, #114 (cost claim): 0021 drops the (connection_name) index because the unique
++    // (connection_name, gmail_message_id) index leads with the same column. The purge's read of the distinct connection
++    // names must still be answered from an index, not from a scan of the table itself. If the query as written cannot
++    // use the unique index, the implementation changes the query, not this test.
++    it("the purge's read of distinct connection names on email_watch_items is answered from an index, with every migration applied", async () => {
++      const { sqlite, db, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await sweepEmailWatchRetention(db, ["a"], log.logger, NOW);
++      const reads = db.executed.filter((statement) => /^\s*select\b/i.test(statement.query) && /\bemail_watch_items\b/.test(statement.query));
++      expect(reads.length).toBeGreaterThanOrEqual(1);
++      for (const read of reads) {
++        const plan = await planOf(sqlite, read);
++        const mentions = plan.split("\n").filter((line) => line.includes("email_watch_items"));
++        expect(mentions.length, read.query).toBeGreaterThanOrEqual(1);
++        for (const line of mentions) expect(line, `${read.query}\n${plan}`).toMatch(/USING (COVERING )?INDEX/);
++      }
++    });
++  });
++
++  // Patch 0014, #114: the two expiry deletes are separate statements and fail separately. One failing for a reason other
++  // than a missing table must not skip the other, nor the purge. One error line per sweep, naming the first error only.
++  describe("the two expiry deletes are independent (patch 0014, #114)", () => {
++    class PendingExpiryFailure extends Error {
++      override name = "PendingExpiryFailure";
++    }
++    class AcknowledgedExpiryFailure extends Error {
++      override name = "AcknowledgedExpiryFailure";
++    }
++    class PurgeFailure extends Error {
++      override name = "PurgeFailure";
++    }
++    const secret = "Quarterly numbers for pat@example.com, code 482913";
++
++    const isPendingExpiry = (query: string) => /^\s*delete\s+from\s+email_watch_items\b/i.test(query) && /created_at/.test(query);
++    const isAcknowledgedExpiry = (query: string) => /^\s*delete\s+from\s+email_watch_items\b/i.test(query) && /acknowledged_at/.test(query);
++    const isPurge = (query: string) => /email_watch_cursors/.test(query);
++
++    type Rule = { when: (query: string) => boolean; error: () => Error };
++    /** Throws when the statement is prepared ("at prepare") or when it runs ("at run"), as a failing D1 call does. */
++    function failing(inner: SqliteD1Database, rules: Rule[], at: "prepare" | "run"): D1DatabaseBinding {
++      return {
++        batch: (statements) => inner.batch(statements),
++        prepare(query: string) {
++          const rule = rules.find((candidate) => candidate.when(query));
++          if (rule && at === "prepare") throw rule.error();
++          const statement = inner.prepare(query);
++          if (!rule) return statement;
++          const rejecting = () => Promise.reject(rule.error());
++          const wrapped: any = {
++            bind: (...values: unknown[]) => {
++              statement.bind(...values);
++              return wrapped;
++            },
++            first: rejecting,
++            all: rejecting,
++            run: rejecting,
++          };
++          return wrapped;
++        },
++      };
++    }
++
++    /** One watched connection "a" with an expired pending item and an expired acknowledged item, plus an unwatched "gone". */
++    async function seeded() {
++      const { sqlite, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await insertItem(sqlite, itemRow({ id: "a#pending-old", connection_name: "a", created_at: old, received_at: old }));
++      await insertItem(
++        sqlite,
++        itemRow({ id: "a#ack-old", connection_name: "a", status: "acknowledged", acknowledged_at: stamp(NOW - 8 * DAY), created_at: old }),
++      );
++      return { sqlite, log };
++    }
++    const itemIds = async (sqlite: SqliteD1Database) =>
++      (await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id);
++
++    describe.each(["prepare", "run"] as const)("when the failure happens at %s", (at) => {
++      it("a failing pending-expiry delete does not skip the acknowledged-expiry delete or the purge, and logs one line naming the error", async () => {
++        const { sqlite, log } = await seeded();
++        const database = failing(sqlite, [{ when: isPendingExpiry, error: () => new PendingExpiryFailure(secret) }], at);
++        await sweepEmailWatchRetention(database, ["a"], log.logger, NOW);
++        // The acknowledged item that expired is gone; the pending one whose delete failed is still there; the purge ran.
++        expect(await itemIds(sqlite)).toEqual(["a#a", "a#p", "a#pending-old"]);
++        expect(await cursorConnections(sqlite)).toEqual(["a"]);
++        expect(log.entries).toHaveLength(1);
++        expect(log.entries[0]!.level).toBe("error");
++        expect(log.text()).toContain("PendingExpiryFailure");
++        for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
++      });
++
++      it("a failing acknowledged-expiry delete does not skip the pending-expiry delete or the purge, and logs one line naming the error", async () => {
++        const { sqlite, log } = await seeded();
++        const database = failing(sqlite, [{ when: isAcknowledgedExpiry, error: () => new AcknowledgedExpiryFailure(secret) }], at);
++        await sweepEmailWatchRetention(database, ["a"], log.logger, NOW);
++        expect(await itemIds(sqlite)).toEqual(["a#a", "a#ack-old", "a#p"]);
++        expect(await cursorConnections(sqlite)).toEqual(["a"]);
++        expect(log.entries).toHaveLength(1);
++        expect(log.entries[0]!.level).toBe("error");
++        expect(log.text()).toContain("AcknowledgedExpiryFailure");
++        for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
++      });
++
++      it("both expiry deletes failing: one line, naming the first error (the pending-expiry one) only; the purge still runs", async () => {
++        const { sqlite, log } = await seeded();
++        const database = failing(
++          sqlite,
++          [
++            { when: isPendingExpiry, error: () => new PendingExpiryFailure(secret) },
++            { when: isAcknowledgedExpiry, error: () => new AcknowledgedExpiryFailure(secret) },
++          ],
++          at,
++        );
++        await sweepEmailWatchRetention(database, ["a"], log.logger, NOW);
++        expect(await itemIds(sqlite)).toEqual(["a#a", "a#ack-old", "a#p", "a#pending-old"]);
++        expect(await cursorConnections(sqlite)).toEqual(["a"]);
++        expect(log.entries).toHaveLength(1);
++        expect(log.text()).toContain("PendingExpiryFailure");
++        expect(log.text()).not.toContain("AcknowledgedExpiryFailure");
++      });
++
++      it("a failing expiry delete followed by a different failure in the purge: still one line, the first error only", async () => {
++        const { sqlite, log } = await seeded();
++        const database = failing(
++          sqlite,
++          [
++            { when: isAcknowledgedExpiry, error: () => new AcknowledgedExpiryFailure(secret) },
++            { when: isPurge, error: () => new PurgeFailure(secret) },
++          ],
++          at,
++        );
++        await sweepEmailWatchRetention(database, ["a"], log.logger, NOW);
++        // Pending expiry and the items purge still ran.
++        expect(await itemIds(sqlite)).toEqual(["a#a", "a#ack-old", "a#p"]);
++        expect(log.entries).toHaveLength(1);
++        expect(log.text()).toContain("AcknowledgedExpiryFailure");
++        expect(log.text()).not.toContain("PurgeFailure");
++      });
++
++      it("a failing expiry delete does not stop the purge when nothing is watched", async () => {
++        const { sqlite, log } = await seeded();
++        const database = failing(sqlite, [{ when: isPendingExpiry, error: () => new PendingExpiryFailure(secret) }], at);
++        await sweepEmailWatchRetention(database, [], log.logger, NOW);
++        expect(await itemIds(sqlite)).toEqual([]);
++        expect(await cursorConnections(sqlite)).toEqual([]);
++        expect(log.entries).toHaveLength(1);
++      });
++    });
++
++    it("no failure: both expiry deletes and the purge run, and nothing is logged", async () => {
++      const { sqlite, log } = await seeded();
++      await sweepEmailWatchRetention(sqlite, ["a"], log.logger, NOW);
++      expect(await itemIds(sqlite)).toEqual(["a#a", "a#p"]);
++      expect(await cursorConnections(sqlite)).toEqual(["a"]);
++      expect(log.entries).toEqual([]);
++    });
++  });
++
++  // Patch 0014, #114: BindLimitedD1.batch applies the same bind-count check to each batched statement as prepare().bind() does.
++  // A statement bound through a more permissive database (or any other way around the limit) must not get through a
++  // batch of the limited one. So the bound-value count belongs to the statement, not to the database that prepared it.
++  describe("BindLimitedD1.batch checks every batched statement (harness self-test)", () => {
++    const placeholders = (count: number) => Array.from({ length: count }, () => "?").join(", ");
++    const values = (count: number) => Array.from({ length: count }, (_, index) => index);
++
++    it("rejects a batch holding a statement with 101 binds, and runs none of its statements", async () => {
++      const sqlite = new SqliteD1Database();
++      databases.push(sqlite);
++      const strict = new BindLimitedD1(sqlite, 100);
++      const permissive = new BindLimitedD1(sqlite, 1000);
++      const fine = strict.prepare("insert into email_watch_cursors (connection_name, history_id, last_run_at, catch_up) values (?, ?, ?, 0)").bind("work", "1", "2026-11-11T12:00:00.000Z");
++      const tooMany = permissive.prepare(`select ${placeholders(101)}`).bind(...values(101));
++      await expect((async () => strict.batch([fine, tooMany]))()).rejects.toThrow(/too many SQL variables/);
++      expect(await selectAll(sqlite, "select connection_name from email_watch_cursors")).toEqual([]);
++    });
++
++    it("rejects the oversize statement wherever it sits in the batch", async () => {
++      const sqlite = new SqliteD1Database();
++      databases.push(sqlite);
++      const strict = new BindLimitedD1(sqlite, 100);
++      const permissive = new BindLimitedD1(sqlite, 1000);
++      const small = () => strict.prepare("select ?").bind(1);
++      const big = () => permissive.prepare(`select ${placeholders(150)}`).bind(...values(150));
++      await expect((async () => strict.batch([big(), small()]))()).rejects.toThrow(/too many SQL variables/);
++      await expect((async () => strict.batch([small(), small(), big()]))()).rejects.toThrow(/too many SQL variables/);
++    });
++
++    it("accepts a batch of statements with exactly 100 binds each, and an empty batch", async () => {
++      const sqlite = new SqliteD1Database();
++      databases.push(sqlite);
++      const limited = new BindLimitedD1(sqlite, 100);
++      const hundred = () => limited.prepare(`select ${placeholders(100)}`).bind(...values(100));
++      const results = await limited.batch([hundred(), hundred()]);
++      expect(results).toHaveLength(2);
++      await expect(limited.batch([])).resolves.toEqual([]);
++    });
++
++    it("still rejects a statement with 101 binds at bind time, as before", () => {
++      const sqlite = new SqliteD1Database();
++      databases.push(sqlite);
++      const limited = new BindLimitedD1(sqlite, 100);
++      expect(() => limited.prepare(`select ${placeholders(101)}`).bind(...values(101))).toThrow(/too many SQL variables/);
++    });
+   });
+ });
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index 414a8a0d..c8c0c5d1 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -438,8 +438,8 @@ const WATCH_TABLES = ["email_watch_items", "email_watch_cursors"] as const;
+ 
+ /**
+  * Retention sweep, independent of the watch: D1 only, no Gmail, no KV. Deletes expired items, then everything for
+- * connections that are not in the watched list (an empty list purges all). Each table is handled on its own. A table
+- * that does not exist yet is skipped silently; any other failure is logged once per sweep by error name.
++ * connections that are not in the watched list (an empty list purges all). Each delete and each table is handled on its own. A table
++ * that does not exist yet is skipped silently; any other failure is logged once per sweep by error name (the first one; later errors are not logged).
+  */
+ export async function sweepEmailWatchRetention(
+   database: D1DatabaseBinding,
+@@ -461,6 +461,8 @@ export async function sweepEmailWatchRetention(
+       .prepare("delete from email_watch_items where status = 'pending' and created_at < ?")
+       .bind(new Date(now - PENDING_RETENTION_MS).toISOString())
+       .run();
++  });
++  await attempt(async () => {
+     await database
+       .prepare("delete from email_watch_items where status = 'acknowledged' and acknowledged_at < ?")
+       .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
+@@ -473,7 +475,11 @@ export async function sweepEmailWatchRetention(
+ }
+ 
+ /** Delete rows of connections not in `watched`, in statements that bind at most PURGE_CHUNK_SIZE names each. */
+-async function purgeUnwatched(database: D1DatabaseBinding, table: (typeof WATCH_TABLES)[number], watched: readonly string[]): Promise<void> {
++async function purgeUnwatched(
++  database: D1DatabaseBinding,
++  table: (typeof WATCH_TABLES)[number],
++  watched: readonly string[],
++): Promise<void> {
+   if (watched.length === 0) {
+     await database.prepare(`delete from ${table}`).run();
+     return;
+diff --git a/src/server/storage/postgres/runtime-store.test.ts b/src/server/storage/postgres/runtime-store.test.ts
+index 3b7e2ad3..d95922c7 100644
+--- a/src/server/storage/postgres/runtime-store.test.ts
++++ b/src/server/storage/postgres/runtime-store.test.ts
+@@ -167,6 +167,7 @@ describe("PostgreSQL migrations with PGlite", () => {
+           { name: "0018_connection_retirement.sql" },
+           { name: "0019_email_watch.sql" },
+           { name: "0020_email_watch_indexes.sql" },
++          { name: "0021_email_watch_drop_connection_index.sql" },
+         ],
+       });
+ 
+@@ -220,8 +221,12 @@ describe("PostgreSQL email watch indexes (patch 0012, #111)", () => {
+          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1')`,
+       );
+ 
+-      await migratePostgresDatabase({ pool });
+-      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      // Patch 0014 (#114): 0021 drops the (connection_name) index again, so stop at 0020 here.
++      const through0020: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name <= NAME),
++      };
++      await migratePostgresDatabase({ pool, migrations: through0020 });
++      await expect(migratePostgresDatabase({ pool, migrations: through0020 })).resolves.toBeUndefined();
+       expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).at(-1)).toBe(NAME);
+       expect((await pool.query("select id from email_watch_items")).rows).toEqual([{ id: "p" }]);
+ 
+@@ -240,6 +245,65 @@ describe("PostgreSQL email watch indexes (patch 0012, #111)", () => {
+   });
+ });
+ 
++describe("PostgreSQL email watch connection index (patch 0014, #114)", () => {
++  let testServer: PGliteTestServer;
++
++  beforeAll(async () => {
++    testServer = await startPGliteTestServer();
++  });
++
++  afterAll(async () => {
++    await testServer.close();
++  });
++
++  const PREVIOUS = "0020_email_watch_indexes.sql";
++  const NAME = "0021_email_watch_drop_connection_index.sql";
++  const indexDefinitions = async (pool: Pool, table: string) =>
++    (await pool.query("select indexdef from pg_indexes where tablename = $1", [table])).rows.map((row: { indexdef: string }) =>
++      row.indexdef.replace(/\s+/g, " "),
++    );
++
++  it("0021 applies after 0020 on a database that holds rows: the (connection_name) index goes, the status and unique indexes stay", async () => {
++    const pool = new Pool({ connectionString: testServer.url, max: 1 });
++    try {
++      const through0020: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name <= PREVIOUS),
++      };
++      await migratePostgresDatabase({ pool, migrations: through0020 });
++      expect((await indexDefinitions(pool, "email_watch_items")).some((definition) => definition.endsWith("(connection_name)"))).toBe(true);
++      await pool.query(
++        `insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++         values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1')`,
++      );
++
++      await migratePostgresDatabase({ pool });
++      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).at(-1)).toBe(NAME);
++      expect((await pool.query("select id from email_watch_items")).rows).toEqual([{ id: "p" }]);
++
++      const definitions = await indexDefinitions(pool, "email_watch_items");
++      expect(definitions.filter((definition) => definition.endsWith("(connection_name)"))).toEqual([]);
++      for (const columns of ["(status, created_at)", "(status, acknowledged_at)"]) {
++        expect(
++          definitions.filter((definition) => definition.startsWith("CREATE INDEX") && definition.endsWith(columns)),
++          columns,
++        ).toHaveLength(1);
++      }
++      expect(
++        definitions.filter((definition) => definition.startsWith("CREATE UNIQUE INDEX") && definition.endsWith("(connection_name, gmail_message_id)")),
++      ).toHaveLength(1);
++      await expect(
++        pool.query(
++          `insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++           values ('q', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k2')`,
++        ),
++      ).rejects.toThrow(/unique|duplicate/i);
++    } finally {
++      await pool.end();
++    }
++  });
++});
++
+ describe("PostgreSQL migrations with a custom migration source", () => {
+   let testServer: PGliteTestServer;
+ 
+@@ -285,6 +349,7 @@ describe("PostgreSQL migrations with a custom migration source", () => {
+           { name: "0018_connection_retirement.sql" },
+           { name: "0019_email_watch.sql" },
+           { name: "0020_email_watch_indexes.sql" },
++          { name: "0021_email_watch_drop_connection_index.sql" },
+           { name: "9998_custom.sql" },
+         ],
+       });
+diff --git a/src/server/storage/sqlite/runtime-store.test.ts b/src/server/storage/sqlite/runtime-store.test.ts
+index 151d9f01..ebd19271 100644
+--- a/src/server/storage/sqlite/runtime-store.test.ts
++++ b/src/server/storage/sqlite/runtime-store.test.ts
+@@ -63,6 +63,7 @@ describe("SqliteRuntimeDatabase", () => {
+       "0018_connection_retirement.sql",
+       "0019_email_watch.sql",
+       "0020_email_watch_indexes.sql",
++      "0021_email_watch_drop_connection_index.sql",
+     ];
+     expect(entries.filter((entry) => entry.message === "sqlite migration started")).toEqual(
+       migrations.map((migration) => ({ fields: { migration }, message: "sqlite migration started" })),
+-- 
+2.34.1
+
