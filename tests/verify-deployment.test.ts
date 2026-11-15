@@ -22,7 +22,7 @@ interface Behaviour {
   /** How the stand-in answers the OAuth probes (#78). Unset means the refusals the real gateway gives. */
   assertion?: "open" | "wrong-text" | "wrong-status" | "wrong-error";
   unknownClient?: "not-the-librarys-answer";
-  authorize?: "redirects" | "shows-consent";
+  authorize?: "redirects" | "shows-consent" | "not-found" | "html-400" | "json-400";
 }
 
 interface OAuthRequest {
@@ -75,6 +75,16 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
           response.writeHead(302, { location: "/redirect-sink?error=invalid_request" });
           return response.end();
         }
+        if (behaviour.authorize === "not-found") {
+          // OAuth is not switched on: the route does not exist.
+          response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          return response.end("Not found");
+        }
+        if (behaviour.authorize === "html-400") {
+          response.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+          return response.end("<h1>Bad request</h1>");
+        }
+        if (behaviour.authorize === "json-400") return send(response, 400, { error: "invalid_request" });
         if (behaviour.authorize === "shows-consent") {
           response.writeHead(200, { "content-type": "text/html" });
           return response.end("<h1>Allow access?</h1>");
@@ -342,6 +352,9 @@ describe("scripts/verify-deployment.ts OAuth probes (#78)", () => {
     ["an unknown client_id is not answered with the library's Client not found", { unknownClient: "not-the-librarys-answer" }],
     ["an authorize GET for an unknown client redirects", { authorize: "redirects" }],
     ["an authorize GET for an unknown client shows the consent page", { authorize: "shows-consent" }],
+    ["an authorize GET for an unknown client answers 404 because OAuth is off", { authorize: "not-found" }],
+    ["an authorize GET for an unknown client answers 400 as HTML", { authorize: "html-400" }],
+    ["an authorize GET for an unknown client answers 400 as JSON", { authorize: "json-400" }],
   ] as [string, Partial<Behaviour>][])("fails exactly one check when %s", async (_name, behaviour) => {
     const origin = await startWorker({ proxyOpen: false, ...behaviour });
 
