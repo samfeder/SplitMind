@@ -1,0 +1,302 @@
+SplitMind patch 0023 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0020).
+Upstream issue: not filed yet.
+Email watch tidy-ups from the 0016 reviews (#127): a test D1 that throws instead of reporting 0 changes, and a dead branch removed.
+
+From c63b8d5224416ba3f0ded406a82e3e8270213c0d Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 12:38:17 -0500
+Subject: [PATCH] fix(email-watch): loud test D1 batch, drop dead no_budget
+ branch (#127)
+
+Test D1: a batch entry from a statement wrapper without readOutcome throws
+when meta.changes is read, instead of reporting 0. startConnection loses its
+unreachable no_budget branch (run() only polls while budget remains and
+nothing before the first Gmail call spends it). Adds a pin that the failing
+notice claim works on a cursor with a null fingerprint.
+---
+ src/server/email-watch/watcher.test.ts      |  59 ++++++++
+ src/server/email-watch/watcher.ts           |   5 +-
+ src/server/storage/d1/test-database.test.ts | 152 ++++++++++++++++++++
+ src/server/storage/d1/test-database.ts      |  18 ++-
+ 4 files changed, 226 insertions(+), 8 deletions(-)
+ create mode 100644 src/server/storage/d1/test-database.test.ts
+
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index fad909bc..e2b8176c 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -3639,3 +3639,62 @@ describe("a stale stub write does not touch a stub made for another account (pat
+     ]);
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0023, #127 item 6: the failing-notice claim matches `connection_id is ?`, so a cursor whose fingerprint is
++// null (a row from before 0015) can still claim. With `= ?` a null never matches, the claim never succeeds and the
++// notice is never made. The resolution keeps failing, so the null is never adopted.
++// ---------------------------------------------------------------------------------------------------------------
++describe("a cursor with no recorded fingerprint still gets its failing notice once (patch 0023, #127 item 6)", () => {
++  const MIN = 60_000;
++  const failingItems = (r: Rig) => itemsOf(r, "rule_id = 'watch-failing'");
++
++  /** A cursor from before 0015: no connection_id, no created_at. The last good read was at T0. Resolution fails from then on. */
++  async function legacyCursor(): Promise<Rig> {
++    const r = rig();
++    await insertCursor(r.db, {
++      connection_name: "work",
++      history_id: "1000",
++      last_run_at: iso(T0),
++      last_success_at: iso(T0),
++      failing_notice_at: null,
++      connection_id: null,
++      created_at: null,
++    });
++    r.runner.resolved.work = new Error("store unavailable");
++    return r;
++  }
++
++  it("no notice before 24 hours have passed since the last good read (control)", async () => {
++    const r = await legacyCursor();
++    r.clock.now = T0 + DAY - MIN;
++    await r.run();
++    expect(await failingItems(r)).toEqual([]);
++    expect((await cursorOf(r))!.failing_notice_at).toBeNull();
++  });
++
++  it("after 24 hours exactly one notice is made, and the cursor records when", async () => {
++    const r = await legacyCursor();
++    r.clock.now = T0 + DAY + HOUR;
++    await r.run();
++    expect((await failingItems(r)).map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-11 12:00 UTC"]);
++    expect(await cursorOf(r)).toMatchObject({ failing_notice_at: iso(T0 + DAY + HOUR), connection_id: null, history_id: "1000" });
++  });
++
++  it("later failing runs of the same streak make no second notice", async () => {
++    const r = await legacyCursor();
++    for (const at of [T0 + DAY + HOUR, T0 + DAY + 2 * HOUR, T0 + 2 * DAY, T0 + 3 * DAY]) {
++      r.clock.now = at;
++      await r.run();
++    }
++    expect(await failingItems(r)).toHaveLength(1);
++    expect((await cursorOf(r))!.failing_notice_at).toBe(iso(T0 + DAY + HOUR));
++  });
++
++  it("two overlapping invocations at the same moment leave exactly one notice", async () => {
++    const r = await legacyCursor();
++    r.clock.now = T0 + DAY + HOUR;
++    await Promise.all([r.watcher.run(), secondWatcher(r).run()]);
++    expect(await failingItems(r)).toHaveLength(1);
++  });
++});
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index e22b2750..fd9abc99 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -244,10 +244,7 @@ export class EmailWatcher {
+     stub: Cursor | undefined,
+   ): Promise<void> {
+     const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
+-    if (reply.kind === "no_budget") {
+-      this.logSkip(name, "no_budget");
+-      return;
+-    }
++    // No budget check here: run() only polls a name while budget remains, and nothing before this call spends it.
+     const historyId = reply.kind === "ok" ? readString(reply.output.historyId) : undefined;
+     if (!historyId) {
+       const code = reply.kind === "failed" ? reply.code : "no_history_id";
+diff --git a/src/server/storage/d1/test-database.test.ts b/src/server/storage/d1/test-database.test.ts
+new file mode 100644
+index 00000000..42a9b465
+--- /dev/null
++++ b/src/server/storage/d1/test-database.test.ts
+@@ -0,0 +1,152 @@
++// Harness self-test (#127 item 4): the test D1 is loud about change counts it cannot know.
++//
++// A statement wrapper that forwards only `readRows` (no `readOutcome`) cannot say how many rows a batched write
++// changed. Reading `meta.changes` from its batch entry must throw, not quietly answer 0: the watcher decides "did
++// anything change" from that number, and a silent 0 makes such a test pass for the wrong reason. The rows of the
++// entry stay readable, and a wrapper that forwards `readOutcome` reports the real count.
++
++import { afterEach, describe, expect, it } from "vitest";
++import type { D1DatabaseBinding, D1PreparedStatementBinding } from "../../cloudflare/cloudflare-bindings.ts";
++import { ActionPolicyService } from "../../../core/action-policy.ts";
++import { FakeGmailRunner, FakeMailbox, HOUR, T0, createLogCapture, insertCursor, insertItem, itemRow, selectAll } from "../../email-watch/test-support.ts";
++import { EmailWatcher } from "../../email-watch/watcher.ts";
++import { SqliteD1Database } from "./test-database.ts";
++
++type Inner = D1PreparedStatementBinding & {
++  readRows(): Record<string, unknown>[];
++  readOutcome(): { rows: Record<string, unknown>[]; changes: number };
++};
++
++/** Forwards bind/first/all/run and `readRows`; forwards `readOutcome` only when asked to. */
++class Forwarding implements D1PreparedStatementBinding {
++  private readonly inner: Inner;
++  private readonly withOutcome: boolean;
++  readOutcome?: () => { rows: Record<string, unknown>[]; changes: number };
++
++  constructor(inner: D1PreparedStatementBinding, withOutcome: boolean) {
++    this.inner = inner as Inner;
++    this.withOutcome = withOutcome;
++    if (withOutcome) this.readOutcome = () => this.inner.readOutcome();
++  }
++
++  bind(...values: unknown[]): D1PreparedStatementBinding {
++    return new Forwarding(this.inner.bind(...values), this.withOutcome);
++  }
++  first<T = Record<string, unknown>>(): Promise<T | null> {
++    return this.inner.first<T>();
++  }
++  all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
++    return this.inner.all<T>();
++  }
++  run(): Promise<{ success: boolean; meta: { changes?: number } }> {
++    return this.inner.run();
++  }
++  readRows(): Record<string, unknown>[] {
++    return this.inner.readRows();
++  }
++}
++
++let databases: SqliteD1Database[] = [];
++afterEach(() => {
++  for (const database of databases) database.close();
++  databases = [];
++});
++
++function open(): SqliteD1Database {
++  const database = new SqliteD1Database();
++  databases.push(database);
++  return database;
++}
++
++async function twoCursors(database: SqliteD1Database): Promise<void> {
++  for (const name of ["a", "b"]) await insertCursor(database, { connection_name: name, history_id: "1", last_run_at: new Date(T0).toISOString() });
++}
++
++const names = async (database: SqliteD1Database): Promise<string[]> =>
++  (await selectAll<{ connection_name: string }>(database, "select connection_name from email_watch_cursors order by connection_name")).map((row) => row.connection_name);
++
++describe("a batch through statements that lack readOutcome", () => {
++  it("still runs the statements and returns the rows of a read", async () => {
++    const database = open();
++    await twoCursors(database);
++    const results = await database.batch([
++      new Forwarding(database.prepare("select connection_name from email_watch_cursors order by connection_name"), false),
++      new Forwarding(database.prepare("delete from email_watch_cursors where connection_name = ?"), false).bind("a"),
++    ]);
++    expect(results[0]!.results).toEqual([{ connection_name: "a" }, { connection_name: "b" }]);
++    expect(await names(database)).toEqual(["b"]);
++  });
++
++  it.each([
++    ["a read", "select connection_name from email_watch_cursors", [] as string[]],
++    ["a delete that removes a row", "delete from email_watch_cursors where connection_name = ?", ["a"]],
++    ["a delete that removes nothing", "delete from email_watch_cursors where connection_name = ?", ["nobody"]],
++  ])("asking %s for its change count throws instead of answering 0", async (_label, sql, values) => {
++    const database = open();
++    await twoCursors(database);
++    const results = await database.batch([new Forwarding(database.prepare(sql), false).bind(...values)]);
++    expect(results).toHaveLength(1);
++    expect(() => results[0]!.meta?.changes).toThrow(Error);
++  });
++
++  it("asking one entry throws while a neighbour entry from a statement with readOutcome still answers", async () => {
++    const database = open();
++    await twoCursors(database);
++    const results = await database.batch([
++      new Forwarding(database.prepare("delete from email_watch_cursors where connection_name = ?"), false).bind("a"),
++      new Forwarding(database.prepare("delete from email_watch_cursors where connection_name = ?"), true).bind("b"),
++    ]);
++    expect(() => results[0]!.meta?.changes).toThrow(Error);
++    expect(results[1]!.meta?.changes).toBe(1);
++  });
++});
++
++describe("a batch through statements that forward readOutcome", () => {
++  it("reports the real count per entry: 0 for a read, 1 for a delete of one row, 2 for two rows, 0 for none", async () => {
++    const database = open();
++    await twoCursors(database);
++    const results = await database.batch([
++      new Forwarding(database.prepare("select connection_name from email_watch_cursors"), true).bind(),
++      new Forwarding(database.prepare("delete from email_watch_cursors where connection_name = ?"), true).bind("nobody"),
++      new Forwarding(database.prepare("delete from email_watch_cursors where connection_name = ?"), true).bind("a"),
++      new Forwarding(database.prepare("delete from email_watch_cursors"), true).bind(),
++    ]);
++    expect(results.map((result) => result.meta?.changes)).toEqual([0, 0, 1, 1]);
++    expect(await names(database)).toEqual([]);
++  });
++
++  it("two rows changed by one statement are counted as 2", async () => {
++    const database = open();
++    await twoCursors(database);
++    const results = await database.batch([new Forwarding(database.prepare("delete from email_watch_cursors"), true).bind()]);
++    expect(results[0]!.meta?.changes).toBe(2);
++  });
++});
++
++describe("the watcher over a database whose statements lack readOutcome", () => {
++  it("fails loudly for that connection instead of reading the purge batch as 'nothing changed'", async () => {
++    const sqlite = open();
++    const OTHER = "e".repeat(64);
++    const mailbox = new FakeMailbox({ prefix: "m0" });
++    const runner = new FakeGmailRunner({ work: mailbox });
++    const log = createLogCapture();
++    await insertCursor(sqlite, { connection_name: "work", history_id: "1000", last_run_at: new Date(T0 - HOUR).toISOString(), connection_id: OTHER });
++    await insertItem(sqlite, itemRow({ id: "old", connection_name: "work", subject: "Deployment failed for old-app", dedup_key: "k-old" }));
++    const wrapped: D1DatabaseBinding = {
++      prepare: (query) => new Forwarding(sqlite.prepare(query), false),
++      batch: (statements) => sqlite.batch(statements),
++    };
++    const watcher = new EmailWatcher({
++      database: wrapped,
++      runner,
++      policy: new ActionPolicyService().createSnapshot(),
++      connections: ["work"],
++      logger: log.logger,
++      now: () => T0,
++    });
++    // The runner resolves "work" to a different account than the cursor holds, so resolution runs the purge batch.
++    await watcher.run();
++    expect(log.entries.filter((entry) => entry.level === "error").map((entry) => entry.message)).toEqual(["email watch failed for a connection"]);
++    expect(log.entries.filter((entry) => entry.level === "warn")).toEqual([]);
++  });
++});
+diff --git a/src/server/storage/d1/test-database.ts b/src/server/storage/d1/test-database.ts
+index 8c3af55b..76c2bc74 100644
+--- a/src/server/storage/d1/test-database.ts
++++ b/src/server/storage/d1/test-database.ts
+@@ -13,16 +13,26 @@ export class SqliteD1Database implements D1DatabaseBinding {
+   }
+ 
+   // Like real D1, each batch entry carries `meta.changes`: the rows a write statement changed (0 for a read).
++  // A wrapper statement that only forwards readRows cannot know the count, so reading `changes` from its entry
++  // throws instead of quietly answering 0.
+   async batch(
+     statements: D1PreparedStatementBinding[],
+-  ): Promise<{ results: Record<string, unknown>[] | null; meta: { changes: number } }[]> {
++  ): Promise<{ results: Record<string, unknown>[] | null; meta: { readonly changes: number } }[]> {
+     this.database.exec("begin immediate");
+     try {
+       const results = statements.map((statement) => {
+-        // A wrapper statement that only forwards readRows (see the sweeping test database) reports no changes.
+         const inner = statement as Partial<SqliteD1PreparedStatement> & { readRows(): Record<string, unknown>[] };
+-        const { rows, changes } = inner.readOutcome?.() ?? { rows: inner.readRows(), changes: 0 };
+-        return { results: rows.length ? rows : null, meta: { changes } };
++        const outcome = inner.readOutcome?.();
++        const rows = outcome?.rows ?? inner.readRows();
++        const meta = {
++          get changes(): number {
++            if (!outcome) {
++              throw new Error("test D1: this statement wrapper has no readOutcome, so batch cannot report meta.changes");
++            }
++            return outcome.changes;
++          },
++        };
++        return { results: rows.length ? rows : null, meta };
+       });
+       this.database.exec("commit");
+       return results;
+-- 
+2.34.1
+

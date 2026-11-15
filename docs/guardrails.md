@@ -361,8 +361,9 @@ delete only while the cursor still holds the fingerprint that poll read, so a sl
 what a newer one stored), one warn line carrying only the alias is logged, and, if the alias resolves, the watch
 starts fresh for it (no backfill). If the store cannot be read the poll is skipped and nothing is deleted. Until the
 next poll runs, `list_pending_mail` and `acknowledge_mail` hide and leave alone the items of an alias whose recorded
-fingerprint differs from the current one, and the items of an alias that has no cursor at all (a cursor deleted by hand: the sweep skips its cursor purge when
-the items purge failed, and a purge cannot stop half way), so the new account does not see the previous one's mail in either case.
+fingerprint differs from the current one, and the items of an alias that has no cursor at all (a cursor deleted by
+hand: the sweep skips its cursor purge when the items purge failed, and a purge cannot stop half way), so the new
+account does not see the previous one's mail in either case.
 
 **Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
 pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
@@ -415,9 +416,9 @@ any other failure is logged once per sweep by error name and the other cron work
 of a sweep is logged; later, different errors in the same sweep are not logged, on purpose. The pending-expiry delete,
 the acknowledged-expiry delete and each table's purge are independent, so a failure (or a missing table) in one does
 not stop the others, except that a failed (not missing) items purge skips the cursor purge for that sweep, so
-items are never left without a cursor. The purge of unwatched accounts has no limit on the number of watched accounts (D1 allows 100
-bound parameters per statement): it reads the distinct account names in each table and deletes the unwatched ones in
-chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
+items are never left without a cursor. The purge of unwatched accounts has no limit on the number of watched
+accounts (D1 allows 100 bound parameters per statement): it reads the distinct account names in each table and
+deletes the unwatched ones in chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
 they delete. The distinct-names read scans the unique `(connection_name, gmail_message_id)` index of
 `email_watch_items` (a covering-index scan, not a table scan), so it reads one index entry per stored item; with 14-day
 retention of machine mail only, that stays small. Migration `0021_email_watch_drop_connection_index.sql` drops 0020's
