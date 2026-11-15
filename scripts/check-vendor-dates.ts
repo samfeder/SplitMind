@@ -1,6 +1,7 @@
 // Finds hard-coded dates in OpenConnector's test files that are about to pass (or just have). A fixture such as
 // `expiresAt: "2026-12-28"` is fine until the day it counts as expired, then it breaks every merge. Scans test and spec
-// files under vendor/open-connector/{src,web/src,scripts}. Usage: node scripts/check-vendor-dates.ts. Add `// date-guard: ok` to a line whose date is intentionally fixed and harmless.
+// files under vendor/open-connector/{src,web/src,scripts}. Usage: node scripts/check-vendor-dates.ts. Add
+// `// date-guard: ok` to a line whose date is intentionally fixed and harmless.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";

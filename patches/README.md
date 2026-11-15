@@ -38,8 +38,8 @@ and fails on any date from yesterday to 400 days from now, in these forms:
 
 - ISO strings in quotes or backticks: `"2026-12-28"`, `"2026-12-28T00:00:00Z"`, `"2026-12-28 10:00:00"`, and a date
   right after an interpolation, `` `${x}2026-12-28` ``;
-- slash dates in quotes, month 1-based: `"2026/12/29"`, `"2027/1/5"`;
-- `new Date(2027, 0, 5)` and `Date.UTC(2027, 0, 5)`, month 0-based, and the two-argument `new Date(2027, 0)` (day 1).
+- slash dates in quotes or backticks, month 1-based: `"2026/12/29"`, `"2027/1/5"`;
+- `new Date(2027, 0, 5)` and `Date.UTC(2027, 0, 5)`, month 0-based, and the two-argument `new Date(2027, 0)` and `Date.UTC(2027, 0)` (day 1).
 
 Impossible dates (`"2026-02-30"`, `new Date(2026, 12, 40)`) are ignored. Epoch-millisecond numbers are not checked: too
 many false positives. Past dates and far-future sentinels such as 2099 are fine. The same job has a 15-minute timeout.
