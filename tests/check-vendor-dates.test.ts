@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { findExpiringDates, vendorScanDirs } from "../scripts/check-vendor-dates.ts";
 
@@ -112,6 +113,150 @@ describe("findExpiringDates: numeric Date forms (month is 0-based)", () => {
     const found = scan("const a = new Date(2026, 11, d), b = new Date(2026, 11, 30);");
     expect(found).toHaveLength(1);
     expect(found[0].literal).toContain("2026, 11, 30");
+  });
+
+  // #124: the two-argument form may end in a trailing comma and in /* ... */ block comments before the closing paren.
+  // Both are still day 1 of the month; a third argument that is not a literal is still not read as day 1.
+  describe("two-argument forms with a trailing comma or a block comment (#124)", () => {
+    it.each([
+      "new Date(2026, 11,)",
+      "Date.UTC(2026, 11 ,)",
+      "new Date(2026, 11 /* Dec */)",
+      "new Date(2026, 11, )",
+      "new Date(2026,11,)",
+      "new Date(2026, 11, /* day 1 */)",
+      "new Date(2026, 11 /* Dec */,)",
+      "new Date(2026, 11 /* a */ /* b */)",
+      "Date.UTC(2027, 0 /* Jan */,)",
+    ])("flags %s as day 1 of the month, naming the whole call", (call) => {
+      expect(scan(`const d = ${call};`)).toEqual([{ path: "src/a.test.ts", line: 1, literal: call }]);
+    });
+
+    it("flags the call on its own line of a multi-line file, with that line number", () => {
+      const text = ["const a = 1;", "const b = [", "  new Date(2026, 11,),", "];"].join("\n");
+      expect(scan(text)).toEqual([{ path: "src/a.test.ts", line: 3, literal: "new Date(2026, 11,)" }]);
+    });
+
+    it("flags a trailing-comma call that follows a non-literal-day call on the same line", () => {
+      const found = scan("const a = new Date(2026, 11, d), b = new Date(2026, 11,);");
+      expect(found).toHaveLength(1);
+      expect(found[0].literal).toBe("new Date(2026, 11,)");
+    });
+
+    it("keeps the window: a trailing comma or a comment does not flag a month outside it", () => {
+      expect(scan("new Date(2026, 10,)")).toEqual([]); // 2026-11-01, before yesterday
+      expect(scan("new Date(2026, 10 /* Nov */)")).toEqual([]);
+      expect(scan("new Date(2028, 0,)")).toEqual([]); // 2028-01-01, after now + 400 days
+      expect(scan("new Date(2028, 0 /* Jan */)")).toEqual([]);
+      expect(scan("new Date(2027, 11,)")).toHaveLength(1); // 2027-12-01, inside
+    });
+
+    it("does not read a non-literal day as day 1, with or without a comment or a trailing comma", () => {
+      expect(scan("new Date(2026, 11, d)")).toEqual([]);
+      expect(scan("new Date(2026, 11, /* day */ d)")).toEqual([]);
+      expect(scan("new Date(2026, 11, d,)")).toEqual([]);
+      expect(scan("new Date(2026, 11, d /* day */)")).toEqual([]);
+      expect(scan("Date.UTC(2026, 11, /* day */ day + 1)")).toEqual([]);
+      expect(scan("new Date(2026, 11 /* Dec */, d)")).toEqual([]);
+    });
+
+    it("does not read anything that is not a block comment as one: an unclosed comment, a line comment, other text", () => {
+      expect(scan("new Date(2026, 11 /* Dec )")).toEqual([]);
+      expect(scan("new Date(2026, 11 // Dec\n)")).toEqual([]);
+      expect(scan("new Date(2026, 11 d)")).toEqual([]);
+      expect(scan("new Date(2026, 11,,)")).toEqual([]);
+      expect(scan("new Date(2026, 11 /* a */ d)")).toEqual([]);
+    });
+
+    it("a literal day with a trailing comma is still flagged by its own day (three arguments, unchanged)", () => {
+      expect(scan("new Date(2026, 11, 5,)")).toHaveLength(1);
+      expect(scan("new Date(2026, 10, 5,)")).toEqual([]); // 2026-11-05
+    });
+
+    it("an opt-out on the line still skips it", () => {
+      expect(scan("new Date(2026, 11,) // date-guard: ok")).toEqual([]);
+    });
+
+    // Review follow-up: the pattern must not backtrack badly, and a comment must not swallow code after it.
+    describe("no catastrophic backtracking, and comments stay comments", () => {
+      const LIMIT_MS = 200;
+      const scanner = pathToFileURL(resolve("scripts/check-vendor-dates.ts")).href;
+      // A pattern that backtracks badly blocks the thread and a vitest timeout cannot interrupt it, so each timing
+      // runs in a child process with a hard kill. The child measures only findExpiringDates, with performance.now().
+      const childSource = [
+        'import { readFileSync } from "node:fs";',
+        "const { findExpiringDates } = await import(process.argv[1]);",
+        'const text = readFileSync(0, "utf8");',
+        "const start = performance.now();",
+        'const found = findExpiringDates([{ path: "src/a.test.ts", text }], new Date("2026-11-15T00:00:00Z"));',
+        "console.log(JSON.stringify({ ms: performance.now() - start, count: found.length }));",
+      ].join("\n");
+      function timed(text: string): { count: number; ms: number } {
+        const run = spawnSync(process.execPath, ["--input-type=module", "-e", childSource, scanner], { input: text, encoding: "utf8", timeout: 10_000 });
+        if (run.error || run.status !== 0) {
+          throw new Error(`the scan did not finish within 10 s (${run.error?.message ?? `status ${run.status}`}): ${run.stderr.slice(0, 200)}`);
+        }
+        return JSON.parse(run.stdout.trim().split("\n").at(-1)!) as { count: number; ms: number };
+      }
+      const comments = (count: number) => " /* c */".repeat(count);
+
+      it("30 block comments before the closing paren: still flagged, within 200 ms", () => {
+        const { count, ms } = timed(`const d = new Date(2026, 11${comments(30)});`);
+        expect(count).toBe(1);
+        expect(ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("30 block comments and then something that is not a closing paren: no finding, within 200 ms", () => {
+        for (const tail of [" d);", ";", " /* never closed )"]) {
+          const { count, ms } = timed(`const d = new Date(2026, 11${comments(30)}${tail}`);
+          expect(count, tail).toBe(0);
+          expect(ms, tail).toBeLessThan(LIMIT_MS);
+        }
+      });
+
+      it("30 block comments after a trailing comma, closed and not closed, within 200 ms", () => {
+        const closed = timed(`new Date(2026, 11,${comments(30)})`);
+        expect(closed.count).toBe(1);
+        expect(closed.ms).toBeLessThan(LIMIT_MS);
+        const open = timed(`new Date(2026, 11,${comments(30)} d)`);
+        expect(open.count).toBe(0);
+        expect(open.ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("40,000 spaces between the month and the closing paren: still flagged, within 200 ms", () => {
+        const { count, ms } = timed(`new Date(2026, 11${" ".repeat(40_000)})`);
+        expect(count).toBe(1);
+        expect(ms).toBeLessThan(LIMIT_MS);
+      });
+
+      it("40,000 spaces and then something that is not a closing paren: no finding, within 200 ms", () => {
+        for (const tail of ["d)", ";", ""]) {
+          const { count, ms } = timed(`new Date(2026, 11${" ".repeat(40_000)}${tail}`);
+          expect(count, JSON.stringify(tail)).toBe(0);
+          expect(ms, JSON.stringify(tail)).toBeLessThan(LIMIT_MS);
+        }
+      });
+
+      it("a comment ends at its own */: code after it is not part of it (no false positive from a later comment's */)", () => {
+        // Month 0 of 2026 is outside the window, so this form can only be a finding by accident; the same shape with
+        // month 11 (inside the window) is the one that shows the false positive.
+        expect(scan("new Date(2026, 0 /* Jan */, d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11 /* Dec */, d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11 /* Dec */ d); /* x */)")).toEqual([]);
+        expect(scan("new Date(2026, 11, /* day */ d); /* x */)")).toEqual([]);
+      });
+
+      it("a real comment-closed call is still flagged, and so is a trailing comma", () => {
+        expect(scan("new Date(2026, 11 /* Dec */)")).toHaveLength(1);
+        expect(scan("new Date(2026, 11,)")).toHaveLength(1);
+      });
+
+      it("a call followed by a comment on the same line is flagged once, naming only the call", () => {
+        const found = scan("const a = new Date(2026, 11 /* Dec */); /* later */");
+        expect(found).toHaveLength(1);
+        expect(found[0].literal).toBe("new Date(2026, 11 /* Dec */)");
+      });
+    });
   });
 });
 

@@ -1,0 +1,1751 @@
+SplitMind patch 0016 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0015).
+Upstream issue: not filed yet.
+Email watch: #125 stale abort after a success, stub cursors for names that never started, migration 0023, sweep ordering, quieter alias-change warn.
+From 18aad919f8952127558fba1e0fc9f3308d890a10 Mon Sep 17 00:00:00 2001
+From: SplitMind <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 09:59:46 -0500
+Subject: [PATCH] fix(email-watch): stale-abort guard, stub cursors, sweep
+ ordering (#125)
+
+Stale abort after a success leaves no item; a name whose first get_profile
+fails gets a stub cursor and a 'could not start reading' item after 24 hours;
+the stub upgrade and the failing-notice claim only touch the stub this poll
+read (connection_id guard); migration 0023 adds cursor created_at; a failed
+items purge skips the cursor purge; the alias-change warn only when rows were
+dropped.
+---
+ .../0023_email_watch_cursor_created_at.sql    |   5 +
+ .../0023_email_watch_cursor_created_at.sql    |   5 +
+ src/server/cloudflare-email-watch.test.ts     | 192 +++-
+ src/server/cloudflare/cloudflare-bindings.ts  |   2 +-
+ src/server/email-watch/account-fingerprint.ts |   3 +-
+ src/server/email-watch/migration.test.ts      | 128 ++-
+ src/server/email-watch/rules.ts               |   1 +
+ src/server/email-watch/test-support.ts        |   8 +-
+ src/server/email-watch/watcher.test.ts        | 866 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             | 108 ++-
+ src/server/storage/d1/test-database.ts        |  21 +-
+ .../storage/postgres/runtime-store.test.ts    |  68 +-
+ .../storage/sqlite/runtime-store.test.ts      |   1 +
+ 13 files changed, 1373 insertions(+), 35 deletions(-)
+ create mode 100644 migrations/0023_email_watch_cursor_created_at.sql
+ create mode 100644 migrations/postgresql/0023_email_watch_cursor_created_at.sql
+
+diff --git a/migrations/0023_email_watch_cursor_created_at.sql b/migrations/0023_email_watch_cursor_created_at.sql
+new file mode 100644
+index 00000000..f489c21c
+--- /dev/null
++++ b/migrations/0023_email_watch_cursor_created_at.sql
+@@ -0,0 +1,5 @@
++-- Email watch (patch 0016). created_at: when the cursor row was first written (ISO-8601 UTC text). A stub cursor
++-- (history_id '', a name whose first get_profile failed) measures its 24 hours from it. Rows older than this
++-- migration get the last successful read, or the last run when there never was one.
++alter table email_watch_cursors add column created_at text;
++update email_watch_cursors set created_at = coalesce(last_success_at, last_run_at);
+diff --git a/migrations/postgresql/0023_email_watch_cursor_created_at.sql b/migrations/postgresql/0023_email_watch_cursor_created_at.sql
+new file mode 100644
+index 00000000..f489c21c
+--- /dev/null
++++ b/migrations/postgresql/0023_email_watch_cursor_created_at.sql
+@@ -0,0 +1,5 @@
++-- Email watch (patch 0016). created_at: when the cursor row was first written (ISO-8601 UTC text). A stub cursor
++-- (history_id '', a name whose first get_profile failed) measures its 24 hours from it. Rows older than this
++-- migration get the last successful read, or the last run when there never was one.
++alter table email_watch_cursors add column created_at text;
++update email_watch_cursors set created_at = coalesce(last_success_at, last_run_at);
+diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
+index 567bdef8..a99d3674 100644
+--- a/src/server/cloudflare-email-watch.test.ts
++++ b/src/server/cloudflare-email-watch.test.ts
+@@ -429,12 +429,18 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+     expect(s.mailboxes.work!.messageRequests()).toEqual([]);
+   });
+ 
+-  it("creates no cursor when the policy does not allow get_profile", async () => {
++  // Patch 0016, #125 decision 2: a refused first get_profile leaves a stub cursor (nothing read, no Gmail call).
++  // Was: "creates no cursor when the policy does not allow get_profile" (cursors expected []).
++  it("leaves only a stub cursor when the policy does not allow get_profile, and makes no Gmail call", async () => {
+     const s = await setup({
+       vars: { [CONNECTIONS]: "gmail:work", OOMOL_CONNECT_ALLOWED_ACTIONS: "notion.*" },
+     });
+     await s.tick(M0);
+-    expect(await s.watchRows("email_watch_cursors")).toEqual([]);
++    const rows = await s.watchRows<Record<string, any>>("email_watch_cursors");
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({ connection_name: "work", history_id: "", last_success_at: null });
++    expect(typeof rows[0]!.created_at).toBe("string");
++    expect(rows[0]!.created_at).not.toBe("");
+     expect(s.fetcher).not.toHaveBeenCalled();
+   });
+ 
+@@ -1761,3 +1767,185 @@ describe("an alias reused by a different account (patch 0015, #101)", () => {
+     });
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0016, #125: a name that never started (a stub cursor, history_id '') through the real Worker, the connection
++// service and the list and acknowledge actions; and the sweep that must not leave items without a cursor.
++// ---------------------------------------------------------------------------------------------------------------
++describe("a name that never started, through the Worker (patch 0016, #125)", () => {
++  const ctx = { waitUntil() {}, passThroughOnException() {} };
++  const NEW_EMAIL = "new-owner@example.org";
++  const TRYING_SINCE = "Email watch could not start reading this account (trying since";
++  const fingerprint = (id: string, accountId: string) => createHash("sha256").update(`${id}|${accountId}`).digest("hex");
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  /** Watches `work` whose first profile call fails; the clock is faked so a day can pass between ticks. */
++  async function stubbed() {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.spyOn(console, "error").mockImplementation(() => {});
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(at(M0));
++    const s = await setup({ names: ["work"], vars: { [CONNECTIONS]: "gmail:work" } });
++    s.mailboxes.work!.failWith("profile", 500);
++    await s.tick(M0);
++    return { s, warn };
++  }
++
++  async function advanceAndTick(s: Setup, minutes: number) {
++    vi.setSystemTime(at(M0 + minutes));
++    await s.tick(M0 + minutes);
++  }
++
++  async function action(s: Setup, name: string, input: unknown): Promise<string> {
++    const response = await worker.fetch(
++      new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/v1/actions/mail_watch.${name}`, {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ input }),
++      }),
++      s.env,
++      ctx,
++    );
++    return JSON.stringify(await response.json());
++  }
++
++  async function connectionStore(s: Setup) {
++    return new D1RuntimeDatabase(s.db, { secretCodec: await createWorkerSecretCodec(s.env.OOMOL_CONNECT_ENCRYPTION_KEY!) }).connectionStore;
++  }
++
++  it("the first failed profile call leaves a stub whose connection_id is the real account fingerprint", async () => {
++    const { s } = await stubbed();
++    const store = await connectionStore(s);
++    const id = (await store.get("gmail", "work"))!.id;
++    const rows = await s.watchRows<Record<string, any>>("email_watch_cursors");
++    expect(rows).toHaveLength(1);
++    expect(rows[0]).toMatchObject({
++      connection_name: "work",
++      history_id: "",
++      page_token: null,
++      catch_up: 0,
++      last_success_at: null,
++      failing_notice_at: null,
++      connection_id: fingerprint(id, s.mailboxes.work!.email),
++    });
++    expect(rows[0]!.created_at).toBe(new Date(at(M0)).toISOString());
++  });
++
++  it("after 24 hours the 'could not start reading' item is listed, can be acknowledged, and is not hidden by the stub", async () => {
++    const { s } = await stubbed();
++    await advanceAndTick(s, 24 * 60 - 1);
++    expect(await s.watchRows("email_watch_items")).toEqual([]);
++    await advanceAndTick(s, 24 * 60 + 10);
++    const items = await s.watchRows<{ id: string; subject: string; rule_id: string }>("email_watch_items");
++    expect(items.map((item) => item.rule_id)).toEqual(["watch-failing"]);
++    expect(items[0]!.subject).toContain(TRYING_SINCE);
++
++    expect(await action(s, "list_pending_mail", {})).toContain(TRYING_SINCE);
++    expect(await action(s, "acknowledge_mail", { ids: [items[0]!.id] })).toContain('"acknowledged":1');
++    expect((await s.watchRows<{ status: string }>("email_watch_items"))[0]!.status).toBe("acknowledged");
++  });
++
++  it("when the name is saved over in place for another account, the list hides the item and acknowledge leaves it, before any poll", async () => {
++    const { s } = await stubbed();
++    await advanceAndTick(s, 24 * 60 + 10);
++    const id = (await s.watchRows<{ id: string }>("email_watch_items"))[0]!.id;
++    expect(await action(s, "list_pending_mail", {})).toContain(TRYING_SINCE);
++
++    s.mailboxes.work = new FakeMailbox({ prefix: "z", email: NEW_EMAIL, startHistoryId: 5000 });
++    await (await connectionStore(s)).set("gmail", "work", {
++      authType: "oauth2",
++      accessToken: "token-work",
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: NEW_EMAIL, displayName: NEW_EMAIL, grantedScopes: [] },
++    });
++    expect(await action(s, "list_pending_mail", {})).not.toContain(TRYING_SINCE);
++    expect(await action(s, "acknowledge_mail", { ids: [id] })).toContain('"acknowledged":0');
++    expect((await s.watchRows<{ status: string }>("email_watch_items"))[0]!.status).toBe("pending");
++  });
++
++  it("the next poll after that switch purges the stub and its item and starts the new account from its own profile", async () => {
++    const { s, warn } = await stubbed();
++    await advanceAndTick(s, 24 * 60 + 10);
++    expect(await s.watchRows("email_watch_items")).toHaveLength(1);
++    s.mailboxes.work = new FakeMailbox({ prefix: "z", email: NEW_EMAIL, startHistoryId: 5000 });
++    const store = await connectionStore(s);
++    const id = (await store.set("gmail", "work", {
++      authType: "oauth2",
++      accessToken: "token-work",
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: NEW_EMAIL, displayName: NEW_EMAIL, grantedScopes: [] },
++    })).id;
++    await advanceAndTick(s, 24 * 60 + 20);
++    expect(await s.watchRows("email_watch_items")).toEqual([]);
++    expect(await s.watchRows("email_watch_cursors")).toMatchObject([{ connection_name: "work", history_id: "5000", connection_id: fingerprint(id, NEW_EMAIL) }]);
++    expect(warn.mock.calls.filter((call) => JSON.stringify(call[1]) === JSON.stringify({ connectionName: "work" }))).toHaveLength(1);
++  });
++
++  it("when Gmail recovers the stub becomes a real cursor and mail is stored", async () => {
++    const { s } = await stubbed();
++    s.mailboxes.work!.clearFailures();
++    await advanceAndTick(s, 10);
++    expect(await s.watchRows("email_watch_cursors")).toMatchObject([{ connection_name: "work", history_id: "1000" }]);
++    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for after-the-start"));
++    await advanceAndTick(s, 20);
++    expect((await s.watchRows<{ subject: string }>("email_watch_items")).map((item) => item.subject)).toEqual(["Deployment failed for after-the-start"]);
++    expect(await action(s, "list_pending_mail", {})).toContain("after-the-start");
++  });
++});
++
++describe("the retention sweep through the Worker leaves no items without a cursor (patch 0016, #125)", () => {
++  const iso = (ms: number) => new Date(ms).toISOString();
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  async function twoNames(): Promise<Setup> {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(at(M0));
++    const s = await setup({ names: ["a", "b"], vars: { [CONNECTIONS]: "gmail:a" } });
++    for (const name of ["a", "b"]) {
++      await insertCursor(s.db, { connection_name: name, history_id: "1000", last_run_at: iso(at(M0) - HOUR) });
++      await insertItem(s.db, itemRow({ id: `${name}-pending`, connection_name: name, created_at: iso(at(M0) - HOUR), received_at: iso(at(M0) - HOUR) }));
++    }
++    return s;
++  }
++  const cursorNames = async (s: Setup) => (await s.watchRows<{ connection_name: string }>("email_watch_cursors")).map((row) => row.connection_name).sort();
++  const itemIds = async (s: Setup) => (await s.watchRows<{ id: string }>("email_watch_items")).map((row) => row.id).sort();
++
++  it("an items purge that fails (not a missing table) leaves b's cursor with b's items, and logs once", async () => {
++    const s = await twoNames();
++    const error = vi.spyOn(console, "error").mockImplementation(() => {});
++    s.db.failWhen = (query) => {
++      if (/select\s+distinct\s+connection_name\s+from\s+email_watch_items/i.test(query)) throw new Error("fixture D1 failure");
++      return false;
++    };
++    await s.tick(M0);
++    expect(await cursorNames(s)).toEqual(["a", "b"]);
++    expect(await itemIds(s)).toEqual(["a-pending", "b-pending"]);
++    expect(error).toHaveBeenCalledTimes(1);
++  });
++
++  it("the next due invocation, with the items table working again, purges b's items and then b's cursor", async () => {
++    const s = await twoNames();
++    vi.spyOn(console, "error").mockImplementation(() => {});
++    s.db.failWhen = (query) => {
++      if (/select\s+distinct\s+connection_name\s+from\s+email_watch_items/i.test(query)) throw new Error("fixture D1 failure");
++      return false;
++    };
++    await s.tick(M0);
++    s.db.failWhen = undefined;
++    vi.setSystemTime(at(M0 + 10));
++    await s.tick(M0 + 10);
++    expect(await cursorNames(s)).toEqual(["a"]);
++    expect(await itemIds(s)).toEqual(["a-pending"]);
++  });
++});
+diff --git a/src/server/cloudflare/cloudflare-bindings.ts b/src/server/cloudflare/cloudflare-bindings.ts
+index f400d97e..99004fd0 100644
+--- a/src/server/cloudflare/cloudflare-bindings.ts
++++ b/src/server/cloudflare/cloudflare-bindings.ts
+@@ -1,5 +1,5 @@
+ export interface D1DatabaseBinding {
+-  batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null }[]>;
++  batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null; meta?: { changes?: number } }[]>;
+   prepare(query: string): D1PreparedStatementBinding;
+ }
+ 
+diff --git a/src/server/email-watch/account-fingerprint.ts b/src/server/email-watch/account-fingerprint.ts
+index bbf93ea9..6aab9d72 100644
+--- a/src/server/email-watch/account-fingerprint.ts
++++ b/src/server/email-watch/account-fingerprint.ts
+@@ -5,7 +5,8 @@ import type { ConnectionSummary } from "../../connection-service.ts";
+  * account id of its profile ("" when there is none). A connection saved over in place for another Google account
+  * keeps its row id but changes the account id, so it counts as a different account. Neither the id nor the address
+  * is stored or logged, only the hash. The watcher and the list/acknowledge check both get it from the action runner,
+- * which calls this one function.
++ * which calls this one function. For a credential that was not validated against Gmail (a manual store write or a
++ * managed connection) the fingerprint is only as strong as the profile's accountId.
+  */
+ export async function accountFingerprint(summary: Pick<ConnectionSummary, "id" | "profile">): Promise<string> {
+   const text = `${summary.id}|${summary.profile?.accountId ?? ""}`;
+diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
+index 5af9c39f..09b0b8f1 100644
+--- a/src/server/email-watch/migration.test.ts
++++ b/src/server/email-watch/migration.test.ts
+@@ -38,10 +38,10 @@ describe("0019_email_watch migration (sqlite and D1)", () => {
+     expect(names.indexOf("0019_email_watch.sql")).toBe(names.indexOf("0018_connection_retirement.sql") + 1);
+   });
+ 
+-  it("creates email_watch_cursors with exactly the specified columns (after every migration: 0022 adds three, patch 0015)", async () => {
++  it("creates email_watch_cursors with exactly the specified columns (after every migration: 0022 adds three, patch 0015; 0023 adds created_at, patch 0016)", async () => {
+     const found = await columns(open(), "email_watch_cursors");
+     expect(found.map((column) => column.name).sort()).toEqual(
+-      ["catch_up", "connection_id", "connection_name", "failing_notice_at", "history_id", "last_run_at", "last_success_at", "page_token"].sort(),
++      ["catch_up", "connection_id", "connection_name", "created_at", "failing_notice_at", "history_id", "last_run_at", "last_success_at", "page_token"].sort(),
+     );
+     const byName = Object.fromEntries(found.map((column) => [column.name, column]));
+     expect(byName.connection_name!.pk).toBe(1);
+@@ -428,7 +428,8 @@ describe("0022_email_watch_cursor_state migration (patch 0015)", () => {
+     }
+     expect(byName.connection_name).toMatchObject({ pk: 1 });
+     expect(byName.catch_up).toMatchObject({ notnull: 1, dflt_value: "0" });
+-    expect(found).toHaveLength(8);
++    // Patch 0016: 0023 adds created_at after this migration, so every migration leaves nine columns.
++    expect(found).toHaveLength(9);
+   });
+ 
+   it("applies on top of a database that has 0021 and cursor rows: the rows stay and last_success_at is their last_run_at", () => {
+@@ -510,6 +511,127 @@ describe("0022_email_watch_cursor_state migration (patch 0015)", () => {
+   });
+ });
+ 
++// Patch 0016, #125: 0023 adds the nullable text column created_at to email_watch_cursors and backfills it with
++// coalesce(last_success_at, last_run_at). Postgres has the same file name in its own directory.
++describe("0023_email_watch_cursor_created_at migration (patch 0016, #125)", () => {
++  const NAME = "0023_email_watch_cursor_created_at.sql";
++  const PREVIOUS = "0022_email_watch_cursor_state.sql";
++
++  const sqlOf = (dialect: "sqlite" | "postgresql") =>
++    defaultMigrationSource.readMigrations(dialect).find((migration) => migration.name === NAME)?.sql;
++  const through = (name: string) => defaultMigrationSource.readMigrations("sqlite").filter((entry) => entry.name <= name);
++
++  it("comes right after 0022, in both the D1/SQLite and the Postgres directory", () => {
++    for (const dialect of ["sqlite", "postgresql"] as const) {
++      const names = defaultMigrationSource.readMigrations(dialect).map((migration) => migration.name);
++      expect(names, dialect).toContain(NAME);
++      expect(names.indexOf(NAME), dialect).toBe(names.indexOf(PREVIOUS) + 1);
++    }
++  });
++
++  it("adds one nullable text column created_at without a default, and keeps the eight that were there", async () => {
++    const found = await columns(open(), "email_watch_cursors");
++    const byName = Object.fromEntries(found.map((column) => [column.name, column]));
++    expect(byName.created_at?.type.toLowerCase()).toBe("text");
++    expect(byName.created_at).toMatchObject({ notnull: 0, dflt_value: null, pk: 0 });
++    expect(byName.connection_name).toMatchObject({ pk: 1 });
++    expect(byName.history_id).toMatchObject({ notnull: 1 });
++    expect(found).toHaveLength(9);
++  });
++
++  it("backfills created_at with coalesce(last_success_at, last_run_at) on rows that exist before 0023", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of through(PREVIOUS)) connection.exec(migration.sql);
++      connection.exec(`
++        insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
++          values ('succeeded', '1', null, '2026-11-11T12:00:00.000Z', 0, '2026-11-10T00:00:00.000Z', null, 'c1');
++        insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
++          values ('never-succeeded', '7', 'p20', '2026-11-09T08:30:00.000Z', 1, null, null, null);
++      `);
++      connection.exec(sqlOf("sqlite")!);
++      expect(
++        connection
++          .prepare("select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, connection_id, created_at from email_watch_cursors order by connection_name")
++          .all(),
++      ).toEqual([
++        {
++          connection_name: "never-succeeded",
++          history_id: "7",
++          page_token: "p20",
++          last_run_at: "2026-11-09T08:30:00.000Z",
++          catch_up: 1,
++          last_success_at: null,
++          connection_id: null,
++          created_at: "2026-11-09T08:30:00.000Z",
++        },
++        {
++          connection_name: "succeeded",
++          history_id: "1",
++          page_token: null,
++          last_run_at: "2026-11-11T12:00:00.000Z",
++          catch_up: 0,
++          last_success_at: "2026-11-10T00:00:00.000Z",
++          connection_id: "c1",
++          created_at: "2026-11-10T00:00:00.000Z",
++        },
++      ]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("a row that predates 0022 gets last_success_at from 0022 and created_at from that: both are its last_run_at", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of through("0021_email_watch_drop_connection_index.sql")) connection.exec(migration.sql);
++      connection.exec("insert into email_watch_cursors values ('old', '1', null, '2026-11-05T01:02:03.000Z', 0)");
++      for (const migration of through(NAME).filter((entry) => entry.name > "0021_email_watch_drop_connection_index.sql")) connection.exec(migration.sql);
++      expect(connection.prepare("select last_run_at, last_success_at, created_at from email_watch_cursors").all()).toEqual([
++        { last_run_at: "2026-11-05T01:02:03.000Z", last_success_at: "2026-11-05T01:02:03.000Z", created_at: "2026-11-05T01:02:03.000Z" },
++      ]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("applies on a database with no cursor rows; a row inserted afterwards has a null created_at unless it gives one", async () => {
++    const db = open();
++    await insertCursor(db, { connection_name: "work", history_id: "1", last_run_at: "2026-11-11T12:00:00.000Z" });
++    await insertCursor(db, { connection_name: "stub", history_id: "", last_run_at: "2026-11-11T12:00:00.000Z", created_at: "2026-11-11T11:00:00.000Z" });
++    expect(await selectAll(db, "select connection_name, history_id, created_at from email_watch_cursors order by connection_name")).toEqual([
++      { connection_name: "stub", history_id: "", created_at: "2026-11-11T11:00:00.000Z" },
++      { connection_name: "work", history_id: "1", created_at: null },
++    ]);
++  });
++
++  it("does not touch the items table, its indexes or its rows", () => {
++    const connection = new DatabaseSync(":memory:");
++    try {
++      for (const migration of through(PREVIOUS)) connection.exec(migration.sql);
++      connection.exec(`
++        insert into email_watch_items (id, connection_name, gmail_message_id, gmail_thread_id, sender_domain, subject, category, rule_id, received_at, created_at, status, acknowledged_at, dedup_key)
++          values ('p', 'work', 'g1', 't1', 'vercel.com', 's', 'deploy_failed', 'r', 'x', '2026-11-11T12:00:00.000Z', 'pending', null, 'k1');
++      `);
++      const itemColumns = () => connection.prepare("pragma table_info(email_watch_items)").all();
++      const indexes = () => connection.prepare("select name from sqlite_master where type = 'index' and tbl_name = 'email_watch_items' order by name").all();
++      const before = { columns: itemColumns(), indexes: indexes() };
++      connection.exec(sqlOf("sqlite")!);
++      expect({ columns: itemColumns(), indexes: indexes() }).toEqual(before);
++      expect(connection.prepare("select id from email_watch_items").all()).toEqual([{ id: "p" }]);
++    } finally {
++      connection.close();
++    }
++  });
++
++  it("the Postgres file adds created_at to email_watch_cursors as nullable text and backfills it", () => {
++    const sql = sqlOf("postgresql")!;
++    expect(sql).toMatch(/alter\s+table\s+email_watch_cursors\s+add\s+column\s+created_at\s+text\b/i);
++    expect(sql).toMatch(/coalesce\(\s*last_success_at\s*,\s*last_run_at\s*\)/i);
++    expect(sql).not.toMatch(/not\s+null/i);
++  });
++});
++
+ describe("Postgres parity", () => {
+   it("has the same 0019 file name as the D1 migration", () => {
+     const names = defaultMigrationSource.readMigrations("postgresql").map((migration) => migration.name);
+diff --git a/src/server/email-watch/rules.ts b/src/server/email-watch/rules.ts
+index 4f55157e..31698aac 100644
+--- a/src/server/email-watch/rules.ts
++++ b/src/server/email-watch/rules.ts
+@@ -193,6 +193,7 @@ function stripControlCharacters(text: string): string {
+ // combining grapheme joiner U+034F, the Hangul fillers, the variation selectors, the Mongolian free variation
+ // selectors), the braille blank U+2800, the combining enclosing keycap U+20E3, and any combining mark that follows a
+ // decimal digit (and further marks in the same sequence). Marks after letters stay, so "café" keeps its accent.
++// U+20E3 stays outside the class: inside it oxlint's no-misleading-character-class flags the combining character.
+ const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\p{Cf}\u2800]|\u20e3/gu;
+ // Applied after INVISIBLE, so a mark that only follows the digit once an invisible character is gone is caught too.
+ const MARK_AFTER_DIGIT = /(?<=\p{Nd}\p{M}*)\p{M}/gu;
+diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
+index 8a2f6a34..3f03c71a 100644
+--- a/src/server/email-watch/test-support.ts
++++ b/src/server/email-watch/test-support.ts
+@@ -458,8 +458,9 @@ export async function insertItem(database: SqlDatabase, row: ItemRow): Promise<v
+ }
+ 
+ /**
+- * Seeds a cursor row. The three columns of migration 0022 (patch 0015) are written only when given, so a row seeded
+- * without them is a pre-0022 row: null `last_success_at`, `failing_notice_at` and `connection_id`.
++ * Seeds a cursor row. The three columns of migration 0022 (patch 0015) and `created_at` of migration 0023 (patch 0016)
++ * are written only when given, so a row seeded without them is an older row: null `last_success_at`,
++ * `failing_notice_at`, `connection_id` and `created_at`. A stub cursor (a name that never started) has `history_id` ''.
+  */
+ export async function insertCursor(
+   database: SqlDatabase,
+@@ -472,6 +473,7 @@ export async function insertCursor(
+     last_success_at?: string | null;
+     failing_notice_at?: string | null;
+     connection_id?: string | null;
++    created_at?: string | null;
+   },
+ ): Promise<void> {
+   const columns: Record<string, unknown> = {
+@@ -481,7 +483,7 @@ export async function insertCursor(
+     last_run_at: row.last_run_at,
+     catch_up: row.catch_up ?? 0,
+   };
+-  for (const column of ["last_success_at", "failing_notice_at", "connection_id"] as const) {
++  for (const column of ["last_success_at", "failing_notice_at", "connection_id", "created_at"] as const) {
+     if (row[column] !== undefined) columns[column] = row[column];
+   }
+   const names = Object.keys(columns);
+diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
+index 7dfcbe82..fad909bc 100644
+--- a/src/server/email-watch/watcher.test.ts
++++ b/src/server/email-watch/watcher.test.ts
+@@ -540,12 +540,15 @@ describe("policy refusals skip the connection for that run", () => {
+     expect((await cursorOf(r))!.history_id).toBe("1000");
+   });
+ 
+-  it("creates no cursor for a connection whose get_profile is refused on the first run", async () => {
++  // Patch 0016, #125: a refused first get_profile now leaves a stub cursor (history_id '', nothing read), so the name's
++  // failure streak can be noticed; it still reads nothing and stores no item. Was: "creates no cursor ...".
++  it("a connection whose get_profile is refused on the first run only gets a stub cursor: nothing is started or stored", async () => {
+     const r = rig(["work", "ops"]);
+     r.runner.refuse = (call) => (call.connectionName === "work" ? "action_blocked" : undefined);
+     await r.run();
+-    expect(await cursorOf(r, "work")).toBeUndefined();
+-    expect(await cursorOf(r, "ops")).toBeDefined();
++    expect(await cursorOf(r, "work")).toMatchObject({ history_id: "", last_success_at: null });
++    expect(await itemsOf(r)).toEqual([]);
++    expect(await cursorOf(r, "ops")).toMatchObject({ history_id: "1000" });
+   });
+ 
+   it("recovers when the policy is lifted: the next run picks the mail up", async () => {
+@@ -1999,7 +2002,10 @@ describe("retention sweep limits (patch 0012, #111)", () => {
+       expect(log.entries).toEqual([]);
+     });
+ 
+-    it("another failure in the items table is logged once by error name, and the cursors are still purged", async () => {
++    // Patch 0016, #125 decision 4: a failure in the items table (the purge of unwatched names comes first) now skips the
++    // cursor purge, so the sweep never leaves items without a cursor. Was: "... and the cursors are still purged"
++    // (cursors expected ["a"]). The details are in "the sweep never leaves items without a cursor".
++    it("another failure in the items table is logged once by error name, and the cursors are not purged that sweep", async () => {
+       const { sqlite, log } = open();
+       await seed(sqlite);
+       await sweepEmailWatchRetention(failingOn(sqlite, /email_watch_items/), ["a"], log.logger, NOW);
+@@ -2007,7 +2013,7 @@ describe("retention sweep limits (patch 0012, #111)", () => {
+       expect(log.entries[0]!.level).toBe("error");
+       expect(log.text()).toContain("FixtureSweepFailure");
+       for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
+-      expect(await cursorConnections(sqlite)).toEqual(["a"]);
++      expect(await cursorConnections(sqlite)).toEqual(["a", "gone"]);
+     });
+ 
+     it("another failure in the cursors table is logged once by error name, and the items are still purged and expired", async () => {
+@@ -2783,3 +2789,853 @@ describe("the cursor records the account the name resolved to (patch 0015, #101)
+     expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T0), last_run_at: iso(T0 + 10 * 60_000) });
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0016, #125: edge cases found reviewing 0015. Expected values are literals. T0 is 2026-11-11 12:00:00 UTC.
++//
++//   1. A failing-notice claim only succeeds while the cursor still holds the last_success_at this invocation loaded.
++//   2. A name whose first get_profile fails (not for budget) gets a stub cursor: history_id '', page_token null,
++//      catch_up 0, last_success_at null, connection_id the resolved fingerprint, created_at now. A later poll of a stub
++//      calls get_profile; success sets history_id and last_success_at and clears failing_notice_at (no second row).
++//      While it keeps failing the abort rules apply with since = last_success_at ?? created_at. After 24 hours one item
++//      per streak says `Email watch could not start reading this account (trying since <YYYY-MM-DD HH:MM UTC>)`.
++//   3. Migration 0023 adds created_at (tested in migration.test.ts); real cursors set it too; an abort measures from
++//      last_success_at ?? created_at ?? last_run_at.
++//   4. The sweep skips the cursor purge when the items purge fails with anything but a missing table.
++//   5. resolveConnection warns and restarts the name only when its guarded purge batch changed a row.
++// ---------------------------------------------------------------------------------------------------------------
++describe("stale abort after a success (patch 0016, #125 decision 1)", () => {
++  const MIN = 60_000;
++  const FAILING_AT = T0 + DAY + HOUR;
++  const failingItems = (r: Rig) => itemsOf(r, "rule_id = 'watch-failing'");
++
++  /** Runs one invocation whose list_history fails, and runs `during` after Gmail answered and before the abort starts. */
++  async function abortWhile(r: Rig, during: () => Promise<void>): Promise<void> {
++    r.mailboxes.work!.failWith("history", 401);
++    r.clock.now = FAILING_AT;
++    r.runner.afterRun = async (call) => {
++      if (call.actionId !== "gmail.list_history") return;
++      r.runner.afterRun = undefined;
++      await during();
++    };
++    await r.run();
++    expect(r.runner.afterRun, "the invocation reached the list_history call").toBeUndefined();
++  }
++
++  it("a concurrent success that moved last_success_at and cleared failing_notice_at leaves the stale abort no item", async () => {
++    const r = rig();
++    await seed(r); // last_success_at = T0, aged over 24 hours by the clock below
++    const T1 = FAILING_AT - MIN;
++    await abortWhile(r, async () => {
++      await r.db.prepare("update email_watch_cursors set last_success_at = ?, failing_notice_at = null, last_run_at = ? where connection_name = 'work'").bind(iso(T1), iso(T1)).run();
++    });
++    expect(await failingItems(r)).toEqual([]);
++    expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T1), failing_notice_at: null });
++  });
++
++  it("the abort still touches the cursor: last_run_at moves and catch_up is 0", async () => {
++    const r = rig();
++    await seed(r);
++    await r.db.prepare("update email_watch_cursors set catch_up = 1 where connection_name = 'work'").run();
++    await abortWhile(r, async () => {
++      await r.db.prepare("update email_watch_cursors set last_success_at = ?, failing_notice_at = null where connection_name = 'work'").bind(iso(FAILING_AT - MIN)).run();
++    });
++    expect(await cursorOf(r)).toMatchObject({ last_run_at: iso(FAILING_AT), catch_up: 0 });
++  });
++
++  it("control: a concurrent write that leaves last_success_at alone does not stop the item", async () => {
++    const r = rig();
++    await seed(r);
++    await abortWhile(r, async () => {
++      await r.db.prepare("update email_watch_cursors set last_run_at = ? where connection_name = 'work'").bind(iso(FAILING_AT - MIN)).run();
++    });
++    const rows = await failingItems(r);
++    expect(rows.map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-11 12:00 UTC"]);
++    expect((await cursorOf(r))!.failing_notice_at).toBe(iso(FAILING_AT));
++  });
++
++  it("control: with nothing concurrent the first abort past 24 hours still leaves exactly one item", async () => {
++    const r = rig();
++    await seed(r);
++    await abortWhile(r, async () => {});
++    expect(await failingItems(r)).toHaveLength(1);
++  });
++
++  it("a row with a null last_success_at is guarded too: a success that sets it in between leaves no item", async () => {
++    const r = rig();
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - 30 * HOUR), connection_id: r.runner.fingerprintOf("work") });
++    await abortWhile(r, async () => {
++      await r.db.prepare("update email_watch_cursors set last_success_at = ?, failing_notice_at = null where connection_name = 'work'").bind(iso(FAILING_AT - MIN)).run();
++    });
++    expect(await failingItems(r)).toEqual([]);
++  });
++
++  it("a row with a null last_success_at and nothing concurrent still gets its item (null matches null in the guard)", async () => {
++    const r = rig();
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - 30 * HOUR), connection_id: r.runner.fingerprintOf("work") });
++    r.mailboxes.work!.failWith("history", 401);
++    r.clock.now = T0;
++    await r.run();
++    expect((await failingItems(r)).map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-10 06:00 UTC"]);
++  });
++});
++
++describe("a name that never started gets a stub cursor (patch 0016, #125 decision 2)", () => {
++  const MIN = 60_000;
++  /** The first attempt happens at 12:00:59, so the minute shown (12:00) is not the instant. */
++  const FIRST = T0 + 59_000;
++  const TRYING_SINCE = "Email watch could not start reading this account (trying since 2026-11-11 12:00 UTC)";
++  const failingItems = (r: Rig, name = "work") => itemsOf(r, `rule_id = 'watch-failing' and connection_name = '${name}'`);
++  async function runAt(r: Rig, ms: number): Promise<void> {
++    r.clock.now = ms;
++    await r.run();
++  }
++  /** A rig whose first get_profile fails with Gmail 500: the stub exists after the run at FIRST. */
++  async function stubbed(names: string[] = ["work"]): Promise<Rig> {
++    const r = rig(names);
++    for (const name of names) r.mailboxes[name]!.failWith("profile", 500);
++    await runAt(r, FIRST);
++    for (const name of names) expect((await cursorOf(r, name))?.history_id, `the first failed attempt left a stub for ${name}`).toBe("");
++    return r;
++  }
++
++  describe("creation", () => {
++    it.each([
++      ["Gmail answers 500", (r: Rig) => r.mailboxes.work!.failWith("profile", 500)],
++      ["Gmail answers 401", (r: Rig) => r.mailboxes.work!.failWith("profile", 401)],
++      ["Gmail answers 429", (r: Rig) => r.mailboxes.work!.failWith("profile", 429)],
++      ["policy refuses get_profile", (r: Rig) => (r.runner.refuse = (call) => (call.actionId === "gmail.get_profile" ? "action_blocked" : undefined))],
++    ])("%s: the stub has the pinned columns and no item is created", async (_name, fail) => {
++      const r = rig();
++      fail(r);
++      await runAt(r, FIRST);
++      expect(await cursorOf(r)).toMatchObject({
++        connection_name: "work",
++        history_id: "",
++        page_token: null,
++        catch_up: 0,
++        last_success_at: null,
++        failing_notice_at: null,
++        connection_id: r.runner.fingerprintOf("work"),
++        created_at: iso(FIRST),
++        last_run_at: iso(FIRST),
++      });
++      expect(await itemsOf(r)).toEqual([]);
++      expect(await r.watcher.needsCatchUp()).toBe(false);
++      expect(r.runner.calls.map((call) => call.actionId)).toEqual(["gmail.get_profile"]);
++    });
++
++    it("each failing name gets its own stub, and a name that succeeds next to it gets a real cursor with created_at set", async () => {
++      const r = rig(["work", "ops"]);
++      r.mailboxes.work!.failWith("profile", 500);
++      await runAt(r, FIRST);
++      expect(await cursorOf(r, "work")).toMatchObject({ history_id: "", created_at: iso(FIRST), connection_id: r.runner.fingerprintOf("work") });
++      expect(await cursorOf(r, "ops")).toMatchObject({ history_id: "1000", last_success_at: iso(FIRST), created_at: iso(FIRST), connection_id: r.runner.fingerprintOf("ops") });
++    });
++
++    it("a first run that succeeds sets created_at on the real cursor too", async () => {
++      const r = rig();
++      await runAt(r, FIRST);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1000", created_at: iso(FIRST), last_success_at: iso(FIRST) });
++    });
++
++    it("a name that cannot be resolved (no connection, or a resolution error) gets no stub", async () => {
++      const none = rig(["work"], { mailboxes: {} });
++      await runAt(none, FIRST);
++      expect(await cursorOf(none)).toBeUndefined();
++
++      const broken = rig();
++      broken.runner.resolved.work = new Error("store unavailable");
++      await runAt(broken, FIRST);
++      expect(await cursorOf(broken)).toBeUndefined();
++      expect(broken.runner.calls).toEqual([]);
++    });
++
++    it("a budget-starved first attempt creates no stub: with 16 failing names the 16th is not tried and has no row", async () => {
++      const names = Array.from({ length: 16 }, (_, index) => `n${String(index + 1).padStart(2, "0")}`);
++      const r = rig(names);
++      for (const name of names) r.mailboxes[name]!.failWith("profile", 500);
++      await runAt(r, FIRST);
++      expect(r.runner.calls).toHaveLength(15);
++      const rows = await selectAll<{ connection_name: string; history_id: string }>(r.db, "select connection_name, history_id from email_watch_cursors order by connection_name");
++      expect(rows.map((row) => row.connection_name)).toEqual(names.slice(0, 15));
++      expect(rows.every((row) => row.history_id === "")).toBe(true);
++    });
++
++    it("two overlapping first runs that both fail leave one stub and log no error", async () => {
++      const r = rig();
++      r.mailboxes.work!.failWith("profile", 500);
++      r.clock.now = FIRST;
++      await Promise.all([r.run(), secondWatcher(r).run()]);
++      expect(await selectAll(r.db, "select connection_name from email_watch_cursors")).toEqual([{ connection_name: "work" }]);
++      expect(r.log.entries.filter((entry) => entry.level === "error")).toEqual([]);
++    });
++
++    it("the logs name the connection and an error code only", async () => {
++      const r = await stubbed();
++      expect(r.log.text()).toContain("work");
++      expect(r.log.text()).not.toContain(r.runner.fingerprintOf("work"));
++      expect(r.log.text()).not.toContain(OWNER_EMAIL);
++    });
++  });
++
++  describe("polling a stub", () => {
++    it("asks Gmail for the profile, never for history, on every poll", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + 10 * MIN);
++      await runAt(r, FIRST + 20 * MIN);
++      expect(r.runner.calls.map((call) => call.actionId)).toEqual(["gmail.get_profile", "gmail.get_profile", "gmail.get_profile"]);
++    });
++
++    it("keeps history_id '', created_at and last_success_at while it fails; last_run_at moves; catch_up stays 0", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + 10 * MIN);
++      expect(await cursorOf(r)).toMatchObject({
++        history_id: "",
++        created_at: iso(FIRST),
++        last_success_at: null,
++        last_run_at: iso(FIRST + 10 * MIN),
++        catch_up: 0,
++        failing_notice_at: null,
++      });
++      expect(await itemsOf(r)).toEqual([]);
++    });
++
++    it("a refusal that is lifted lets the next poll start it", async () => {
++      const r = rig();
++      r.runner.refuse = (call) => (call.actionId === "gmail.get_profile" ? "action_blocked" : undefined);
++      await runAt(r, FIRST);
++      r.runner.refuse = undefined;
++      await runAt(r, FIRST + 10 * MIN);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1000", last_success_at: iso(FIRST + 10 * MIN) });
++    });
++  });
++
++  describe("the 'could not start reading' item", () => {
++    it("is not inserted at 23 hours 59 minutes, nor 1 ms before 24 hours after the first attempt", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + HOUR);
++      await runAt(r, FIRST + 23 * HOUR + 59 * MIN);
++      await runAt(r, FIRST + DAY - 1);
++      expect(await itemsOf(r)).toEqual([]);
++      expect((await cursorOf(r))!.failing_notice_at).toBeNull();
++    });
++
++    it("is inserted by the first abort at exactly 24 hours, with the pinned columns and no error text", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + DAY - 1);
++      expect(await itemsOf(r)).toEqual([]);
++      await runAt(r, FIRST + DAY);
++      const rows = await itemsOf(r);
++      expect(rows).toHaveLength(1);
++      expect(rows[0]).toMatchObject({
++        connection_name: "work",
++        category: "watch_gap",
++        rule_id: "watch-failing",
++        sender_domain: "",
++        subject: TRYING_SINCE,
++        status: "pending",
++        acknowledged_at: null,
++        occurrences: 1,
++      });
++      expect(rows[0]!.gmail_message_id).toBeTruthy();
++      expect(rows[0]!.gmail_thread_id ?? "").toBe("");
++      expect(rows[0]!.created_at).toBe(iso(FIRST + DAY));
++      expect((await cursorOf(r))!.failing_notice_at).toBe(iso(FIRST + DAY));
++      const dump = JSON.stringify([rows[0]!.subject, rows[0]!.category, rows[0]!.rule_id, rows[0]!.sender_domain]);
++      for (const leak of ["401", "500", "action_blocked", "provider_error", OWNER_EMAIL, "Gmail"]) expect(dump, leak).not.toContain(leak);
++    });
++
++    it("later aborts of the same streak insert nothing more, even after the user acknowledges it", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + DAY);
++      const first = await failingItems(r);
++      expect(first).toHaveLength(1);
++      for (const hours of [25, 48, 24 * 9]) await runAt(r, FIRST + hours * HOUR);
++      await r.db.prepare("update email_watch_items set status = 'acknowledged', acknowledged_at = ? where rule_id = 'watch-failing'").bind(iso(FIRST + 9 * DAY)).run();
++      await runAt(r, FIRST + 12 * DAY);
++      expect((await failingItems(r)).map((row) => row.id)).toEqual([first[0]!.id]);
++    });
++
++    it("a policy refusal of get_profile reaches it the same way", async () => {
++      const r = rig();
++      r.runner.refuse = (call) => (call.actionId === "gmail.get_profile" ? "action_blocked" : undefined);
++      await runAt(r, FIRST);
++      await runAt(r, FIRST + DAY);
++      expect((await failingItems(r)).map((row) => row.subject)).toEqual([TRYING_SINCE]);
++    });
++
++    it("two overlapping aborts at 24 hours insert one item between them", async () => {
++      const r = await stubbed();
++      r.clock.now = FIRST + DAY;
++      await Promise.all([r.run(), secondWatcher(r).run()]);
++      expect(await failingItems(r)).toHaveLength(1);
++    });
++
++    it("one name's stub does not give another name an item", async () => {
++      const r = rig(["work", "ops"]);
++      r.mailboxes.work!.failWith("profile", 500);
++      await runAt(r, FIRST);
++      await runAt(r, FIRST + DAY);
++      expect(await failingItems(r, "work")).toHaveLength(1);
++      expect(await failingItems(r, "ops")).toEqual([]);
++    });
++
++    it("a stale abort (a start that succeeded meanwhile) leaves no item", async () => {
++      const r = await stubbed();
++      r.clock.now = FIRST + DAY + HOUR;
++      r.runner.afterRun = async (call) => {
++        if (call.actionId !== "gmail.get_profile") return;
++        r.runner.afterRun = undefined;
++        await r.db.prepare("update email_watch_cursors set history_id = '1000', last_success_at = ?, failing_notice_at = null where connection_name = 'work'").bind(iso(FIRST + DAY + HOUR - MIN)).run();
++      };
++      await r.run();
++      expect(r.runner.afterRun).toBeUndefined();
++      expect(await failingItems(r)).toEqual([]);
++    });
++  });
++
++  describe("a later success turns the stub into a real cursor", () => {
++    it("sets history_id and last_success_at, clears failing_notice_at, keeps one row and created_at, and keeps the item", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++      r.mailboxes.work!.clearFailures();
++      r.mailboxes.work!.deliver(failed("Deployment failed before the start"));
++      await runAt(r, FIRST + DAY + HOUR);
++
++      expect(await selectAll(r.db, "select connection_name from email_watch_cursors")).toEqual([{ connection_name: "work" }]);
++      expect(await cursorOf(r)).toMatchObject({
++        history_id: "1001",
++        page_token: null,
++        catch_up: 0,
++        last_success_at: iso(FIRST + DAY + HOUR),
++        last_run_at: iso(FIRST + DAY + HOUR),
++        failing_notice_at: null,
++        created_at: iso(FIRST),
++        connection_id: r.runner.fingerprintOf("work"),
++      });
++      // No backfill: the mail that arrived before the start is not read; the notice stays for the user to dismiss.
++      expect((await itemsOf(r)).map((row) => row.rule_id)).toEqual(["watch-failing"]);
++    });
++
++    it("mail that arrives after the start is stored normally by the next poll", async () => {
++      const r = await stubbed();
++      r.mailboxes.work!.clearFailures();
++      await runAt(r, FIRST + 10 * MIN);
++      r.mailboxes.work!.deliver(failed("Deployment failed for fresh-1"));
++      await runAt(r, FIRST + 20 * MIN);
++      expect((await itemsOf(r, "category = 'deploy_failed'")).map((row) => row.subject)).toEqual(["Deployment failed for fresh-1"]);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1001", last_success_at: iso(FIRST + 20 * MIN) });
++      expect(r.runner.callsTo("gmail.get_profile")).toHaveLength(2);
++      expect(r.runner.callsTo("gmail.list_history")).toHaveLength(1);
++    });
++
++    it("a success before 24 hours leaves no item and no streak mark", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + 10 * HOUR);
++      r.mailboxes.work!.clearFailures();
++      await runAt(r, FIRST + 11 * HOUR);
++      r.mailboxes.work!.failWith("history", 401);
++      // 24 hours after the first attempt, but 13 hours after the success.
++      await runAt(r, FIRST + DAY + 11 * HOUR - 1);
++      expect(await itemsOf(r)).toEqual([]);
++    });
++
++    it("once started, a new streak is measured from the success and says 'could not read', not 'could not start'", async () => {
++      const r = await stubbed();
++      r.mailboxes.work!.clearFailures();
++      await runAt(r, FIRST + HOUR);
++      r.mailboxes.work!.failWith("history", 401);
++      await runAt(r, FIRST + HOUR + DAY - 1);
++      expect(await itemsOf(r)).toEqual([]);
++      await runAt(r, FIRST + HOUR + DAY);
++      expect((await failingItems(r)).map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-11 13:00 UTC"]);
++    });
++
++    it("an overlapping start does not overwrite a cursor another invocation already started and moved on", async () => {
++      const r = await stubbed();
++      expect((await cursorOf(r))!.history_id, "precondition: the stub exists").toBe("");
++      r.mailboxes.work!.clearFailures();
++
++      // A asks for the profile (answer: historyId 1000) and is held before it writes anything.
++      let reached!: () => void;
++      const reachedPromise = new Promise<void>((resolve) => (reached = resolve));
++      let release!: () => void;
++      const gate = new Promise<void>((resolve) => (release = resolve));
++      let held = false;
++      r.runner.afterRun = async (call) => {
++        if (call.actionId === "gmail.get_profile" && !held) {
++          held = true;
++          reached();
++          await gate;
++        }
++      };
++      r.clock.now = FIRST + 10 * MIN;
++      const slow = r.run();
++      await Promise.race([reachedPromise, slow]);
++      expect(held, "the first invocation reached get_profile on the stub").toBe(true);
++
++      // B starts the name, mail arrives, B reads it.
++      await secondWatcher(r).run();
++      r.mailboxes.work!.deliver(failed("Deployment failed for one"));
++      r.clock.now = FIRST + 20 * MIN;
++      await secondWatcher(r).run();
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1001", last_success_at: iso(FIRST + 20 * MIN) });
++
++      release();
++      await slow;
++      expect(await cursorOf(r)).toMatchObject({ history_id: "1001", last_success_at: iso(FIRST + 20 * MIN), failing_notice_at: null });
++      expect(await selectAll(r.db, "select connection_name from email_watch_cursors")).toHaveLength(1);
++      expect((await itemsOf(r, "category = 'deploy_failed'")).map((row) => row.subject)).toEqual(["Deployment failed for one"]);
++    });
++  });
++
++  describe("a stub is subject to the alias check and the purges like any cursor", () => {
++    const OTHER = "f".repeat(64);
++    const nameOnly = (r: Rig, name: string) =>
++      r.log.entries.filter((entry) => entry.level === "warn" && JSON.stringify(entry.fields) === JSON.stringify({ connectionName: name }));
++
++    it("a name that now points at another account: the stub and its item are purged, one warn with the name only, and the name starts fresh from the profile", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++      r.mailboxes.work!.clearFailures();
++      r.runner.resolved.work = OTHER;
++      const callsBefore = r.runner.calls.length;
++      await runAt(r, FIRST + DAY + HOUR);
++
++      expect(await itemsOf(r)).toEqual([]);
++      expect(await cursorOf(r)).toMatchObject({ connection_id: OTHER, history_id: "1000", created_at: iso(FIRST + DAY + HOUR), last_success_at: iso(FIRST + DAY + HOUR) });
++      expect(r.runner.calls.slice(callsBefore).map((call) => call.actionId)).toEqual(["gmail.get_profile"]);
++      expect(nameOnly(r, "work")).toHaveLength(1);
++      expect(r.log.text()).not.toContain(OTHER);
++    });
++
++    it("if the new account cannot be started either, the new stub carries the new fingerprint and a new created_at (a fresh 24 hours)", async () => {
++      const r = await stubbed();
++      r.runner.resolved.work = OTHER;
++      await runAt(r, FIRST + 20 * HOUR);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "", connection_id: OTHER, created_at: iso(FIRST + 20 * HOUR) });
++      await runAt(r, FIRST + DAY + HOUR);
++      expect(await itemsOf(r)).toEqual([]);
++      await runAt(r, FIRST + 20 * HOUR + DAY);
++      expect((await failingItems(r)).map((row) => row.subject)).toEqual(["Email watch could not start reading this account (trying since 2026-11-12 08:00 UTC)"]);
++    });
++
++    it("a name that no longer resolves: the stub is purged and nothing is called", async () => {
++      const r = await stubbed();
++      r.runner.resolved.work = undefined;
++      const callsBefore = r.runner.calls.length;
++      await runAt(r, FIRST + HOUR);
++      expect(await cursorOf(r)).toBeUndefined();
++      expect(r.runner.calls.length).toBe(callsBefore);
++      expect(nameOnly(r, "work")).toHaveLength(1);
++    });
++
++    it("a resolution failure deletes nothing and does not start the name", async () => {
++      const r = await stubbed();
++      r.runner.resolved.work = new Error("store unavailable");
++      await runAt(r, FIRST + HOUR);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "", connection_id: r.runner.fingerprintOf("work"), created_at: iso(FIRST) });
++      expect(nameOnly(r, "work")).toEqual([]);
++    });
++
++    it("the retention sweep purges the stub and its item of a name that is not watched", async () => {
++      const r = await stubbed();
++      await runAt(r, FIRST + DAY);
++      expect(await failingItems(r)).toHaveLength(1);
++      await sweepEmailWatchRetention(r.db, ["ops"], r.log.logger, FIRST + DAY + 1);
++      expect(await cursorOf(r)).toBeUndefined();
++      expect(await itemsOf(r)).toEqual([]);
++    });
++
++    it("the sweep keeps the stub of a watched name", async () => {
++      const r = await stubbed();
++      await sweepEmailWatchRetention(r.db, ["work"], r.log.logger, FIRST + HOUR);
++      expect(await cursorOf(r)).toMatchObject({ history_id: "" });
++    });
++  });
++});
++
++describe("an abort measures from last_success_at, then created_at, then last_run_at (patch 0016, #125 decision 3)", () => {
++  async function abortAt(r: Rig, row: { last_success_at?: string | null; created_at?: string | null; last_run_at: string }): Promise<Record<string, any>[]> {
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", connection_id: r.runner.fingerprintOf("work"), ...row });
++    r.mailboxes.work!.failWith("history", 401);
++    r.clock.now = T0;
++    await r.run();
++    return itemsOf(r, "rule_id = 'watch-failing'");
++  }
++
++  it("with no last_success_at the window starts at created_at, not at the recent last_run_at", async () => {
++    const r = rig();
++    const rows = await abortAt(r, { created_at: iso(T0 - 30 * HOUR), last_run_at: iso(T0 - HOUR) });
++    expect(rows.map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-10 06:00 UTC"]);
++  });
++
++  it("a recent created_at keeps an old last_run_at from making an item", async () => {
++    const r = rig();
++    expect(await abortAt(r, { created_at: iso(T0 - HOUR), last_run_at: iso(T0 - 30 * HOUR) })).toEqual([]);
++  });
++
++  it("a last_success_at beats an older created_at: a success an hour ago means no item", async () => {
++    const r = rig();
++    expect(await abortAt(r, { last_success_at: iso(T0 - HOUR), created_at: iso(T0 - 30 * HOUR), last_run_at: iso(T0 - HOUR) })).toEqual([]);
++  });
++
++  it("a last_success_at beats a newer created_at: an old success makes the item and names its own minute", async () => {
++    const r = rig();
++    const rows = await abortAt(r, { last_success_at: iso(T0 - 30 * HOUR), created_at: iso(T0 - HOUR), last_run_at: iso(T0 - HOUR) });
++    expect(rows.map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-10 06:00 UTC"]);
++  });
++
++  it("with neither it falls back to last_run_at (a row older than every column)", async () => {
++    const r = rig();
++    const rows = await abortAt(r, { last_run_at: iso(T0 - 30 * HOUR) });
++    expect(rows.map((row) => row.subject)).toEqual(["Email watch could not read this account since 2026-11-10 06:00 UTC"]);
++  });
++});
++
++describe("a stale invocation's purge changes nothing and says nothing (patch 0016, #125 decision 5)", () => {
++  const OTHER = "e".repeat(64);
++  const quote = (value: string | null) => (value === null ? "null" : `'${value.replace(/'/g, "''")}'`);
++  const nameOnly = (r: Rig, name: string) =>
++    r.log.entries.filter((entry) => entry.level === "warn" && JSON.stringify(entry.fields) === JSON.stringify({ connectionName: name }));
++
++  /** A database that runs `act` the first time a per-name delete on the watch tables is prepared. */
++  function onFirstPurge(inner: SqliteD1Database, act: () => void): D1DatabaseBinding {
++    let fired = false;
++    return {
++      batch: (statements) => inner.batch(statements),
++      prepare(query: string) {
++        if (!fired && /delete\s+from\s+email_watch_(items|cursors)\b[^;]*connection_name/i.test(query)) {
++          fired = true;
++          act();
++        }
++        return inner.prepare(query);
++      },
++    };
++  }
++
++  function staleWatcher(r: Rig, act: () => void): EmailWatcher {
++    return new EmailWatcher({
++      database: onFirstPurge(r.db, act),
++      runner: r.runner,
++      policy,
++      connections: r.connections,
++      logger: r.log.logger,
++      now: () => r.clock.now,
++    });
++  }
++
++  /** What another invocation did meanwhile: purged `work`, started it fresh under OTHER, stored a new item. */
++  function otherInvocationRestarted(r: Rig) {
++    return () => {
++      r.db.exec("delete from email_watch_items where connection_name = 'work'");
++      r.db.exec("delete from email_watch_cursors where connection_name = 'work'");
++      r.db.exec(
++        `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
++         values ('work', '7777', null, ${quote(iso(r.clock.now))}, 0, ${quote(iso(r.clock.now))}, null, ${quote(OTHER)})`,
++      );
++      const row = itemRow({ id: "fresh-1", connection_name: "work", gmail_message_id: "g-fresh-1", subject: "Deployment failed for fresh-app", dedup_key: "k-fresh-1" });
++      const columns = Object.keys(row);
++      r.db.exec(
++        `insert into email_watch_items (${columns.join(", ")}) values (${Object.values(row).map((value) => (typeof value === "number" ? String(value) : quote(value as string | null))).join(", ")})`,
++      );
++    };
++  }
++
++  it("a guard that matches nothing logs no warn, makes no get_profile call and leaves the other invocation's cursor and items alone", async () => {
++    const r = rig();
++    await seed(r);
++    await insertItem(r.db, itemRow({ id: "old-work", connection_name: "work", subject: "Deployment failed for old-app", dedup_key: "k-old" }));
++    r.runner.resolved.work = OTHER; // the name points at OTHER now: this invocation decides to purge the old fingerprint
++    const callsBefore = r.runner.calls.length;
++    r.clock.now = T0 + 10 * 60_000;
++    await staleWatcher(r, otherInvocationRestarted(r)).run();
++
++    expect(nameOnly(r, "work")).toEqual([]);
++    expect(r.log.entries.filter((entry) => entry.level !== "info")).toEqual([]);
++    expect(r.runner.calls.length).toBe(callsBefore);
++    expect(await cursorOf(r)).toMatchObject({ connection_id: OTHER, history_id: "7777" });
++    expect((await itemsOf(r)).map((row) => row.id)).toEqual(["fresh-1"]);
++  });
++
++  it("a guard that matches a stub cursor (no items) changed a row, so it warns once and restarts the name", async () => {
++    const r = rig();
++    r.mailboxes.work!.failWith("profile", 500);
++    await r.run();
++    expect((await cursorOf(r))!.history_id, "precondition: the stub exists").toBe("");
++    r.mailboxes.work!.clearFailures();
++    r.runner.resolved.work = OTHER;
++    const callsBefore = r.runner.calls.length;
++    r.clock.now = T0 + 10 * 60_000;
++    await r.run();
++    expect(nameOnly(r, "work")).toHaveLength(1);
++    expect(r.runner.calls.slice(callsBefore).map((call) => call.actionId)).toEqual(["gmail.get_profile"]);
++    expect(await cursorOf(r)).toMatchObject({ connection_id: OTHER, history_id: "1000" });
++  });
++});
++
++describe("the sweep never leaves items without a cursor (patch 0016, #125 decision 4)", () => {
++  const NOW = Date.UTC(2026, 10, 13, 0, 5, 0);
++  const stamp = (ms: number) => new Date(ms).toISOString();
++  const recent = stamp(NOW - HOUR);
++
++  class ItemsPurgeFailure extends Error {
++    override name = "ItemsPurgeFailure";
++  }
++  const secret = "Quarterly numbers for pat@example.com, code 482913";
++
++  function open() {
++    const sqlite = new SqliteD1Database();
++    databases.push(sqlite);
++    return { sqlite, log: createLogCapture() };
++  }
++
++  async function seedConnections(sqlite: SqliteD1Database, names: readonly string[]) {
++    for (const name of names) {
++      await insertCursor(sqlite, { connection_name: name, history_id: "1", last_run_at: recent });
++      await insertItem(sqlite, itemRow({ id: `${name}#p`, connection_name: name, created_at: recent, received_at: recent }));
++    }
++  }
++
++  const names = async (sqlite: SqliteD1Database, table: "email_watch_items" | "email_watch_cursors") =>
++    [...new Set((await selectAll<{ connection_name: string }>(sqlite, `select connection_name from ${table}`)).map((row) => row.connection_name))].sort();
++
++  /** The purge reads of email_watch_items (`select distinct` for a watched list, an unfiltered delete for none). */
++  const isItemsPurge = (query: string) =>
++    /select\s+distinct\s+connection_name\s+from\s+email_watch_items/i.test(query) || /^\s*delete\s+from\s+email_watch_items\s*$/i.test(query);
++
++  /** Throws when the statement matches, either as it is prepared or when it runs. `nth` counts matches, from 1. */
++  function failing(inner: SqliteD1Database, when: (query: string) => boolean, at: "prepare" | "run", nth = 1): D1DatabaseBinding {
++    let seen = 0;
++    return {
++      batch: (statements) => inner.batch(statements),
++      prepare(query: string) {
++        if (!when(query)) return inner.prepare(query);
++        seen += 1;
++        if (seen !== nth) return inner.prepare(query);
++        if (at === "prepare") throw new ItemsPurgeFailure(secret);
++        const statement = inner.prepare(query);
++        const rejecting = () => Promise.reject(new ItemsPurgeFailure(secret));
++        const wrapped: any = {
++          bind: (...values: unknown[]) => {
++            statement.bind(...values);
++            return wrapped;
++          },
++          first: rejecting,
++          all: rejecting,
++          run: rejecting,
++        };
++        return wrapped;
++      },
++    };
++  }
++
++  describe.each(["prepare", "run"] as const)("when the failure happens at %s", (at) => {
++    it("watched list: the cursor purge is skipped, the cursors stay, one error is logged by name only, and every item still has its cursor", async () => {
++      const { sqlite, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await sweepEmailWatchRetention(failing(sqlite, isItemsPurge, at), ["a"], log.logger, NOW);
++      expect(await names(sqlite, "email_watch_cursors")).toEqual(["a", "gone"]);
++      expect(await names(sqlite, "email_watch_items")).toEqual(["a", "gone"]);
++      expect(log.entries).toHaveLength(1);
++      expect(log.entries[0]!.level).toBe("error");
++      expect(log.text()).toContain("ItemsPurgeFailure");
++      for (const part of ["Quarterly numbers", "pat@example.com", "482913"]) expect(log.text(), part).not.toContain(part);
++    });
++
++    it("empty watched list: the cursors of every name stay", async () => {
++      const { sqlite, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await sweepEmailWatchRetention(failing(sqlite, isItemsPurge, at), [], log.logger, NOW);
++      expect(await names(sqlite, "email_watch_cursors")).toEqual(["a", "gone"]);
++      expect(log.entries).toHaveLength(1);
++    });
++
++    it("the expiry deletes still ran, and only the cursors of unwatched names were held back", async () => {
++      const { sqlite, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await insertItem(sqlite, itemRow({ id: "a#expired", connection_name: "a", created_at: stamp(NOW - 20 * DAY), received_at: stamp(NOW - 20 * DAY) }));
++      await sweepEmailWatchRetention(failing(sqlite, isItemsPurge, at), ["a"], log.logger, NOW);
++      expect((await selectAll<{ id: string }>(sqlite, "select id from email_watch_items order by id")).map((row) => row.id)).toEqual(["a#p", "gone#p"]);
++      expect(await names(sqlite, "email_watch_cursors")).toEqual(["a", "gone"]);
++    });
++
++    it("the next sweep, when the items purge works again, purges items and then cursors", async () => {
++      const { sqlite, log } = open();
++      await seedConnections(sqlite, ["a", "gone"]);
++      await sweepEmailWatchRetention(failing(sqlite, isItemsPurge, at), ["a"], log.logger, NOW);
++      await sweepEmailWatchRetention(sqlite, ["a"], log.logger, NOW);
++      expect(await names(sqlite, "email_watch_items")).toEqual(["a"]);
++      expect(await names(sqlite, "email_watch_cursors")).toEqual(["a"]);
++      expect(log.entries).toHaveLength(1);
++    });
++
++    it("a failure on the second chunk of unwatched names holds back every cursor, including those whose items were already purged", async () => {
++      const { sqlite, log } = open();
++      const many = Array.from({ length: 120 }, (_, index) => `n${String(index).padStart(3, "0")}`);
++      await seedConnections(sqlite, ["a", ...many]);
++      const secondChunk = (query: string) => /^\s*delete\s+from\s+email_watch_items\s+where\s+connection_name\s+in\b/i.test(query);
++      await sweepEmailWatchRetention(new BindLimitedD1(failing(sqlite, secondChunk, at, 2)), ["a"], log.logger, NOW);
++      expect(await names(sqlite, "email_watch_cursors")).toHaveLength(121);
++      expect((await names(sqlite, "email_watch_items")).length).toBeLessThan(121);
++      expect(log.entries).toHaveLength(1);
++      // Every name that still has items still has its cursor.
++      const cursors = new Set(await names(sqlite, "email_watch_cursors"));
++      for (const name of await names(sqlite, "email_watch_items")) expect(cursors.has(name), name).toBe(true);
++    });
++  });
++
++  it("a missing items table does not hold back the cursor purge, and nothing is logged", async () => {
++    const { sqlite, log } = open();
++    await seedConnections(sqlite, ["a", "gone"]);
++    sqlite.exec("drop table email_watch_items");
++    await sweepEmailWatchRetention(sqlite, ["a"], log.logger, NOW);
++    expect(await names(sqlite, "email_watch_cursors")).toEqual(["a"]);
++    expect(log.entries).toEqual([]);
++  });
++
++  it("a missing items table with an empty watched list purges every cursor", async () => {
++    const { sqlite, log } = open();
++    await seedConnections(sqlite, ["a", "gone"]);
++    sqlite.exec("drop table email_watch_items");
++    await sweepEmailWatchRetention(sqlite, [], log.logger, NOW);
++    expect(await names(sqlite, "email_watch_cursors")).toEqual([]);
++    expect(log.entries).toEqual([]);
++  });
++
++  it("a failing expiry delete alone does not hold back the cursor purge (only the items purge does)", async () => {
++    const { sqlite, log } = open();
++    await seedConnections(sqlite, ["a", "gone"]);
++    const pendingExpiry = (query: string) => /^\s*delete\s+from\s+email_watch_items\b/i.test(query) && /created_at/.test(query);
++    await sweepEmailWatchRetention(failing(sqlite, pendingExpiry, "prepare"), ["a"], log.logger, NOW);
++    expect(await names(sqlite, "email_watch_cursors")).toEqual(["a"]);
++    expect(await names(sqlite, "email_watch_items")).toEqual(["a"]);
++    expect(log.entries).toHaveLength(1);
++  });
++
++  it("a failing cursor purge after a working items purge still logs once and purges the items", async () => {
++    const { sqlite, log } = open();
++    await seedConnections(sqlite, ["a", "gone"]);
++    const cursorPurge = (query: string) => /email_watch_cursors/i.test(query);
++    await sweepEmailWatchRetention(failing(sqlite, cursorPurge, "prepare"), ["a"], log.logger, NOW);
++    expect(await names(sqlite, "email_watch_items")).toEqual(["a"]);
++    expect(log.entries).toHaveLength(1);
++  });
++});
++
++describe("the test D1 reports rows changed per batched statement, as real D1 does (harness self-test, patch 0016)", () => {
++  it("meta.changes of each batch entry is the number of rows that statement deleted, and 0 for a read", async () => {
++    const sqlite = new SqliteD1Database();
++    databases.push(sqlite);
++    for (const name of ["a", "b"]) await insertCursor(sqlite, { connection_name: name, history_id: "1", last_run_at: iso(T0) });
++    const results = await sqlite.batch([
++      sqlite.prepare("select connection_name from email_watch_cursors").bind(),
++      sqlite.prepare("delete from email_watch_cursors where connection_name = ?").bind("a"),
++      sqlite.prepare("delete from email_watch_cursors where connection_name = ?").bind("nobody"),
++    ]);
++    expect(results.map((result) => (result as { meta?: { changes?: number } }).meta?.changes)).toEqual([0, 1, 0]);
++    expect(results[0]!.results).toHaveLength(2);
++  });
++});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0016 review follow-up: a stub is only upgraded, and its failing notice only claimed, while it still holds the
++// connection_id this invocation read. Invocation A reads stub S1 (fingerprint X); before A's write the name is purged
++// and re-stubbed as S2 (fingerprint Y). A must leave S2 alone.
++// ---------------------------------------------------------------------------------------------------------------
++describe("a stale stub write does not touch a stub made for another account (patch 0016 review)", () => {
++  const MIN = 60_000;
++  const OTHER = "d".repeat(64);
++  const FIRST = T0 + 59_000;
++
++  /** One failed first attempt at FIRST leaves stub S1 for fingerprint X (the runner's default for "work"). */
++  async function withStub(): Promise<Rig> {
++    const r = rig();
++    r.mailboxes.work!.failWith("profile", 500);
++    r.clock.now = FIRST;
++    await r.run();
++    expect((await cursorOf(r))?.history_id, "precondition: S1 exists").toBe("");
++    return r;
++  }
++
++  /** What another invocation did meanwhile: the name was purged and stubbed again for fingerprint Y at `createdMs`. */
++  async function restubbed(r: Rig, createdMs: number): Promise<void> {
++    await r.db.prepare("delete from email_watch_cursors where connection_name = 'work'").run();
++    await r.db
++      .prepare(
++        `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id, created_at)
++         values ('work', '', null, ?, 0, null, null, ?, ?)`,
++      )
++      .bind(iso(createdMs), OTHER, iso(createdMs))
++      .run();
++  }
++
++  /** Holds nothing: runs `during` once, after the first get_profile answered and before A writes anything. */
++  function afterProfile(r: Rig, during: () => Promise<void>): void {
++    r.runner.afterRun = async (call) => {
++      if (call.actionId !== "gmail.get_profile") return;
++      r.runner.afterRun = undefined;
++      await during();
++    };
++  }
++
++  it("an upgrade after a successful profile call leaves S2 a stub: history_id '' and last_success_at null", async () => {
++    const r = await withStub();
++    r.mailboxes.work!.clearFailures();
++    r.clock.now = FIRST + 10 * MIN;
++    afterProfile(r, () => restubbed(r, FIRST + 5 * MIN));
++    await r.run();
++    expect(r.runner.afterRun, "A reached its get_profile call").toBeUndefined();
++    expect(await cursorOf(r)).toMatchObject({
++      history_id: "",
++      last_success_at: null,
++      failing_notice_at: null,
++      connection_id: OTHER,
++      created_at: iso(FIRST + 5 * MIN),
++    });
++  });
++
++  it("control: with nothing swapped the same profile call does upgrade the stub", async () => {
++    const r = await withStub();
++    r.mailboxes.work!.clearFailures();
++    r.clock.now = FIRST + 10 * MIN;
++    await r.run();
++    expect(await cursorOf(r)).toMatchObject({ history_id: "1000", last_success_at: iso(FIRST + 10 * MIN), connection_id: r.runner.fingerprintOf("work") });
++  });
++
++  it("a failing-notice claim leaves S2 without failing_notice_at and inserts no item", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR; // S1 is over 24 hours old, so A's abort will try to claim
++    afterProfile(r, () => restubbed(r, FIRST + DAY));
++    await r.run();
++    expect(r.runner.afterRun, "A reached its get_profile call").toBeUndefined();
++    expect(await cursorOf(r)).toMatchObject({ history_id: "", connection_id: OTHER, failing_notice_at: null, last_success_at: null });
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toEqual([]);
++  });
++
++  it("control: with nothing swapped the same abort claims and leaves exactly one item", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR;
++    await r.run();
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toHaveLength(1);
++    expect((await cursorOf(r))!.failing_notice_at).toBe(iso(FIRST + DAY + HOUR));
++  });
++
++  it("S2 still gets its own notice after its own 24 hours, from its own created_at", async () => {
++    const r = await withStub();
++    r.clock.now = FIRST + DAY + HOUR;
++    afterProfile(r, () => restubbed(r, FIRST + DAY));
++    await r.run();
++    r.runner.resolved.work = OTHER;
++    await r.run(); // the name now resolves to Y: S2 matches, A's stale write is long over
++    expect(await itemsOf(r, "rule_id = 'watch-failing'")).toEqual([]);
++    r.clock.now = FIRST + 2 * DAY;
++    await r.run();
++    expect((await itemsOf(r, "rule_id = 'watch-failing'")).map((row) => row.subject)).toEqual([
++      "Email watch could not start reading this account (trying since 2026-11-12 12:00 UTC)",
++    ]);
++  });
++});
+diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
+index 9f75e8c1..e22b2750 100644
+--- a/src/server/email-watch/watcher.ts
++++ b/src/server/email-watch/watcher.ts
+@@ -46,6 +46,8 @@ interface Cursor {
+   failingNoticeAt: string | null;
+   /** The Gmail connection the name resolved to when the cursor was written; null before patch 0015. */
+   connectionId: string | null;
++  /** When the row was first written; null on a row from before migration 0023 that was never backfilled. */
++  createdAt: string | null;
+ }
+ 
+ interface CursorRow {
+@@ -57,6 +59,7 @@ interface CursorRow {
+   last_success_at: string | null;
+   failing_notice_at: string | null;
+   connection_id: string | null;
++  created_at: string | null;
+ }
+ 
+ /** What one Gmail action run came back as. Nothing in it is logged. */
+@@ -159,8 +162,8 @@ export class EmailWatcher {
+     const resolved = await this.resolveConnection(name, stored);
+     if (resolved.kind === "stop") return;
+     const cursor = resolved.cursor;
+-    if (!cursor) {
+-      await this.startConnection(name, budget, resolved.connectionId);
++    if (!cursor || isStub(cursor)) {
++      await this.startConnection(name, budget, resolved.connectionId, cursor);
+       return;
+     }
+     const counts: PageCounts = { fetched: 0, stored: 0, merged: 0 };
+@@ -206,7 +209,7 @@ export class EmailWatcher {
+     if (cursor) {
+       // One batch, and both deletes only while the cursor still holds the fingerprint this invocation read: an
+       // invocation that read it before another one purged and started fresh must not delete the new cursor or items.
+-      await this.database.batch([
++      const results = await this.database.batch([
+         this.database
+           .prepare(
+             `delete from email_watch_items where connection_name = ?
+@@ -217,6 +220,9 @@ export class EmailWatcher {
+           .prepare("delete from email_watch_cursors where connection_name = ? and connection_id is ?")
+           .bind(name, cursor.connectionId),
+       ]);
++      // Nothing changed: another invocation already purged and restarted this name. Leave it to that one.
++      const dropped = results.reduce((sum, result) => sum + (result.meta?.changes ?? 0), 0);
++      if (dropped === 0) return { kind: "stop" };
+       this.logger.warn({ connectionName: name }, "email watch dropped what it had stored for a name that points elsewhere now");
+     }
+     if (current === undefined) {
+@@ -226,21 +232,66 @@ export class EmailWatcher {
+     return { kind: "go", cursor: undefined, connectionId: current };
+   }
+ 
+-  /** First run for a connection: remember where the mailbox is now and read nothing (no backfill). */
+-  private async startConnection(name: string, budget: Budget, connectionId: string | null): Promise<void> {
++  /**
++   * First run for a connection, or a poll of a stub cursor (history_id ''): remember where the mailbox is now and
++   * read nothing (no backfill). When get_profile fails, a name with no cursor gets a stub so that its failure streak
++   * can be noticed; a stub that fails again aborts like any cursor. A name the budget did not reach gets no stub.
++   */
++  private async startConnection(
++    name: string,
++    budget: Budget,
++    connectionId: string | null,
++    stub: Cursor | undefined,
++  ): Promise<void> {
+     const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
++    if (reply.kind === "no_budget") {
++      this.logSkip(name, "no_budget");
++      return;
++    }
+     const historyId = reply.kind === "ok" ? readString(reply.output.historyId) : undefined;
+     if (!historyId) {
+-      this.logSkip(name, reply.kind === "failed" ? reply.code : "no_history_id");
++      const code = reply.kind === "failed" ? reply.code : "no_history_id";
++      if (stub) {
++        await this.abort(name, stub, code);
++      } else {
++        this.logSkip(name, code);
++        await this.insertStub(name, connectionId);
++      }
++      return;
++    }
++    const now = this.nowIso();
++    if (stub) {
++      // Only while it is still the stub this invocation read: another invocation may have started it, or purged it and
++      // left a new stub for another account.
++      await this.database
++        .prepare(
++          `update email_watch_cursors set history_id = ?, page_token = null, last_run_at = ?, catch_up = 0,
++             last_success_at = ?, failing_notice_at = null
++           where connection_name = ? and history_id = '' and connection_id is ?`,
++        )
++        .bind(historyId, now, now, name, stub.connectionId)
++        .run();
+       return;
+     }
+     await this.database
+       .prepare(
+         `insert or ignore into email_watch_cursors
+-           (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
+-         values (?, ?, null, ?, 0, ?, null, ?)`,
++           (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id, created_at)
++         values (?, ?, null, ?, 0, ?, null, ?, ?)`,
++      )
++      .bind(name, historyId, now, now, connectionId, now)
++      .run();
++  }
++
++  private async insertStub(name: string, connectionId: string | null): Promise<void> {
++    const now = this.nowIso();
++    await this.database
++      .prepare(
++        `insert or ignore into email_watch_cursors
++           (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id, created_at)
++         values (?, '', null, ?, 0, null, null, ?, ?)`,
+       )
+-      .bind(name, historyId, this.nowIso(), this.nowIso(), connectionId)
++      .bind(name, now, connectionId, now)
+       .run();
+   }
+ 
+@@ -495,20 +546,28 @@ export class EmailWatcher {
+   /**
+    * A poll that could not read Gmail. The cursor keeps its place and goes back to the normal interval (catch_up is
+    * cleared: a connection that keeps failing is not retried every minute). After 24 hours without a successful read
+-   * the first abort of the streak leaves one pending "could not read" item.
++   * the first abort of the streak leaves one pending "could not read" item ("could not start reading" for a stub
++   * cursor). The claim only succeeds while the cursor still holds the last_success_at this invocation loaded, so an
++   * abort that a concurrent success overtook leaves no item.
+    */
+   private async abort(name: string, cursor: Cursor, code: string): Promise<void> {
+     this.logSkip(name, code);
+     await this.touch(name, false);
+-    const since = cursor.lastSuccessAt ?? cursor.lastRunAt;
++    const since = cursor.lastSuccessAt ?? cursor.createdAt ?? cursor.lastRunAt;
+     if (cursor.failingNoticeAt !== null || this.now() - Date.parse(since) < FAILING_AFTER_MS) return;
+     // Claim the streak first, so two overlapping invocations leave one item.
+     const claimed = await this.database
+-      .prepare("update email_watch_cursors set failing_notice_at = ? where connection_name = ? and failing_notice_at is null")
+-      .bind(this.nowIso(), name)
++      .prepare(
++        `update email_watch_cursors set failing_notice_at = ?
++         where connection_name = ? and failing_notice_at is null and last_success_at is ? and connection_id is ?`,
++      )
++      .bind(this.nowIso(), name, cursor.lastSuccessAt, cursor.connectionId)
+       .run();
+     if ((claimed.meta.changes ?? 0) > 0) {
+-      await this.insertPendingGap(name, "watch-failing", `Email watch could not read this account since ${formatMinute(since)}`);
++      const subject = isStub(cursor)
++        ? `Email watch could not start reading this account (trying since ${formatMinute(since)})`
++        : `Email watch could not read this account since ${formatMinute(since)}`;
++      await this.insertPendingGap(name, "watch-failing", subject);
+     }
+   }
+ 
+@@ -564,8 +623,19 @@ export async function sweepEmailWatchRetention(
+       .bind(new Date(now - ACKNOWLEDGED_RETENTION_MS).toISOString())
+       .run();
+   });
++  // Items before cursors, and no cursor purge after an items purge that failed: the sweep must not leave items
++  // without a cursor. A missing items table does not stop it.
++  let itemsPurged = true;
+   for (const table of WATCH_TABLES) {
+-    await attempt(() => purgeUnwatched(database, table, watched));
++    if (table === "email_watch_cursors" && !itemsPurged) continue;
++    await attempt(async () => {
++      try {
++        await purgeUnwatched(database, table, watched);
++      } catch (error) {
++        if (!isMissingTable(error)) itemsPurged = false;
++        throw error;
++      }
++    });
+   }
+   if (failure !== undefined) logger.error({ errorName: errorName(failure) }, "email watch retention sweep failed");
+ }
+@@ -590,6 +660,11 @@ async function purgeUnwatched(
+   }
+ }
+ 
++/** A stub cursor: a name whose first get_profile failed, so nothing is started yet. */
++function isStub(cursor: Cursor): boolean {
++  return cursor.historyId === "";
++}
++
+ function isMissingTable(error: unknown): boolean {
+   return error instanceof Error && /no such table/i.test(error.message);
+ }
+@@ -605,7 +680,7 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
+ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cursor>> {
+   const { results } = await database
+     .prepare(
+-      `select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id
++      `select connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id, created_at
+        from email_watch_cursors`,
+     )
+     .all<CursorRow>();
+@@ -621,6 +696,7 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
+         lastSuccessAt: row.last_success_at,
+         failingNoticeAt: row.failing_notice_at,
+         connectionId: row.connection_id,
++        createdAt: row.created_at,
+       },
+     ]),
+   );
+diff --git a/src/server/storage/d1/test-database.ts b/src/server/storage/d1/test-database.ts
+index 556b51e4..8c3af55b 100644
+--- a/src/server/storage/d1/test-database.ts
++++ b/src/server/storage/d1/test-database.ts
+@@ -12,12 +12,17 @@ export class SqliteD1Database implements D1DatabaseBinding {
+     }
+   }
+ 
+-  async batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null }[]> {
++  // Like real D1, each batch entry carries `meta.changes`: the rows a write statement changed (0 for a read).
++  async batch(
++    statements: D1PreparedStatementBinding[],
++  ): Promise<{ results: Record<string, unknown>[] | null; meta: { changes: number } }[]> {
+     this.database.exec("begin immediate");
+     try {
+       const results = statements.map((statement) => {
+-        const rows = (statement as SqliteD1PreparedStatement).readRows();
+-        return { results: rows.length ? rows : null };
++        // A wrapper statement that only forwards readRows (see the sweeping test database) reports no changes.
++        const inner = statement as Partial<SqliteD1PreparedStatement> & { readRows(): Record<string, unknown>[] };
++        const { rows, changes } = inner.readOutcome?.() ?? { rows: inner.readRows(), changes: 0 };
++        return { results: rows.length ? rows : null, meta: { changes } };
+       });
+       this.database.exec("commit");
+       return results;
+@@ -75,6 +80,16 @@ class SqliteD1PreparedStatement implements D1PreparedStatementBinding {
+     return this.database.prepare(this.query).all(...toSqlValues(this.values));
+   }
+ 
++  /** Runs the statement once: its rows, and the number of rows it changed (a write with RETURNING has both). */
++  readOutcome(): { rows: Record<string, unknown>[]; changes: number } {
++    const statement = this.database.prepare(this.query);
++    if (statement.columns().length > 0) {
++      const rows = statement.all(...toSqlValues(this.values));
++      return { rows, changes: /^\s*(select|with|pragma)\b/i.test(this.query) ? 0 : rows.length };
++    }
++    return { rows: [], changes: Number(statement.run(...toSqlValues(this.values)).changes) };
++  }
++
+   async all<T = Record<string, unknown>>(): Promise<{ results: T[] }> {
+     return { results: this.readRows() as T[] };
+   }
+diff --git a/src/server/storage/postgres/runtime-store.test.ts b/src/server/storage/postgres/runtime-store.test.ts
+index 7bd5f8a5..2df557ff 100644
+--- a/src/server/storage/postgres/runtime-store.test.ts
++++ b/src/server/storage/postgres/runtime-store.test.ts
+@@ -169,6 +169,7 @@ describe("PostgreSQL migrations with PGlite", () => {
+           { name: "0020_email_watch_indexes.sql" },
+           { name: "0021_email_watch_drop_connection_index.sql" },
+           { name: "0022_email_watch_cursor_state.sql" },
++          { name: "0023_email_watch_cursor_created_at.sql" },
+         ],
+       });
+ 
+@@ -356,6 +357,7 @@ describe("PostgreSQL migrations with a custom migration source", () => {
+           { name: "0020_email_watch_indexes.sql" },
+           { name: "0021_email_watch_drop_connection_index.sql" },
+           { name: "0022_email_watch_cursor_state.sql" },
++          { name: "0023_email_watch_cursor_created_at.sql" },
+           { name: "9998_custom.sql" },
+         ],
+       });
+@@ -840,7 +842,7 @@ describe("PostgreSQL email watch cursor state (patch 0015, #96 and #101)", () =>
+ 
+       await migratePostgresDatabase({ pool });
+       await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
+-      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).slice(-2)).toEqual([PREVIOUS, NAME]);
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).filter((name: string) => name <= NAME).slice(-2)).toEqual([PREVIOUS, NAME]);
+       await expect(assertPostgresSchemaReady(pool)).resolves.toBeUndefined();
+ 
+       const columns = (
+@@ -893,3 +895,67 @@ describe("PostgreSQL email watch cursor state (patch 0015, #96 and #101)", () =>
+     }
+   });
+ });
++
++describe("PostgreSQL email watch cursor created_at (patch 0016, #125)", () => {
++  let testServer: PGliteTestServer;
++
++  beforeAll(async () => {
++    testServer = await startPGliteTestServer();
++  });
++
++  afterAll(async () => {
++    await testServer.close();
++  });
++
++  const PREVIOUS = "0022_email_watch_cursor_state.sql";
++  const NAME = "0023_email_watch_cursor_created_at.sql";
++
++  it("0023 applies after 0022 on a database that holds cursor rows, adds a nullable text created_at and backfills coalesce(last_success_at, last_run_at)", async () => {
++    const pool = new Pool({ connectionString: testServer.url, max: 1 });
++    try {
++      const through0022: MigrationSource = {
++        readMigrations: (dialect) => defaultMigrationSource.readMigrations(dialect).filter((migration) => migration.name <= PREVIOUS),
++      };
++      await migratePostgresDatabase({ pool, migrations: through0022 });
++      await pool.query(
++        `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at) values
++           ('succeeded', '1', null, '2026-11-11T12:00:00.000Z', 0, '2026-11-10T00:00:00.000Z'),
++           ('never-succeeded', '7', 'p20', '2026-11-09T08:30:00.000Z', 1, null)`,
++      );
++
++      await migratePostgresDatabase({ pool });
++      await expect(migratePostgresDatabase({ pool })).resolves.toBeUndefined();
++      expect((await pool.query("select name from runtime_migrations order by name")).rows.map((row: { name: string }) => row.name).slice(-2)).toEqual([PREVIOUS, NAME]);
++      await expect(assertPostgresSchemaReady(pool)).resolves.toBeUndefined();
++
++      expect(
++        (
++          await pool.query(
++            "select column_name, data_type, is_nullable, column_default from information_schema.columns where table_name = 'email_watch_cursors' and column_name = 'created_at'",
++          )
++        ).rows,
++      ).toEqual([{ column_name: "created_at", data_type: "text", is_nullable: "YES", column_default: null }]);
++      expect(
++        (await pool.query("select connection_name, last_success_at, last_run_at, created_at from email_watch_cursors order by connection_name")).rows,
++      ).toEqual([
++        {
++          connection_name: "never-succeeded",
++          last_success_at: null,
++          last_run_at: "2026-11-09T08:30:00.000Z",
++          created_at: "2026-11-09T08:30:00.000Z",
++        },
++        {
++          connection_name: "succeeded",
++          last_success_at: "2026-11-10T00:00:00.000Z",
++          last_run_at: "2026-11-11T12:00:00.000Z",
++          created_at: "2026-11-10T00:00:00.000Z",
++        },
++      ]);
++
++      await pool.query("insert into email_watch_cursors (connection_name, history_id, last_run_at) values ('new', '2', '2026-11-12T00:00:00.000Z')");
++      expect((await pool.query("select created_at from email_watch_cursors where connection_name = 'new'")).rows).toEqual([{ created_at: null }]);
++    } finally {
++      await pool.end();
++    }
++  });
++});
+diff --git a/src/server/storage/sqlite/runtime-store.test.ts b/src/server/storage/sqlite/runtime-store.test.ts
+index 7aed6f62..2489be5c 100644
+--- a/src/server/storage/sqlite/runtime-store.test.ts
++++ b/src/server/storage/sqlite/runtime-store.test.ts
+@@ -65,6 +65,7 @@ describe("SqliteRuntimeDatabase", () => {
+       "0020_email_watch_indexes.sql",
+       "0021_email_watch_drop_connection_index.sql",
+       "0022_email_watch_cursor_state.sql",
++      "0023_email_watch_cursor_created_at.sql",
+     ];
+     expect(entries.filter((entry) => entry.message === "sqlite migration started")).toEqual(
+       migrations.map((migration) => ({ fields: { migration }, message: "sqlite migration started" })),
+-- 
+2.34.1
+
