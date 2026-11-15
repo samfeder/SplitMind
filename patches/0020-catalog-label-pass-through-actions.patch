@@ -1,0 +1,634 @@
+SplitMind patch 0020 for OpenConnector v1.9.2.
+Upstream issue: not filed yet. Draft text: docs/upstream/connection-read-only-issue-draft.md, section "Mislabelled actions" (#134, the pass-through audit).
+Replace this line with the upstream issue or pull request link once it exists.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sun, 15 Nov 2026 12:10:42 -0500
+Subject: [PATCH] fix(catalog): label pass-through and mutating actions as
+ write or destructive
+
+Read-only connections (0018) and the read-only MCP consent grants (0004)
+trust each action's operationType. The #134 audit found actions labelled
+read that forward caller-chosen tools, SQL, GraphQL, code or HTTP methods,
+or that plainly mutate:
+
+- destructive: google_bigquery.query (raw GoogleSQL runs DML and DDL; the
+  required scopes are unchanged) and okta.lifecycle_user (deactivates and
+  suspends users).
+- write: gildata.call_tool, pkulaw.call_tool, investoday_mcp.call_tool,
+  finchina.execute_tool, sif.call_tool, tongdaxin.call_tool,
+  fireflies.execute_graphql_query (its mutation guard can be bypassed with
+  a block-string escape), waffo.run_query, wandb.query_wandb,
+  turbot_pipes.execute_query, vapi.test_code_tool_execution,
+  scrapfly.scrape, scrapingant.scrape_with_extended_json_output,
+  scrapingant.extract_content_as_markdown and
+  scrapingant.extract_data_with_ai.
+
+Descriptions that claimed read-only (tongdaxin, fireflies, waffo, wandb) no
+longer do. Actions that gate on an allowlist (baizhi_mcp, helium10) and the
+public scrape OpenAPI invokers stay read.
+---
+ src/providers/catalog-write-labels.test.ts    | 110 +++++++++++++++-
+ src/providers/finchina/actions.ts             |   2 +-
+ src/providers/fireflies/actions.ts            |   4 +-
+ src/providers/gildata/actions.ts              |   2 +-
+ src/providers/google_bigquery/actions.ts      |   6 +-
+ src/providers/investoday_mcp/actions.ts       |   2 +-
+ src/providers/okta/actions.ts                 |   2 +-
+ src/providers/pkulaw/actions.ts               |   2 +-
+ src/providers/scrapfly/actions.ts             |   2 +-
+ src/providers/scrapingant/actions.ts          |   6 +-
+ src/providers/sif/actions.ts                  |   2 +-
+ src/providers/tongdaxin/actions.ts            |   6 +-
+ src/providers/turbot_pipes/actions.ts         |   2 +-
+ src/providers/vapi/actions.ts                 |   2 +-
+ src/providers/waffo/actions.ts                |   4 +-
+ src/providers/wandb/actions.ts                |   6 +-
+ .../cloudflare-read-only-connections.test.ts  | 124 +++++++++++++++++-
+ 17 files changed, 254 insertions(+), 30 deletions(-)
+
+diff --git a/src/providers/catalog-write-labels.test.ts b/src/providers/catalog-write-labels.test.ts
+index 29ee56b1..aa3505bc 100644
+--- a/src/providers/catalog-write-labels.test.ts
++++ b/src/providers/catalog-write-labels.test.ts
+@@ -1,6 +1,7 @@
+ import type { ProviderDefinition } from "../core/types.ts";
+ 
+ import { describe, expect, it } from "vitest";
++import { parseReadOnlyConnections } from "../core/read-only-connections.ts";
+ 
+ /**
+  * Read-only connections (and the read-only consent grants) trust each action's `operationType`. These actions
+@@ -9,6 +10,9 @@ import { describe, expect, it } from "vitest";
+  * provider definitions, the same objects the catalog is generated from.
+  *
+  * Each expected value is a literal from the revision-2 review list and the round-2 review (linear.run_query), not derived from the code under test.
++ *
++ * Patch 0020 (#134) adds the pass-through block: actions that forward a caller-chosen tool, SQL, GraphQL, code or
++ * HTTP request, or that plainly mutate. The expected labels are literals from the #134 audit.
+  */
+ 
+ const definitions: Record<string, () => Promise<{ provider: ProviderDefinition }>> = {
+@@ -26,6 +30,25 @@ const definitions: Record<string, () => Promise<{ provider: ProviderDefinition }
+   harpa_ai: () => import("./harpa_ai/definition.ts"),
+   fuxin: () => import("./fuxin/definition.ts"),
+   linear: () => import("./linear/definition.ts"),
++  google_bigquery: () => import("./google_bigquery/definition.ts"),
++  okta: () => import("./okta/definition.ts"),
++  gildata: () => import("./gildata/definition.ts"),
++  pkulaw: () => import("./pkulaw/definition.ts"),
++  investoday_mcp: () => import("./investoday_mcp/definition.ts"),
++  finchina: () => import("./finchina/definition.ts"),
++  sif: () => import("./sif/definition.ts"),
++  tongdaxin: () => import("./tongdaxin/definition.ts"),
++  fireflies: () => import("./fireflies/definition.ts"),
++  waffo: () => import("./waffo/definition.ts"),
++  wandb: () => import("./wandb/definition.ts"),
++  turbot_pipes: () => import("./turbot_pipes/definition.ts"),
++  vapi: () => import("./vapi/definition.ts"),
++  scrapfly: () => import("./scrapfly/definition.ts"),
++  scrapingant: () => import("./scrapingant/definition.ts"),
++  baizhi_mcp: () => import("./baizhi_mcp/definition.ts"),
++  helium10: () => import("./helium10/definition.ts"),
++  scrape_creators: () => import("./scrape_creators/definition.ts"),
++  tikhub: () => import("./tikhub/definition.ts"),
+ };
+ 
+ const expected: [actionId: string, operationType: "write" | "destructive"][] = [
+@@ -54,17 +77,56 @@ const expected: [actionId: string, operationType: "write" | "destructive"][] = [
+   ["linear.run_query", "write"],
+ ];
+ 
+-async function labelOf(actionId: string): Promise<string | undefined> {
++// Patch 0020 (#134): pass-through and mislabelled actions.
++const passThrough: [actionId: string, operationType: "write" | "destructive"][] = [
++  // Raw GoogleSQL runs DML and DDL, including DROP TABLE; deactivating or suspending users is destructive.
++  ["google_bigquery.query", "destructive"],
++  ["okta.lifecycle_user", "destructive"],
++  // Forward any tool the caller names.
++  ["gildata.call_tool", "write"],
++  ["pkulaw.call_tool", "write"],
++  ["investoday_mcp.call_tool", "write"],
++  ["finchina.execute_tool", "write"],
++  ["sif.call_tool", "write"],
++  ["tongdaxin.call_tool", "write"],
++  // Caller-supplied GraphQL, SQL or code.
++  ["fireflies.execute_graphql_query", "write"],
++  ["waffo.run_query", "write"],
++  ["wandb.query_wandb", "write"],
++  ["turbot_pipes.execute_query", "write"],
++  ["vapi.test_code_tool_execution", "write"],
++  // The caller picks any HTTP method and body to any URL.
++  ["scrapfly.scrape", "write"],
++  ["scrapingant.scrape_with_extended_json_output", "write"],
++  ["scrapingant.extract_content_as_markdown", "write"],
++  ["scrapingant.extract_data_with_ai", "write"],
++];
++
++// Controls: these stay `read` (allowlisted executors, or GET/POST against a public scrape OpenAPI).
++const staysRead: string[] = [
++  "baizhi_mcp.call_tool",
++  "helium10.call_tool",
++  "scrape_creators.invoke_endpoint",
++  "tikhub.invoke_endpoint",
++];
++
++async function actionOf(actionId: string) {
+   const service = actionId.slice(0, actionId.indexOf("."));
+   const load = definitions[service];
+   if (!load) throw new Error(`no definition loader for ${service}`);
+   const { provider } = await load();
+-  return provider.actions.find((action) => action.id === actionId)?.operationType;
++  return provider.actions.find((action) => action.id === actionId);
++}
++
++async function labelOf(actionId: string): Promise<string | undefined> {
++  return (await actionOf(actionId))?.operationType;
+ }
+ 
+ describe("catalog labels for actions that write", () => {
+   it("lists every service the review named", () => {
+-    expect(new Set(expected.map(([id]) => id.slice(0, id.indexOf("."))))).toEqual(new Set(Object.keys(definitions)));
++    const services = [...expected, ...passThrough].map(([id]) => id.slice(0, id.indexOf(".")));
++    services.push(...staysRead.map((id) => id.slice(0, id.indexOf("."))));
++    expect(new Set(services)).toEqual(new Set(Object.keys(definitions)));
+   });
+ 
+   it.each(expected)("%s exists and is labelled %s", async (actionId, operationType) => {
+@@ -73,3 +135,45 @@ describe("catalog labels for actions that write", () => {
+     expect(label).toBe(operationType);
+   });
+ });
++
++describe("catalog labels for pass-through actions (patch 0020, #134)", () => {
++  it.each(passThrough)("%s exists and is labelled %s", async (actionId, operationType) => {
++    const label = await labelOf(actionId);
++    expect(label, `${actionId} must exist in the catalog with an operationType`).toBeDefined();
++    expect(label).toBe(operationType);
++  });
++
++  it.each(staysRead)("%s stays labelled read (control)", async (actionId) => {
++    const label = await labelOf(actionId);
++    expect(label, `${actionId} must exist in the catalog with an operationType`).toBeDefined();
++    expect(label).toBe("read");
++  });
++
++  // A relabelled action must not still advertise itself as read-only: that is what misled the grant.
++  it.each(passThrough)("%s no longer describes itself as read-only", async (actionId) => {
++    const action = await actionOf(actionId);
++    expect(action, `${actionId} must exist`).toBeDefined();
++    expect(action!.description).not.toMatch(/read[\s-]*only/i);
++  });
++
++  // The read-only rule itself, fed the label the definition carries: a read-only connection refuses every
++  // relabelled action and still allows the controls.
++  it.each(passThrough)("%s is refused on a read-only connection and the writable one is not", async (actionId) => {
++    const service = actionId.slice(0, actionId.indexOf("."));
++    const readOnly = parseReadOnlyConnections(`${service}:ro`, () => {});
++    const label = await labelOf(actionId);
++
++    expect(readOnly.refuseAction({ service, connectionName: "ro" }, label)).toMatchObject({
++      allowed: false,
++      code: "action_blocked",
++    });
++    expect(readOnly.refuseAction({ service, connectionName: "rw" }, label)).toBeUndefined();
++  });
++
++  it.each(staysRead)("%s is still allowed on a read-only connection (control)", async (actionId) => {
++    const service = actionId.slice(0, actionId.indexOf("."));
++    const readOnly = parseReadOnlyConnections(`${service}:ro`, () => {});
++
++    expect(readOnly.refuseAction({ service, connectionName: "ro" }, await labelOf(actionId))).toBeUndefined();
++  });
++});
+diff --git a/src/providers/finchina/actions.ts b/src/providers/finchina/actions.ts
+index c6a1da40..2166170d 100644
+--- a/src/providers/finchina/actions.ts
++++ b/src/providers/finchina/actions.ts
+@@ -110,7 +110,7 @@ export const finchinaActions: readonly ActionDefinition[] = [
+   defineProviderAction("finchina", {
+     name: "execute_tool",
+ 
+-    operationType: "read",
++    operationType: "write",
+     requiredScopes: [],
+     description:
+       "Query a FinChina data subtool discovered with discover_tools. Pass its exact name and arguments. Queries consume account credits; this action executes one request without automatic pagination or business retries.",
+diff --git a/src/providers/fireflies/actions.ts b/src/providers/fireflies/actions.ts
+index 9fb59cd5..87c6f409 100644
+--- a/src/providers/fireflies/actions.ts
++++ b/src/providers/fireflies/actions.ts
+@@ -974,8 +974,8 @@ export const firefliesActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "execute_graphql_query",
+-    operationType: "read",
+-    description: "Execute a raw read-only Fireflies GraphQL query and return the raw response.",
++    operationType: "write",
++    description: "Execute a raw Fireflies GraphQL document and return the raw response.",
+     inputSchema: executeGraphqlQueryInputSchema,
+     outputSchema: executeGraphqlQueryOutputSchema,
+   }),
+diff --git a/src/providers/gildata/actions.ts b/src/providers/gildata/actions.ts
+index 710636bc..5e6f7b56 100644
+--- a/src/providers/gildata/actions.ts
++++ b/src/providers/gildata/actions.ts
+@@ -226,7 +226,7 @@ export const gildataActions: readonly ActionDefinition[] = [
+   defineProviderAction("gildata", {
+     name: "call_tool",
+ 
+-    operationType: "read",
++    operationType: "write",
+     description:
+       "Call a current Gildata Data Map financial MCP tool with JSON arguments after checking its live schema with list_tools.",
+     requiredScopes: [],
+diff --git a/src/providers/google_bigquery/actions.ts b/src/providers/google_bigquery/actions.ts
+index 1d43c949..8c712fe3 100644
+--- a/src/providers/google_bigquery/actions.ts
++++ b/src/providers/google_bigquery/actions.ts
+@@ -136,7 +136,9 @@ const actions: BigQueryActionSource[] = [
+       raw: rawObject,
+     }),
+   ),
+-  read(
++  {
++    // Raw GoogleSQL runs DML and DDL (including DROP TABLE), so the label is destructive. The scopes stay as they were.
++    ...read(
+     "query",
+     "Run a BigQuery SQL query synchronously.",
+     input(
+@@ -171,6 +173,8 @@ const actions: BigQueryActionSource[] = [
+       raw: rawObject,
+     }),
+   ),
++    operationType: "destructive",
++  },
+   read(
+     "get_query_results",
+     "Poll BigQuery query job results.",
+diff --git a/src/providers/investoday_mcp/actions.ts b/src/providers/investoday_mcp/actions.ts
+index 67213e40..026b590e 100644
+--- a/src/providers/investoday_mcp/actions.ts
++++ b/src/providers/investoday_mcp/actions.ts
+@@ -45,7 +45,7 @@ export const investodayMcpActions: readonly ActionDefinition[] = [
+   }),
+   defineProviderAction("investoday_mcp", {
+     name: "call_tool",
+-    operationType: "read",
++    operationType: "write",
+     description:
+       "Call a current Investoday MCP tool with JSON arguments after checking its live schema and behavior annotations.",
+     requiredScopes: [],
+diff --git a/src/providers/okta/actions.ts b/src/providers/okta/actions.ts
+index c6b9eb6c..12283850 100644
+--- a/src/providers/okta/actions.ts
++++ b/src/providers/okta/actions.ts
+@@ -187,7 +187,7 @@ export const oktaActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "lifecycle_user",
+-    operationType: "read",
++    operationType: "destructive",
+     description: "Activate, reactivate, deactivate, suspend, unsuspend, unlock, or expire an Okta user's password.",
+     requiredScopes: [oktaUsersManageScope],
+     inputSchema: s.object(
+diff --git a/src/providers/pkulaw/actions.ts b/src/providers/pkulaw/actions.ts
+index 72348264..cdb59a63 100644
+--- a/src/providers/pkulaw/actions.ts
++++ b/src/providers/pkulaw/actions.ts
+@@ -60,7 +60,7 @@ export const pkulawActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "call_tool",
+-    operationType: "read",
++    operationType: "write",
+     description: "Call a current PKULaw legal data tool with JSON arguments after checking its live schema.",
+     requiredScopes: [],
+     followUpActions: ["pkulaw.list_tools"],
+diff --git a/src/providers/scrapfly/actions.ts b/src/providers/scrapfly/actions.ts
+index e4928fc6..1ea3c076 100644
+--- a/src/providers/scrapfly/actions.ts
++++ b/src/providers/scrapfly/actions.ts
+@@ -24,7 +24,7 @@ const responseMetadataSchema = s.object("Metadata collected from Scrapfly respon
+ 
+ const scrapeAction = defineProviderAction(service, {
+   name: "scrape",
+-  operationType: "read",
++  operationType: "write",
+   description: "Scrape one public URL through Scrapfly and return the documented JSON response envelope.",
+   inputSchema: s.object(
+     "The input payload for scraping a URL with Scrapfly.",
+diff --git a/src/providers/scrapingant/actions.ts b/src/providers/scrapingant/actions.ts
+index 464b3603..281e9406 100644
+--- a/src/providers/scrapingant/actions.ts
++++ b/src/providers/scrapingant/actions.ts
+@@ -139,7 +139,7 @@ const usageOutputSchema = s.object("The credits usage payload returned by Scrapi
+ export const scrapingantActions: ActionDefinition[] = [
+   defineProviderAction(service, {
+     name: "scrape_with_extended_json_output",
+-    operationType: "read",
++    operationType: "write",
+     description:
+       "Scrape a page through ScrapingAnt's v2 extended endpoint and return HTML, text, cookies, headers, XHRs, and iframes.",
+     inputSchema: commonRequestInputSchema,
+@@ -147,14 +147,14 @@ export const scrapingantActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "extract_content_as_markdown",
+-    operationType: "read",
++    operationType: "write",
+     description: "Convert a page into Markdown through ScrapingAnt's Markdown transformation endpoint.",
+     inputSchema: commonRequestInputSchema,
+     outputSchema: markdownOutputSchema,
+   }),
+   defineProviderAction(service, {
+     name: "extract_data_with_ai",
+-    operationType: "read",
++    operationType: "write",
+     description: "Extract structured top-level JSON fields from a page through ScrapingAnt's AI extraction endpoint.",
+     inputSchema: aiExtractionInputSchema,
+     outputSchema: s.looseObject("The top-level JSON object returned by ScrapingAnt AI extraction."),
+diff --git a/src/providers/sif/actions.ts b/src/providers/sif/actions.ts
+index efd2fc13..4b3eb900 100644
+--- a/src/providers/sif/actions.ts
++++ b/src/providers/sif/actions.ts
+@@ -260,7 +260,7 @@ export const sifActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "call_tool",
+-    operationType: "read",
++    operationType: "write",
+     description:
+       "Call a current Sif MCP Amazon analysis tool with JSON arguments after discovering its live input schema.",
+     followUpActions: ["sif.list_tools"],
+diff --git a/src/providers/tongdaxin/actions.ts b/src/providers/tongdaxin/actions.ts
+index 15923b61..6f0bd612 100644
+--- a/src/providers/tongdaxin/actions.ts
++++ b/src/providers/tongdaxin/actions.ts
+@@ -59,13 +59,13 @@ export const tongdaxinActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "call_tool",
+-    operationType: "read",
++    operationType: "write",
+     description:
+-      "Call one supported read-only Tongdaxin financial data MCP tool with arguments matching its live input schema.",
++      "Call one supported Tongdaxin financial data MCP tool with arguments matching its live input schema.",
+     requiredScopes: [],
+     followUpActions: ["tongdaxin.list_tools"],
+     inputSchema: s.object(
+-      "Input for invoking one supported read-only Tongdaxin MCP tool.",
++      "Input for invoking one supported Tongdaxin MCP tool.",
+       {
+         toolName: s.nonWhitespaceString("The exact Tongdaxin MCP tool to invoke."),
+         arguments: s.looseObject("JSON arguments matching the live inputSchema returned for the selected tool."),
+diff --git a/src/providers/turbot_pipes/actions.ts b/src/providers/turbot_pipes/actions.ts
+index 83ae55ba..6d046f23 100644
+--- a/src/providers/turbot_pipes/actions.ts
++++ b/src/providers/turbot_pipes/actions.ts
+@@ -15,7 +15,7 @@ const queryMetaSchema = s.looseObject("Turbot Pipes query metadata returned by t
+ export const turbotPipesActions: ActionDefinition[] = [
+   defineProviderAction(service, {
+     name: "execute_query",
+-    operationType: "read",
++    operationType: "write",
+     description: "Execute a SQL query with the Turbot Pipes Query API and return rows plus query metadata.",
+     requiredScopes: [],
+     inputSchema: s.actionInput(
+diff --git a/src/providers/vapi/actions.ts b/src/providers/vapi/actions.ts
+index 6baddf91..e4fcee1c 100644
+--- a/src/providers/vapi/actions.ts
++++ b/src/providers/vapi/actions.ts
+@@ -800,7 +800,7 @@ export const vapiActions: ActionDefinition[] = [
+   ),
+   action(
+     "test_code_tool_execution",
+-    "read",
++    "write",
+     "Execute TypeScript code inside Vapi's code tool sandbox and return the logs, result, and execution outcome.",
+     inputSchema(
+       "The input payload for this action.",
+diff --git a/src/providers/waffo/actions.ts b/src/providers/waffo/actions.ts
+index 552322e8..dd362546 100644
+--- a/src/providers/waffo/actions.ts
++++ b/src/providers/waffo/actions.ts
+@@ -503,9 +503,9 @@ export const waffoActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "run_query",
+-    operationType: "read",
++    operationType: "write",
+     description:
+-      "Run a read-only query against the Waffo GraphQL API for stores, products, orders, payments, refunds, customers, or analytics.",
++      "Run a GraphQL query against the Waffo GraphQL API for stores, products, orders, payments, refunds, customers, or analytics.",
+     inputSchema: s.object(
+       "Parameters for running a Waffo GraphQL query.",
+       {
+diff --git a/src/providers/wandb/actions.ts b/src/providers/wandb/actions.ts
+index 96829aeb..0ec557cb 100644
+--- a/src/providers/wandb/actions.ts
++++ b/src/providers/wandb/actions.ts
+@@ -94,12 +94,12 @@ export const wandbActions: ProviderActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "query_wandb",
+-    operationType: "read",
+-    description: "Run a read-only GraphQL query against W&B experiment data with bounded pagination.",
++    operationType: "write",
++    description: "Run a GraphQL query against W&B experiment data with bounded pagination.",
+     inputSchema: s.object(
+       "Input for querying W&B GraphQL data.",
+       {
+-        query: s.nonWhitespaceString("A read-only W&B GraphQL query."),
++        query: s.nonWhitespaceString("A W&B GraphQL query."),
+         variables: s.looseObject("GraphQL variables."),
+         max_items: s.positiveInteger("Maximum total items returned across pages.", { default: 100 }),
+         items_per_page: s.positiveInteger("Items requested per GraphQL page.", { default: 20 }),
+diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
+index 180b8204..92db7875 100644
+--- a/src/server/cloudflare-read-only-connections.test.ts
++++ b/src/server/cloudflare-read-only-connections.test.ts
+@@ -2,7 +2,7 @@ import type { AssetsBinding, D1DatabaseBinding } from "./cloudflare/cloudflare-b
+ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+ 
+ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+-import { createHmac } from "node:crypto";
++import { createHmac, generateKeyPairSync } from "node:crypto";
+ import { readFileSync } from "node:fs";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import worker from "./cloudflare.ts";
+@@ -63,6 +63,21 @@ beforeEach(() => {
+           },
+         });
+       }
++      if (url.hostname === "api.gildata.com") {
++        // A minimal MCP server over streamable HTTP: enough for credential verification and a tool call.
++        const rpc = (await request.clone().json().catch(() => ({}))) as { id?: number; method?: string };
++        if (rpc.id === undefined) return new Response(null, { status: 202 });
++        const result =
++          rpc.method === "initialize"
++            ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "gildata-stub", version: "1" } }
++            : rpc.method === "tools/list"
++              ? { tools: [{ name: "anything", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] }
++              : { content: [{ type: "text", text: "ok" }] };
++        return Response.json({ jsonrpc: "2.0", id: rpc.id, result });
++      }
++      if (url.hostname === "oauth2.googleapis.com") {
++        return Response.json({ access_token: `google-${token || "t"}`, expires_in: 3600, token_type: "Bearer" });
++      }
+       if (url.hostname.endsWith("amazonaws.com")) return new Response(null, { status: 200 });
+       if (url.hostname.endsWith("feishu.cn")) {
+         return Response.json({ code: 0, tenant_access_token: "t-feishu", expire: 7200, data: {} });
+@@ -1224,6 +1239,70 @@ describe("read-only connections: a presigned URL is not a read (catalog label)",
+   });
+ });
+ 
++describe("read-only connections: pass-through actions are not reads (catalog labels, patch 0020, #134)", () => {
++  // google_bigquery.query runs any GoogleSQL, DML and DDL included, and gildata.call_tool forwards any tool the
++  // caller names, so neither can be a `read`. Both sit on a read-only connection with another, writable one beside it.
++  const bigquery = {
++    actionId: "google_bigquery.query",
++    input: { projectId: "p", query: "DROP TABLE ds.t" },
++  };
++  const gildataCall = {
++    actionId: "gildata.call_tool",
++    input: { serverType: "tool", toolName: "anything", arguments: { q: "x" } },
++  };
++
++  it("refuses google_bigquery.query through MCP on a read-only connection with no provider call", async () => {
++    const site = await boot({ readOnly: "google_bigquery:a", connections: [], bigqueryConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...bigquery, connectionName: "a" });
++
++    expect(result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    expect(String((result.error as { message: string }).message)).toContain('"google_bigquery:a"');
++    expect(String((result.error as { message: string }).message)).toContain("read-only");
++    expect(providerCalls).toEqual([]);
++  });
++
++  it("refuses gildata.call_tool through MCP on a read-only connection with no provider call", async () => {
++    const site = await boot({ readOnly: "gildata:a", connections: [], gildataConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...gildataCall, connectionName: "a" });
++
++    expect(result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    expect(String((result.error as { message: string }).message)).toContain('"gildata:a"');
++    expect(providerCalls).toEqual([]);
++  });
++
++  it("refuses both through the HTTP execute API on a read-only connection with no provider call", async () => {
++    const site = await boot({
++      readOnly: "google_bigquery:a,gildata:a",
++      connections: [],
++      bigqueryConnections: ["a", "b"],
++      gildataConnections: ["a", "b"],
++    });
++    const token = await site.createRuntimeToken(["google_bigquery.*", "gildata.*"]);
++    for (const call of [bigquery, gildataCall]) {
++      const response = await site.httpExecute(token, call.actionId, call.input, { connectionName: "a" });
++      expect(response.status, call.actionId).toBe(400);
++      await expect(response.json(), call.actionId).resolves.toMatchObject({ success: false, errorCode: "action_blocked" });
++    }
++    expect(providerCalls).toEqual([]);
++  });
++
++  // Controls: the read-only rule is per connection, so the same actions are not blocked on the writable one.
++  it("does not refuse gildata.call_tool on a gildata connection that is not read-only, and reaches the provider", async () => {
++    const site = await boot({ readOnly: "gildata:a", connections: [], gildataConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...gildataCall, connectionName: "b" });
++
++    expect((result.error as { code?: string } | undefined)?.code).not.toBe("action_blocked");
++    expect(providerCalls.length).toBeGreaterThan(0);
++  });
++
++  it("does not refuse google_bigquery.query on a bigquery connection that is not read-only", async () => {
++    const site = await boot({ readOnly: "google_bigquery:a", connections: [], bigqueryConnections: ["a", "b"] });
++    const result = await site.mcpExecute({ ...bigquery, connectionName: "b" });
++
++    expect((result.error as { code?: string } | undefined)?.code).not.toBe("action_blocked");
++  });
++});
++
+ // ---------------------------------------------------------------------------------------------------------------------
+ // Harness
+ // ---------------------------------------------------------------------------------------------------------------------
+@@ -1241,6 +1320,10 @@ interface BootOptions {
+   awsConnections?: string[];
+   /** GitHub connection names to create (api_key, secret-<name>). Used by the Trigger tests. */
+   githubConnections?: string[];
++  /** Gildata connection names to create (api_key, secret-<name>). Used by the pass-through label tests. */
++  gildataConnections?: string[];
++  /** Google BigQuery connection names to create (service account JSON naming the connection). Used by the pass-through label tests. */
++  bigqueryConnections?: string[];
+   /** Notion action ids whose `operationType` is removed from the served catalog, to model an unlabelled action. */
+   unlabelled?: string[];
+ }
+@@ -1332,6 +1415,33 @@ async function boot(options: BootOptions): Promise<Site> {
+     });
+     expect(response.status, `connect aws_s3:${name}: ${await response.clone().text()}`).toBe(200);
+   }
++  for (const name of options.gildataConnections ?? []) {
++    const response = await site.admin("/api/connections/gildata", {
++      method: "PUT",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({ authType: "api_key", connectionName: name, values: { apiKey: `secret-${name}` } }),
++    });
++    expect(response.status, `connect gildata:${name}: ${await response.clone().text()}`).toBe(200);
++  }
++  for (const name of options.bigqueryConnections ?? []) {
++    const response = await site.admin("/api/connections/google_bigquery", {
++      method: "PUT",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({
++        authType: "custom_credential",
++        connectionName: name,
++        values: {
++          serviceAccountJson: JSON.stringify({
++            type: "service_account",
++            project_id: "p",
++            client_email: `${name}@p.iam.gserviceaccount.com`,
++            private_key: serviceAccountKey,
++          }),
++        },
++      }),
++    });
++    expect(response.status, `connect google_bigquery:${name}: ${await response.clone().text()}`).toBe(200);
++  }
+   providerCalls = [];
+   return site;
+ }
+@@ -1433,13 +1543,17 @@ function createSite(
+   return site;
+ }
+ 
++const serviceAccountKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
++  .privateKey.export({ type: "pkcs8", format: "pem" })
++  .toString();
++
+ const testSecretCodec = await createWorkerSecretCodec("read-only-test-key");
+ 
+ const runtimeTokens = new WeakMap<Site, Promise<string>>();
+ function runtimeTokenFor(site: Site): Promise<string> {
+   let token = runtimeTokens.get(site);
+   if (!token) {
+-    token = site.createRuntimeToken(["notion.*", "aws_s3.*"]);
++    token = site.createRuntimeToken(["notion.*", "aws_s3.*", "gildata.*", "google_bigquery.*"]);
+     runtimeTokens.set(site, token);
+   }
+   return token;
+@@ -1470,9 +1584,11 @@ function notionCatalog(unlabelled: string[] = []): Record<string, unknown> {
+   const feishu = load("feishu_app_bot");
+   const linear = load("linear");
+   const awsS3 = load("aws_s3");
++  const gildata = load("gildata");
++  const bigquery = load("google_bigquery");
+   return {
+-    "/catalog/index.json": { version: 1, providerCount: 5, chunks: ["apps-0000.json"] },
+-    "/catalog/apps-0000.json": [provider, github, feishu, linear, awsS3],
++    "/catalog/index.json": { version: 1, providerCount: 7, chunks: ["apps-0000.json"] },
++    "/catalog/apps-0000.json": [provider, github, feishu, linear, awsS3, gildata, bigquery],
+   };
+ }
+ 
+-- 
+2.34.1
+
