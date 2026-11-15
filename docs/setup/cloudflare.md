@@ -140,6 +140,13 @@ to cap runaway CPU.
 - `npm run deploy -- --dry-run` builds and bundles with placeholder ids. It needs no login and changes nothing;
   use it to check a change before deploying.
 
+## The registration budget and how to undo it
+
+Deploying patch 0017 adds a Durable Object that budgets client registrations (see
+[guardrails](../guardrails.md#budget-for-anonymous-kv-writes-patch-0017-78)). Its migration is one-way. Before the
+first deploy of 0017, and any time you need to switch the budget off, read the
+[rollback runbook](../runbooks/mcp-oauth-budget-rollback.md). It also has the deploy checklist.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |

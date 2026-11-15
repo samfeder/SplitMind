@@ -123,6 +123,25 @@ function describe(result: { status: number; json: Envelope | undefined; text: st
   return `${result.status}${result.json?.errorCode ? ` ${result.json.errorCode}` : ""}`;
 }
 
+/** POSTs a form with no credential and reads the JSON answer. */
+async function formPost(
+  origin: string,
+  path: string,
+  fields: Record<string, string>,
+): Promise<{ status: number; json: Record<string, unknown> | undefined }> {
+  const response = await fetch(`${origin}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  const text = await response.text();
+  try {
+    return { status: response.status, json: JSON.parse(text) as Record<string, unknown> };
+  } catch {
+    return { status: response.status, json: undefined };
+  }
+}
+
 export async function verify(origin: string, adminToken: string): Promise<Check[]> {
   // The providers the deployment should offer are the ones its template allowlists.
   const template = readFileSync(join(root, "wrangler.template.jsonc"), "utf8");
@@ -161,6 +180,53 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   });
   const refusal = (stranger.json as { error?: string } | undefined)?.error;
   check("a client with a non-Claude redirect URI can't register", stranger.status === 400, `${stranger.status} ${refusal ?? ""}`.trim());
+
+  // The anonymous OAuth probes (#78). None of them can write to the gateway's KV: a client assertion is refused before the
+  // library runs, an unknown client_id is refused before a grant is read, and an authorize GET for an unknown client is
+  // an error page. They carry no credential, and the authorize probe never follows a redirect.
+  const assertion = await formPost(origin, "/oauth/mcp/token", {
+    grant_type: "refresh_token",
+    refresh_token: "splitmind-verify",
+    client_id: "https://splitmind-verify.invalid/client.json",
+    client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+    client_assertion: "splitmind-verify.invalid.assertion",
+  });
+  check(
+    "the token endpoint refuses a client assertion",
+    assertion.status === 401 &&
+      assertion.json?.error === "invalid_client" &&
+      String(assertion.json?.error_description).includes("not supported by this gateway"),
+    `${assertion.status} ${String(assertion.json?.error ?? "")}`.trim(),
+  );
+  const unknownClient = await formPost(origin, "/oauth/mcp/token", {
+    grant_type: "refresh_token",
+    refresh_token: "splitmind-verify",
+    client_id: "splitmind-verify-unknown-client",
+  });
+  check(
+    "the token endpoint reaches the OAuth library for an unknown client",
+    unknownClient.status === 401 &&
+      unknownClient.json?.error === "invalid_client" &&
+      String(unknownClient.json?.error_description).includes("Client not found"),
+    `${unknownClient.status} ${String(unknownClient.json?.error ?? "")}`.trim(),
+  );
+  const authorize = await fetch(
+    `${origin}/oauth/mcp/authorize?${new URLSearchParams({
+      response_type: "code",
+      client_id: "splitmind-verify-unknown-client",
+      redirect_uri: "https://splitmind-verify.invalid/callback",
+      code_challenge: "x".repeat(43),
+      code_challenge_method: "S256",
+      state: "splitmind-verify",
+    })}`,
+    { redirect: "manual" },
+  );
+  await authorize.text();
+  check(
+    "an authorize request for an unknown client is an error page, not a redirect or a consent page",
+    authorize.status >= 400 && authorize.status < 500,
+    `${authorize.status}`,
+  );
 
   const anonymous = await request(origin, "POST", "/mcp", undefined, { jsonrpc: "2.0", id: 1, method: "tools/list" });
   check("POST /mcp without a token is refused", anonymous.status === 401, describe(anonymous));
