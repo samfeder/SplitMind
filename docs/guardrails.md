@@ -91,8 +91,9 @@ use the day's writes up, connected clients could not refresh their tokens. Patch
 
   Registrations the redirect allowlist refuses use no slot. Over the budget, a registration answers
   `400 invalid_client_metadata` with a `Retry-After` of the seconds left until 00:00 UTC, and nothing is written. If
-  the counter cannot answer, the registration is refused. Every refusal logs one warning line that names neither the
-  address nor the client.
+  the counter cannot answer, the registration is refused and an error is logged. An over-budget refusal logs one
+  warning that names the limit that refused (`global` or `per_address`, `global` if both are reached) and neither the
+  address nor the client; a counter failure logs an error; a registration the allowlist refuses logs nothing.
 - **Sign-in writes nothing before the administrator token.** `GET /oauth/mcp/authorize` only shows the consent page.
   The page posts back to the same URL, and the Worker stores the authorization (and writes anything) only after
   checking the administrator token, for Allow and for Deny. An anonymous request therefore never writes, and sign-in

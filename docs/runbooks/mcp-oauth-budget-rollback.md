@@ -30,6 +30,11 @@ and deploy again.
 
 ## Full removal
 
+Warning: reverse-applying 0017 also removes owner-only consent and the client_assertion refusal. That brings back
+anonymous KV writes on `GET /oauth/mcp/authorize` (a consent transaction per request) and on token requests with an
+assertion (a replay marker), and with them the way to use up the day's 1,000 writes. If you only want the budget off,
+use the kill switch.
+
 1. Reverse-apply `patches/0017-mcp-oauth-anonymous-kv-write-budget.patch` in `vendor/open-connector`
    (`git apply -R`), and remove the `durable_objects` block and the two budget vars. Also delete the 0017 patch file, so
    `scripts/bootstrap.sh` no longer applies it.

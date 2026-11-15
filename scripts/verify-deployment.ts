@@ -223,9 +223,9 @@ export async function verify(origin: string, adminToken: string): Promise<Check[
   );
   await authorize.text();
   check(
-    "an authorize request for an unknown client is an error page, not a redirect or a consent page",
-    authorize.status >= 400 && authorize.status < 500,
-    `${authorize.status}`,
+    "an authorize request for an unknown client is a local error page, not a redirect or a consent page",
+    authorize.status === 400 && (authorize.headers.get("content-type") ?? "").toLowerCase().startsWith("text/plain"),
+    `${authorize.status} ${authorize.headers.get("content-type") ?? "no content type"}`,
   );
 
   const anonymous = await request(origin, "POST", "/mcp", undefined, { jsonrpc: "2.0", id: 1, method: "tools/list" });

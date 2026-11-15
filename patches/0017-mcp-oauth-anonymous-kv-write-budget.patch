@@ -2,9 +2,9 @@ SplitMind patch 0017 for OpenConnector v1.9.2.
 Upstream issue: not filed yet. Draft text: docs/upstream/mcp-oauth-issue-drafts.md, Draft 3 (#78).
 Replace this line with the upstream issue or pull request link once it exists.
 
-From a6a9b8b927d992bf55c47426143820075630ca3a Mon Sep 17 00:00:00 2001
+From 077777f662df1bdaae44c2d07c126703eb201136 Mon Sep 17 00:00:00 2001
 From: Sam Feder <noreply@splitmind.invalid>
-Date: Sun, 15 Nov 2026 09:51:04 -0500
+Date: Sun, 15 Nov 2026 10:10:23 -0500
 Subject: [PATCH] feat(mcp-oauth): budget client registration, owner-only
  sign-in
 
@@ -23,8 +23,9 @@ passes: at most OOMOL_CONNECT_MCP_OAUTH_MAX_ANONYMOUS_WRITES_PER_DAY
 CF-Connecting-IP (IPv6 per /64), per UTC day, both checked and taken in
 one call under blockConcurrencyWhile. Over the budget, registration
 answers invalid_client_metadata with Retry-After set to the seconds until
-00:00 UTC, with no KV write, and logs one console.warn that names neither
-the address nor the client. If the budget errors, or the per-request
+00:00 UTC, with no KV write, and logs one console.warn object that names the
+limit that refused (global or per_address, global if both) but neither the
+address nor the client. If the budget errors, or the per-request
 scope is missing, the registration is refused. Without the binding there
 is no registration cap.
 
@@ -34,11 +35,13 @@ and has no handle. The form posts back to the same URL. The POST
 re-validates the request from its own URL, checks the administrator token
 for Allow and for Deny, then calls completeAuthorization (Allow) or
 redirects with authorizationErrorRedirect (Deny). The authorize path
-never touches the budget.
+never touches the budget. A GET error that carries a redirect target is
+redirected to only when the allowlist accepts that URI; otherwise it is a
+local error.
 
 Token endpoint: a request with client_assertion or client_assertion_type
-gets 401 invalid_client (read from a clone, one console.warn with no
-client_id), and a urlencoded body over 64 KiB gets 400. Both run with or
+gets 401 invalid_client (read from a clone, one console.warn object with
+no client_id), and a urlencoded body over 64 KiB gets 400. Both run with or
 without the binding. The wrapper's own responses carry the library's CORS
 headers.
 ---
@@ -47,14 +50,16 @@ headers.
  src/server/cloudflare/cloudflare-env.ts       |   12 +-
  .../cloudflare/mcp-consent-page.test.ts       |   57 +-
  src/server/cloudflare/mcp-consent-page.ts     |    6 +-
- .../mcp-oauth-anonymous-write-budget.ts       |   73 +
- .../mcp-oauth-registration-counter.test.ts    |  262 +++
+ .../mcp-oauth-anonymous-write-budget.ts       |   76 +
+ .../cloudflare/mcp-oauth-grant-flow.test.ts   |  279 ++++
+ .../mcp-oauth-registration-counter.test.ts    |  344 ++++
  .../cloudflare/mcp-oauth-request-env.test.ts  |   95 ++
- src/server/cloudflare/mcp-oauth.test.ts       | 1432 ++++++++++++++++-
- src/server/cloudflare/mcp-oauth.ts            |  273 +++-
+ src/server/cloudflare/mcp-oauth.test.ts       | 1486 ++++++++++++++++-
+ src/server/cloudflare/mcp-oauth.ts            |  293 +++-
  .../cloudflare/test-registration-counter.ts   |  198 +++
- 11 files changed, 2354 insertions(+), 63 deletions(-)
+ 12 files changed, 2791 insertions(+), 64 deletions(-)
  create mode 100644 src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
+ create mode 100644 src/server/cloudflare/mcp-oauth-grant-flow.test.ts
  create mode 100644 src/server/cloudflare/mcp-oauth-registration-counter.test.ts
  create mode 100644 src/server/cloudflare/mcp-oauth-request-env.test.ts
  create mode 100644 src/server/cloudflare/test-registration-counter.ts
@@ -224,13 +229,12 @@ index f02df7287..4d15fb094 100644
  <p><button name="decision" value="approve">Allow access</button><button name="decision" value="deny" formnovalidate>Deny</button></p></form></main></body></html>`;
 diff --git a/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
 new file mode 100644
-index 000000000..b8fcaced3
+index 000000000..4fb9c6d6b
 --- /dev/null
 +++ b/src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,76 @@
 +/**
-+ * Durable Object that budgets the unauthenticated MCP OAuth requests that write to OAUTH_KV (client registrations and
-+ * authorize requests), so they cannot use up the Workers Free plan's daily KV write allowance. One instance
++ * Durable Object that budgets the unauthenticated MCP OAuth client registrations, which write to OAUTH_KV, so they cannot use up the Workers Free plan's daily KV write allowance. One instance
 + * ("global") holds one global count and one count per client address for the current UTC day only. Each call checks
 + * both limits and takes a slot in one step.
 + *
@@ -257,6 +261,8 @@ index 000000000..b8fcaced3
 +
 +const countsKey = "counts";
 +
++export type BudgetLimit = "global" | "per_address";
++
 +export class McpOAuthAnonymousWriteBudget {
 +  private readonly state: BudgetState;
 +  private readonly now: () => number;
@@ -269,21 +275,23 @@ index 000000000..b8fcaced3
 +  async fetch(request: Request): Promise<Response> {
 +    const body = await readTakeRequest(request);
 +    if (!body) return Response.json({ ok: false, error: "invalid_request" }, { status: 400 });
-+    const ok = await this.state.blockConcurrencyWhile(() => this.take(body));
-+    return Response.json({ ok });
++    const refusal = await this.state.blockConcurrencyWhile(() => this.take(body));
++    return Response.json(refusal ? { ok: false, limit: refusal } : { ok: true });
 +  }
 +
-+  private async take(body: { ip: string; maxPerDay: number; maxPerIpPerDay: number }): Promise<boolean> {
++  /** Undefined when a slot was taken, else the limit that refused. If both are reached, the global one is named. */
++  private async take(body: { ip: string; maxPerDay: number; maxPerIpPerDay: number }): Promise<BudgetLimit | undefined> {
 +    const day = new Date(this.now()).toISOString().slice(0, 10);
 +    const stored = await this.state.storage.get<DayCounts>(countsKey);
 +    // A different day means the old counts are dropped, so storage never grows with the days run.
 +    const counts: DayCounts = stored?.day === day ? stored : { day, total: 0, perIp: {} };
 +    const ipCount = Object.hasOwn(counts.perIp, body.ip) ? counts.perIp[body.ip]! : 0;
-+    if (counts.total >= body.maxPerDay || ipCount >= body.maxPerIpPerDay) return false;
++    if (counts.total >= body.maxPerDay) return "global";
++    if (ipCount >= body.maxPerIpPerDay) return "per_address";
 +    counts.total += 1;
 +    counts.perIp[body.ip] = ipCount + 1;
 +    await this.state.storage.put({ [countsKey]: counts });
-+    return true;
++    return undefined;
 +  }
 +}
 +
@@ -301,14 +309,299 @@ index 000000000..b8fcaced3
 +  if (typeof ip !== "string" || typeof maxPerDay !== "number" || typeof maxPerIpPerDay !== "number") return undefined;
 +  return { ip, maxPerDay, maxPerIpPerDay };
 +}
+diff --git a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+new file mode 100644
+index 000000000..4a68519a0
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+@@ -0,0 +1,279 @@
++// The consent form's access and accounts choices must reach the backing runtime token through POST approve
++// (SplitMind #78 review follow-up 9). This lives in its own file because the Worker caches the catalog per module
++// instance, and these tests need a catalog with read, write and destructive actions. The actions are made up, filed
++// under the real api_key provider 17track, because the Worker only connects providers it can execute.
++import type { AssetsBinding, KVNamespaceBinding } from "./cloudflare-bindings.ts";
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import worker from "../cloudflare.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++const origin = "https://connect.example.com";
++const adminToken = "grant-flow-admin-token";
++const claudeCallback = "https://claude.ai/api/mcp/auth_callback";
++
++const action = (name: string, operationType: string) => ({
++  id: `17track.${name}`,
++  service: "17track",
++  name,
++  description: name,
++  operationType,
++  requiredScopes: [],
++  providerPermissions: [],
++  inputSchema: {},
++  outputSchema: {},
++});
++
++const catalog: Record<string, unknown> = {
++  "/catalog/index.json": { version: 1, providerCount: 1, chunks: ["apps-0000.json"] },
++  "/catalog/apps-0000.json": [
++    {
++      service: "17track",
++      displayName: "17TRACK",
++      categories: ["Productivity"],
++      authTypes: ["api_key"],
++      auth: [{ type: "api_key", label: "API Key" }],
++      actions: [
++        action("read_thing", "read"),
++        action("write_thing", "write"),
++        action("delete_thing", "destructive"),
++        action("list_things", "read"),
++      ],
++    },
++  ],
++};
++
++const assets: AssetsBinding = {
++  fetch: async (request) => {
++    const pathname = new URL(request.url).pathname;
++    return pathname in catalog ? Response.json(catalog[pathname]) : new Response("not found", { status: 404 });
++  },
++};
++
++function context(): Parameters<typeof worker.fetch>[2] {
++  return { waitUntil() {}, passThroughOnException() {} };
++}
++
++class MemoryKV implements KVNamespaceBinding {
++  private readonly store = new Map<string, string>();
++  async put(key: string, value: unknown): Promise<void> {
++    this.store.set(key, typeof value === "string" ? value : new TextDecoder().decode(value as ArrayBuffer));
++  }
++  // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return text, JSON or bytes by option.
++  async get(key: string, options?: unknown): Promise<any> {
++    const value = this.store.get(key);
++    if (value === undefined) return null;
++    const type = typeof options === "string" ? options : (options as { type?: string } | undefined)?.type;
++    if (type === "json") return JSON.parse(value);
++    if (type === "arrayBuffer") return new TextEncoder().encode(value).buffer;
++    return value;
++  }
++  async delete(key: string): Promise<void> {
++    this.store.delete(key);
++  }
++  async list(options?: { prefix?: string }): Promise<{ keys: { name: string }[]; list_complete: true }> {
++    const prefix = options?.prefix ?? "";
++    return {
++      keys: [...this.store.keys()].filter((key) => key.startsWith(prefix)).map((name) => ({ name })),
++      list_complete: true,
++    };
++  }
++}
++
++const env: CloudflareEnv = {
++  DB: new SqliteD1Database(),
++  TRANSIT_FILES: new MemoryKV(),
++  ASSETS: assets,
++  OAUTH_KV: new MemoryKV(),
++  OOMOL_CONNECT_ORIGIN: origin,
++  OOMOL_CONNECT_ADMIN_TOKEN: adminToken,
++  OOMOL_CONNECT_ENCRYPTION_KEY: "grant-flow-encryption-key",
++};
++
++const admin = { authorization: `Bearer ${adminToken}` };
++
++async function adminJson(path: string, init: RequestInit = {}): Promise<{ status: number; body: any }> {
++  const response = await worker.fetch(
++    new Request(`${origin}${path}`, {
++      ...init,
++      headers: { ...admin, "content-type": "application/json", ...init.headers },
++    }),
++    env,
++    context(),
++  );
++  return { status: response.status, body: await response.json() };
++}
++
++/** 17track checks a new key against its quota endpoint. This answers for it, so no test reaches the network. */
++function stubQuotaEndpoint(): void {
++  vi.stubGlobal("fetch", async () =>
++    Response.json({
++      code: 0,
++      data: {
++        quota_total: 100,
++        quota_used: 1,
++        quota_remain: 99,
++        today_used: 0,
++        max_track_daily: 10,
++        free_email_quota: 0,
++        free_email_quota_used: 0,
++      },
++    }),
++  );
++}
++
++async function connect(name: string): Promise<void> {
++  stubQuotaEndpoint();
++  const response = await adminJson("/api/connections/17track", {
++    method: "PUT",
++    body: JSON.stringify({ authType: "api_key", connectionName: name, values: { apiKey: `key-${name}` } }),
++  });
++  expect([response.status, JSON.stringify(response.body)]).toEqual([200, expect.any(String)]);
++}
++
++async function connectionIds(): Promise<Record<string, string>> {
++  const listed = await adminJson("/v1/connections");
++  expect(listed.status).toBe(200);
++  return Object.fromEntries((listed.body.data as { id: string; alias: string }[]).map((row) => [row.alias, row.id]));
++}
++
++async function registerClient(): Promise<string> {
++  const response = await worker.fetch(
++    new Request(`${origin}/oauth/mcp/register`, {
++      method: "POST",
++      headers: { "content-type": "application/json" },
++      body: JSON.stringify({
++        client_name: "Scope client",
++        redirect_uris: [claudeCallback],
++        grant_types: ["authorization_code", "refresh_token"],
++        response_types: ["code"],
++        token_endpoint_auth_method: "none",
++      }),
++    }),
++    env,
++    context(),
++  );
++  expect(response.status).toBe(201);
++  return (await response.json()).client_id;
++}
++
++function approve(
++  clientId: string,
++  fields: Record<string, string>,
++  token: string | null = adminToken,
++): Promise<Response> {
++  const query = new URLSearchParams({
++    response_type: "code",
++    client_id: clientId,
++    redirect_uri: claudeCallback,
++    scope: "mcp:access offline_access",
++    resource: `${origin}/mcp`,
++    state: "scope-state",
++    code_challenge: "x".repeat(43),
++    code_challenge_method: "S256",
++  });
++  const form = new URLSearchParams({ decision: "approve", ...fields });
++  if (token !== null) form.set("admin_token", token);
++  return worker.fetch(
++    new Request(`${origin}/oauth/mcp/authorize?${query}`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded", origin },
++      body: form,
++    }),
++    env,
++    context(),
++  );
++}
++
++interface TokenRecord {
++  id: string;
++  name: string;
++  allowedActions: string[];
++  allowedConnections: string[];
++}
++
++async function oauthTokens(): Promise<TokenRecord[]> {
++  const listed = await adminJson("/api/runtime-tokens");
++  expect(listed.status).toBe(200);
++  const rows = (Array.isArray(listed.body) ? listed.body : listed.body.data) as TokenRecord[];
++  return rows.filter((row) => row.name.startsWith("MCP OAuth"));
++}
++
++/** The OAuth backing tokens that were not in `before`. */
++async function createdSince(before: Set<string>): Promise<TokenRecord[]> {
++  return (await oauthTokens()).filter((row) => !before.has(row.id));
++}
++
++describe("POST approve turns the consent form's choices into the backing runtime token's scope", () => {
++  it("gives a read-only grant for one named account only the read actions and only that connection", async () => {
++    await connect("work");
++    await connect("home");
++    const ids = await connectionIds();
++    expect(Object.keys(ids).sort()).toEqual(["home", "work"]);
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++
++    const response = await approve(await registerClient(), { access: "read", accounts: "work" });
++
++    expect(response.status).toBe(302);
++    expect(new URL(response.headers.get("location") ?? "").searchParams.get("code")).toBeTruthy();
++    const created = await createdSince(before);
++    expect(created).toHaveLength(1);
++    expect([...created[0]!.allowedActions].sort()).toEqual(["17track.list_things", "17track.read_thing"]);
++    expect(created[0]!.allowedActions).not.toContain("*");
++    expect(created[0]!.allowedConnections).toEqual([ids.work]);
++  });
++
++  it("gives access=all with no accounts every action on every connection", async () => {
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++    expect((await approve(await registerClient(), { access: "all", accounts: "" })).status).toBe(302);
++    const created = await createdSince(before);
++    expect(created).toHaveLength(1);
++    expect(created[0]!.allowedActions).toEqual(["*"]);
++    expect(created[0]!.allowedConnections).toEqual([]);
++  });
++
++  it("treats a form with no access field as read-only", async () => {
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++    expect((await approve(await registerClient(), {})).status).toBe(302);
++    const created = await createdSince(before);
++    expect(created).toHaveLength(1);
++    expect(created[0]!.allowedActions).not.toContain("*");
++    expect(created[0]!.allowedActions).not.toContain("17track.write_thing");
++    expect(created[0]!.allowedActions).not.toContain("17track.delete_thing");
++  });
++
++  it("refuses a nickname that matches no account with a local 400, and creates no token and no code", async () => {
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++    const response = await approve(await registerClient(), { access: "read", accounts: "work, nonesuch" });
++    expect(response.status).toBe(400);
++    expect(response.headers.get("location")).toBeNull();
++    expect(await response.text()).toContain("nonesuch");
++    expect(await createdSince(before)).toEqual([]);
++  });
++
++  it("creates no backing token for a deny, or for an approve without the administrator token", async () => {
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++    const clientId = await registerClient();
++    expect((await approve(clientId, { decision: "deny" })).status).toBe(302);
++    expect((await approve(clientId, { access: "all" }, "wrong")).status).toBe(401);
++    expect((await approve(clientId, { access: "all" }, null)).status).toBe(401);
++    expect(await createdSince(before)).toEqual([]);
++  });
++});
 diff --git a/src/server/cloudflare/mcp-oauth-registration-counter.test.ts b/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
 new file mode 100644
-index 000000000..37b7e040e
+index 000000000..b9522f898
 --- /dev/null
 +++ b/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,344 @@
 +// Unit tests for McpOAuthAnonymousWriteBudget (SplitMind #78). The interface under test is pinned in the header of
-+// ./test-registration-counter.ts: POST {ip, maxPerDay, maxPerIpPerDay} to fetch, get {ok} back.
++// ./test-registration-counter.ts: POST {ip, maxPerDay, maxPerIpPerDay} to fetch, get {ok} back (and {ok: false, limit} when refused).
 +import { describe, expect, it, vi } from "vitest";
 +import { createCounter, FakeClock, FakeDurableStorage, takeRequest } from "./test-registration-counter.ts";
 +
@@ -527,6 +820,88 @@ index 000000000..37b7e040e
 +  });
 +});
 +
++describe("McpOAuthAnonymousWriteBudget: the answer names the limit that refused", () => {
++  function answerer(time = noon) {
++    const { counter, clock, storage } = setup(time);
++    const answer = async (ip: string, maxPerDay: number, maxPerIpPerDay: number) =>
++      (await counter.fetch(takeRequest({ ip, maxPerDay, maxPerIpPerDay }))).json();
++    return { answer, clock, storage };
++  }
++
++  it("answers exactly { ok: true } when a slot is taken", async () => {
++    const { answer } = answerer();
++    expect(await answer("203.0.113.1", 5, 5)).toEqual({ ok: true });
++  });
++
++  it("answers limit: global when only the global limit is reached", async () => {
++    const { answer } = answerer();
++    expect(await answer("203.0.113.1", 2, 50)).toEqual({ ok: true });
++    expect(await answer("203.0.113.2", 2, 50)).toEqual({ ok: true });
++    expect(await answer("203.0.113.3", 2, 50)).toEqual({ ok: false, limit: "global" });
++    expect(await answer("203.0.113.4", 2, 50)).toEqual({ ok: false, limit: "global" });
++  });
++
++  it("answers limit: per_address when only that address has reached its limit", async () => {
++    const { answer } = answerer();
++    expect(await answer("203.0.113.1", 100, 2)).toEqual({ ok: true });
++    expect(await answer("203.0.113.1", 100, 2)).toEqual({ ok: true });
++    expect(await answer("203.0.113.1", 100, 2)).toEqual({ ok: false, limit: "per_address" });
++    // Another address is not refused, so the refusal was about this address.
++    expect(await answer("203.0.113.2", 100, 2)).toEqual({ ok: true });
++  });
++
++  it("names the limit from the limits sent with each call, so raising one moves the refusal to the other", async () => {
++    const { answer } = answerer();
++    expect(await answer("a", 3, 1)).toEqual({ ok: true });
++    expect(await answer("a", 3, 1)).toEqual({ ok: false, limit: "per_address" });
++    // The per-address limit is raised past the count; the address is allowed again.
++    expect(await answer("a", 3, 5)).toEqual({ ok: true });
++    expect(await answer("b", 3, 5)).toEqual({ ok: true });
++    expect(await answer("c", 3, 5)).toEqual({ ok: false, limit: "global" });
++  });
++
++  it("takes no slot for a refusal of either kind", async () => {
++    const { answer } = answerer();
++    expect(await answer("a", 3, 1)).toEqual({ ok: true });
++    for (let i = 0; i < 5; i++) expect(await answer("a", 3, 1)).toEqual({ ok: false, limit: "per_address" });
++    // Two slots are left, whatever the refusals above did.
++    expect(await answer("b", 3, 1)).toEqual({ ok: true });
++    expect(await answer("c", 3, 1)).toEqual({ ok: true });
++    for (let i = 0; i < 5; i++) expect(await answer("d", 3, 1)).toEqual({ ok: false, limit: "global" });
++  });
++
++  it("names per_address for a key of any form, such as the /64 prefix the Worker sends for IPv6", async () => {
++    const { answer } = answerer();
++    expect(await answer("2001:db8:1:1", 100, 1)).toEqual({ ok: true });
++    expect(await answer("2001:db8:1:1", 100, 1)).toEqual({ ok: false, limit: "per_address" });
++  });
++
++  it("starts the new day with ok: true and no refusal", async () => {
++    const { answer, clock } = answerer(lastMs);
++    expect(await answer("a", 1, 1)).toEqual({ ok: true });
++    expect(await answer("a", 1, 1)).toEqual({ ok: false, limit: "global" });
++    clock.time = midnight;
++    expect(await answer("a", 1, 1)).toEqual({ ok: true });
++  });
++
++  it("gives every concurrent refusal its limit, with no serializing namespace", async () => {
++    const { counter } = setup();
++    const answers = (await Promise.all(
++      Array.from({ length: 10 }, () => counter.fetch(takeRequest({ ip: "a", maxPerDay: 100, maxPerIpPerDay: 3 })).then((r) => r.json())),
++    )) as { ok: boolean; limit?: string }[];
++    expect(answers.filter((entry) => entry.ok)).toHaveLength(3);
++    expect(answers.filter((entry) => !entry.ok).every((entry) => entry.limit === "per_address")).toBe(true);
++    expect(answers.filter((entry) => entry.ok).every((entry) => entry.limit === undefined)).toBe(true);
++  });
++
++  it("does not say which limit a malformed request hit", async () => {
++    const { counter } = setup();
++    const response = await counter.fetch(takeRequest({ ip: "a", maxPerDay: "3", maxPerIpPerDay: 3 }));
++    expect(response.status).toBe(400);
++    expect(((await response.json().catch(() => ({}))) as { limit?: unknown }).limit).toBeUndefined();
++  });
++});
++
 +describe("McpOAuthAnonymousWriteBudget: persistence", () => {
 +  it("continues the same counts in a new instance over the same storage", async () => {
 +    const storage = new FakeDurableStorage();
@@ -537,7 +912,7 @@ index 000000000..37b7e040e
 +    expect(await call(first, "a")).toEqual({ ok: true });
 +    expect(await call(first, "b")).toEqual({ ok: true });
 +    const restarted = createCounter(storage, clock);
-+    expect(await call(restarted, "c")).toEqual({ ok: false });
++    expect(await call(restarted, "c")).toEqual({ ok: false, limit: "global" });
 +  });
 +
 +  it("starts the new day clean when an instance restarts after midnight", async () => {
@@ -671,7 +1046,7 @@ index 000000000..8892dcac8
 +  });
 +});
 diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
-index 517110e79..6f0ae426b 100644
+index 517110e79..1999f993c 100644
 --- a/src/server/cloudflare/mcp-oauth.test.ts
 +++ b/src/server/cloudflare/mcp-oauth.test.ts
 @@ -1,17 +1,53 @@
@@ -744,7 +1119,7 @@ index 517110e79..6f0ae426b 100644
      const html = await page.text();
      expect(html).toContain('<input type="radio" name="access" value="read" checked>');
      expect(html).not.toContain('value="all" checked');
-@@ -104,6 +144,1285 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+@@ -104,6 +144,1339 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
    });
  });
  
@@ -1100,9 +1475,8 @@ index 517110e79..6f0ae426b 100644
 +      expect(gatewayWarnings(warn)).toEqual([]);
 +      await expectLimited(await from("203.0.113.77"));
 +      const own = gatewayWarnings(warn);
-+      expect(own).toHaveLength(1);
++      expect(own).toEqual([[{ event: "mcp_oauth_registration_refused", limit: "global" }]]);
 +      const text = serialized(own);
-+      expect(text).toContain("regist");
 +      expect(text).not.toContain("203.0.113");
 +      expect(text).not.toContain("test client");
 +      warn.mockRestore();
@@ -1115,11 +1489,20 @@ index 517110e79..6f0ae426b 100644
 +      expect((await from("2001:db8:abcd:12::1")).status).toBe(201);
 +      await expectLimited(await from("2001:db8:abcd:12::2"));
 +      const own = gatewayWarnings(warn);
-+      expect(own).toHaveLength(1);
++      expect(own).toEqual([[{ event: "mcp_oauth_registration_refused", limit: "per_address" }]]);
 +      const text = serialized(own);
-+      expect(text).toContain("regist");
 +      for (const fragment of ["2001", "db8", "abcd", "0012"]) expect(text).not.toContain(fragment);
 +      warn.mockRestore();
++    });
++
++    it("names the limit the counter says it hit, not one the Worker guesses", async () => {
++      for (const limit of ["global", "per_address"]) {
++        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++        const env = cappedEnv({}, createStubNamespace(() => Response.json({ ok: false, limit })));
++        await expectLimited(await registerResponse(env, [claudeCallback]));
++        expect(gatewayWarnings(warn)).toEqual([[{ event: "mcp_oauth_registration_refused", limit }]]);
++        warn.mockRestore();
++      }
 +    });
 +
 +    it("logs nothing for a registration that is accepted or that the redirect allowlist rejects", async () => {
@@ -1231,7 +1614,7 @@ index 517110e79..6f0ae426b 100644
 +      });
 +      await expectAssertionRefused(response);
 +      const own = gatewayWarnings(warn);
-+      expect(own).toHaveLength(1);
++      expect(own).toEqual([[{ event: "mcp_oauth_client_assertion_refused" }]]);
 +      const text = serialized(own);
 +      expect(text).toContain("assertion");
 +      expect(text).not.toContain("client-id-7f3a");
@@ -1687,6 +2070,52 @@ index 517110e79..6f0ae426b 100644
 +    });
 +  });
 +
++  describe("a GET error that carries a redirect target (review follow-up 6)", () => {
++    const attackerCallback = "https://attacker.example/steal";
++    const errorKinds: [string, Record<string, string | null>][] = [
++      ["a missing code_challenge", { code_challenge: null, code_challenge_method: null }],
++      ["an unsupported response_type", { response_type: "token" }],
++    ];
++
++    describe.each(errorKinds)("%s", (_kind, overrides) => {
++      it("renders a local 400 with no Location and no KV write for a CIMD client whose redirect_uri is not allowlisted", async () => {
++        stubCimd({ [cimdClientId]: { ...cimdDocument(cimdClientId), redirect_uris: [attackerCallback] } });
++        const { env, kv } = spiedEnv();
++        kv.reset();
++        const response = await getAuthorize(env, queryFor(cimdClientId, attackerCallback, overrides));
++        expectLocalError(response, 400);
++        expectNoKvWrites(kv);
++        expect(await allKeys(kv)).toEqual([]);
++      });
++
++      it("renders a local 400 for a registered client the allowlist now excludes", async () => {
++        const kvShared = new SpyKV();
++        const db = new SqliteD1Database();
++        const open = createEnv({}, kvShared, db);
++        const clientId = await register(open, [attackerCallback]);
++        const restricted = createEnv({ OOMOL_CONNECT_MCP_OAUTH_ALLOWED_REDIRECT_URIS: claudeCallback }, kvShared, db);
++        kvShared.reset();
++        const response = await getAuthorize(restricted, queryFor(clientId, attackerCallback, overrides));
++        expectLocalError(response, 400);
++        expectNoKvWrites(kvShared);
++      });
++
++      it("still redirects the error to an allowlisted redirect_uri, with the client's state", async () => {
++        stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
++        const { env, kv } = spiedEnv();
++        kv.reset();
++        const response = await getAuthorize(env, queryFor(cimdClientId, claudeCallback, overrides));
++        expect(response.status).toBe(302);
++        const location = new URL(response.headers.get("location") ?? "");
++        expect(`${location.origin}${location.pathname}`).toBe(claudeCallback);
++        expect(location.searchParams.get("error")).toBeTruthy();
++        expect(location.searchParams.get("state")).toBe("test-state");
++        expect(location.searchParams.get("code")).toBeNull();
++        expectNoKvWrites(kv);
++      });
++    });
++  });
++
 +  describe("the sign-in path never calls the budget (flipped from the authorize gate)", () => {
 +    it("does not touch the counter for a GET, an approve or a deny, even with the budget exhausted", async () => {
 +      stubCimd({ [cimdClientId]: cimdDocument(cimdClientId) });
@@ -2030,7 +2459,7 @@ index 517110e79..6f0ae426b 100644
  async function authorizeAndExchange(
    env: CloudflareEnv,
    redirectUri: string,
-@@ -128,19 +1447,16 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
+@@ -128,19 +1501,16 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
    const clientId = await register(env, [redirectUri]);
    const verifier = randomBytes(48).toString("base64url");
    const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -2056,7 +2485,7 @@ index 517110e79..6f0ae426b 100644
        }),
        env,
        context(),
-@@ -148,6 +1464,53 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
+@@ -148,6 +1518,53 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
    return { clientId, verifier, consent };
  }
  
@@ -2110,7 +2539,7 @@ index 517110e79..6f0ae426b 100644
  function authorizeUrl(clientId: string, redirectUri: string, challenge: string): string {
    return `${origin}/oauth/mcp/authorize?${new URLSearchParams({
      response_type: "code",
-@@ -167,11 +1530,15 @@ async function register(env: CloudflareEnv, redirectUris: string[]): Promise<str
+@@ -167,11 +1584,15 @@ async function register(env: CloudflareEnv, redirectUris: string[]): Promise<str
    return (await response.json()).client_id;
  }
  
@@ -2128,7 +2557,7 @@ index 517110e79..6f0ae426b 100644
        body: JSON.stringify({
          client_name: "Test client",
          redirect_uris: redirectUris,
-@@ -185,6 +1552,19 @@ function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<R
+@@ -185,6 +1606,19 @@ function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<R
    );
  }
  
@@ -2148,7 +2577,7 @@ index 517110e79..6f0ae426b 100644
  function post(env: CloudflareEnv, path: string, form: Record<string, string>): Promise<Response> {
    return worker.fetch(
      new Request(`${origin}${path}`, {
-@@ -248,3 +1628,25 @@ class MemoryKV implements KVNamespaceBinding {
+@@ -248,3 +1682,25 @@ class MemoryKV implements KVNamespaceBinding {
      };
    }
  }
@@ -2175,10 +2604,13 @@ index 517110e79..6f0ae426b 100644
 +  }
 +}
 diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
-index ca245397e..5350e178c 100644
+index ca245397e..dc574c393 100644
 --- a/src/server/cloudflare/mcp-oauth.ts
 +++ b/src/server/cloudflare/mcp-oauth.ts
-@@ -3,15 +3,18 @@ import type { OAuthProviderOptions, OAuthResourceAuth } from "@cloudflare/worker
+@@ -1,17 +1,21 @@
+ import type { CloudflareEnv } from "./cloudflare-env.ts";
++import type { BudgetLimit } from "./mcp-oauth-anonymous-write-budget.ts";
+ import type { OAuthProviderOptions, OAuthResourceAuth } from "@cloudflare/workers-oauth-provider";
  
  import OAuthProvider, {
    AuthorizationError,
@@ -2197,7 +2629,7 @@ index ca245397e..5350e178c 100644
  import { renderMcpConsentPage } from "./mcp-consent-page.ts";
  import { McpGrantScopeError, readMcpGrantRequest, resolveMcpGrantScope } from "./mcp-grant-scope.ts";
  
-@@ -96,10 +99,13 @@ export function createMcpOAuthHandler(
+@@ -96,10 +100,13 @@ export function createMcpOAuthHandler(
          return runtime(new Request(request, { headers }), env);
        },
      },
@@ -2210,11 +2642,11 @@ index ca245397e..5350e178c 100644
 +        return { description: "This gateway does not accept clients with these redirect URIs." };
 +      }
 +      // After the allowlist, so requests it rejects never use up the budget.
-+      if ((await takeFromRequestScope(request)) !== "taken") return { description: registrationLimitMessage };
++      if ((await takeFromRequestScope(request)).state !== "taken") return { description: registrationLimitMessage };
      },
      async resolveExternalToken({ token, env }) {
        if (!(await validRuntimeToken(env, token))) return null;
-@@ -124,22 +130,26 @@ export function createMcpOAuthHandler(
+@@ -124,22 +131,26 @@ export function createMcpOAuthHandler(
              const details = await oauth.describeConsent(auth);
              // Checked before anything redirects, so a disallowed client never receives a callback.
              if (!redirectAllowed(details.redirectUri)) return localError("This client is not allowed.", 403);
@@ -2253,7 +2685,7 @@ index ca245397e..5350e178c 100644
            }
            if (request.method !== "POST") return localError("Method not allowed.", 405);
            if (request.headers.get("origin") !== origin) return localError("Invalid request origin.", 403);
-@@ -153,16 +163,22 @@ export function createMcpOAuthHandler(
+@@ -153,16 +164,22 @@ export function createMcpOAuthHandler(
              signal: request.signal,
            });
            const form = new URLSearchParams(new TextDecoder().decode(bytes));
@@ -2283,7 +2715,7 @@ index ca245397e..5350e178c 100644
            let scope;
            try {
              scope = await resolveMcpGrantScope(readMcpGrantRequest(form), origin, env, runtime);
-@@ -170,9 +186,6 @@ export function createMcpOAuthHandler(
+@@ -170,9 +187,6 @@ export function createMcpOAuthHandler(
              if (error instanceof McpGrantScopeError) return localError(`${error.message} Go back and try again.`, 400);
              throw error;
            }
@@ -2293,7 +2725,7 @@ index ca245397e..5350e178c 100644
            const tokens = runtimeTokens(env);
            const backing = await tokens.createToken(`MCP OAuth • ${client.clientName.slice(0, 120)}`, {
              allowedActions: scope.allowedActions,
-@@ -183,14 +196,16 @@ export function createMcpOAuthHandler(
+@@ -183,20 +197,29 @@ export function createMcpOAuthHandler(
            });
            try {
              const authorization = await oauth.completeAuthorization({
@@ -2314,7 +2746,21 @@ index ca245397e..5350e178c 100644
            } catch (error) {
              await tokens.revokeToken(backing.record.id);
              throw error;
-@@ -220,11 +235,209 @@ export function createMcpOAuthHandler(
+           }
+         } catch (error) {
+-          if (request.method === "GET" && error instanceof AuthorizationError && error.redirectTo) {
++          // The library redirects a malformed request's error to the client's redirect URI. Only do so when the
++          // allowlist accepts that URI, so a disallowed client never receives a callback, as on the success path.
++          if (
++            request.method === "GET" &&
++            error instanceof AuthorizationError &&
++            error.redirectTo &&
++            redirectAllowed(withoutErrorParameters(error.redirectTo))
++          ) {
+             return Response.redirect(error.redirectTo, 302);
+           }
+           if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
+@@ -220,11 +243,219 @@ export function createMcpOAuthHandler(
          url.pathname = "/.well-known/oauth-protected-resource/mcp";
          request = new Request(url, request);
        }
@@ -2346,21 +2792,21 @@ index ca245397e..5350e178c 100644
 +
 +const requestScope = new AsyncLocalStorage<RequestScope>();
 +
-+/** "taken": go ahead (or there is no budget). "refused": a limit is reached. "unavailable": the budget could not answer. */
-+type TakeResult = "taken" | "refused" | "unavailable";
++/** "taken": go ahead (or there is no budget). "refused": the named limit is reached. "unavailable": no answer. */
++type TakeResult = { state: "taken" } | { state: "refused"; limit: BudgetLimit } | { state: "unavailable" };
 +
 +/** Take a slot using the scope the handler's fetch wrapper set for this request. Without one, fail closed. */
 +async function takeFromRequestScope(request: Request | undefined): Promise<TakeResult> {
 +  const scope = requestScope.getStore();
 +  if (!scope) {
 +    console.error("MCP OAuth registration budget ran outside a request scope; rejecting.");
-+    return "unavailable";
++    return { state: "unavailable" };
 +  }
 +  const result = await takeRegistrationSlot(scope.env, request);
-+  if (result === "refused") {
++  if (result.state === "refused") {
 +    scope.budgetRefused = true;
-+    // No address and no client_id: the log says a limit was hit, not who hit it.
-+    console.warn("MCP OAuth client registration refused: the daily registration budget is used up.");
++    // No address and no client_id: the log says which limit was hit, not who hit it.
++    console.warn({ event: "mcp_oauth_registration_refused", limit: result.limit });
 +  }
 +  return result;
 +}
@@ -2371,7 +2817,7 @@ index ca245397e..5350e178c 100644
 + */
 +async function takeRegistrationSlot(env: CloudflareEnv, request: Request | undefined): Promise<TakeResult> {
 +  const namespace = env.MCP_OAUTH_ANONYMOUS_WRITES;
-+  if (!namespace) return "taken";
++  if (!namespace) return { state: "taken" };
 +  try {
 +    const response = await namespace.get(namespace.idFromName("global")).fetch(
 +      new Request("https://anonymous-writes.invalid/take", {
@@ -2391,12 +2837,22 @@ index ca245397e..5350e178c 100644
 +      }),
 +    );
 +    if (!response.ok) throw new Error(`registration budget answered ${response.status}`);
-+    const body = (await response.json()) as { ok?: unknown };
-+    return body.ok === true ? "taken" : "refused";
++    const body = (await response.json()) as { ok?: unknown; limit?: unknown };
++    if (body.ok === true) return { state: "taken" };
++    // A refusal that names no known limit is treated as a failure, so the log never names one the counter did not.
++    if (body.limit === "global" || body.limit === "per_address") return { state: "refused", limit: body.limit };
++    throw new Error("registration budget refused without naming a limit");
 +  } catch (error) {
 +    console.error("MCP OAuth registration budget failed; rejecting the request.", error);
-+    return "unavailable";
++    return { state: "unavailable" };
 +  }
++}
++
++/** The redirect URI an error redirect was built from: the library adds only these parameters to it. */
++function withoutErrorParameters(redirectTo: string): string {
++  const url = new URL(redirectTo);
++  for (const name of ["error", "error_description", "error_uri", "state", "iss"]) url.searchParams.delete(name);
++  return url.href;
 +}
 +
 +/** Whole seconds until the next 00:00 UTC, rounded up, and at least 1. */
@@ -2484,7 +2940,7 @@ index ca245397e..5350e178c 100644
 +  }
 +  if (!form.has("client_assertion") && !form.has("client_assertion_type")) return undefined;
 +  // No client_id and no assertion in the log: only that one was refused.
-+  console.warn("MCP OAuth token request refused: client assertions are not supported by this gateway.");
++  console.warn({ event: "mcp_oauth_client_assertion_refused" });
 +  return withCorsHeaders(
 +    Response.json(
 +      { error: "invalid_client", error_description: "Client assertions are not supported by this gateway." },
