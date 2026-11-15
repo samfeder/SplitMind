@@ -99,6 +99,20 @@ describe("findExpiringDates: numeric Date forms (month is 0-based)", () => {
   it("does not flag numeric Date forms that are not full dates, such as new Date(0) or new Date(ms)", () => {
     expect(scan("new Date(0); new Date(1700000000000); new Date(Date.now() + 1000);")).toEqual([]);
   });
+
+  it("does not read a non-literal day as day 1: new Date(2026, 11, d) and Date.UTC(2026, 11, day) give no finding", () => {
+    expect(scan("const a = new Date(2026, 11, d);")).toEqual([]);
+    expect(scan("const b = Date.UTC(2026, 11, day);")).toEqual([]);
+    expect(scan("new Date(2026, 11, day + 1)")).toEqual([]);
+    expect(scan("new Date(2026, 11, offset(3))")).toEqual([]);
+    expect(scan("new Date(2026,11,d,12,0,0)")).toEqual([]);
+  });
+
+  it("still flags a literal-day call that follows a non-literal-day call on the same line", () => {
+    const found = scan("const a = new Date(2026, 11, d), b = new Date(2026, 11, 30);");
+    expect(found).toHaveLength(1);
+    expect(found[0].literal).toContain("2026, 11, 30");
+  });
 });
 
 describe("findExpiringDates: window boundaries", () => {
