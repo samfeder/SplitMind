@@ -11,13 +11,14 @@ Run after every deploy of 0017, and after any change to the budget:
 1. `npm run verify` passes. It probes the gateway's refusal of client assertions, the OAuth library's
    answer for an unknown client, and an authorize request for an unknown client. None of the probes writes to KV.
 2. One tool call on an existing connection: a claude.ai connection that has been idle for over 1 hour (its access
-   token has expired, so the call must refresh), or Claude Code. For example a read-only `execute_action`. It must
+   token has expired, so the call must refresh), or a Claude Code connection idle for as long. For example a read-only `execute_action`. It must
    succeed. This proves token refresh still works. Do this before step 3, because a fresh sign-in revokes the earlier
    claude.ai grant, so afterwards there is no old connection left to test.
 3. One fresh sign-in from claude.ai: remove the connector, add it again, enter the administrator token on the consent
    page and allow. It must reach the connected state.
 
-If step 2 or 3 fails, use the kill switch below first, then investigate.
+If step 2 or 3 fails, the kill switch below will not help: it turns off only the registration budget, which neither a
+refresh nor a sign-in touches. Fix forward, or use full removal below.
 
 ## Kill switch: turn the budget off (reversible)
 
