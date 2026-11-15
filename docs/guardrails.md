@@ -233,8 +233,9 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      `get_action_guide`, the default connection for `search_actions`, `?connectionName=`, `?alias=` or the
      `x-oo-connector-alias` header on the console `agent.md` route), the policy shown for a write, destructive or
      unlabelled action is `Denied:` with the same message. With no connection selected, nothing changes.
-   - **Set it as a Wrangler secret:** `wrangler secret put OOMOL_CONNECT_READ_ONLY_CONNECTIONS --config
-     wrangler.local.jsonc`. Never set it as a dashboard variable: the next deploy deletes it, which silently turns
+   - **Set it as a Wrangler secret,** from the repo root:
+     `(cd vendor/open-connector && npx wrangler secret put OOMOL_CONNECT_READ_ONLY_CONNECTIONS --config wrangler.local.jsonc)`
+     (`npm run deploy` renders that config there). Never set it as a dashboard variable: the next deploy deletes it, which silently turns
      read-only off.
    - **After each deploy,** check that `list_connections` still shows `readOnly: true` on the connections you listed.
    - **After deploying patch 0019,** revoke the runtime tokens whose names start with "MCP OAuth" and reconnect
