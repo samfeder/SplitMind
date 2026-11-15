@@ -29,6 +29,11 @@ every call that is not a read, for every caller:
   message and deployment check as execute_action. Both call the same rule
   (applyReadOnlyToDecision, built on refuseAction). With no connection
   selected, output is unchanged.
+- search_actions applies the rule only when the caller's grant allows the
+  default connection, so it agrees with execute_action's "not granted".
+- The email watch's ConnectionService gets the read-only list too.
+- Entries that can never match (uppercase provider id, "*", a provider not
+  in the catalog) are kept and warned about once each.
 
 list_connections and /v1/apps/services/:service add readOnly: true to
 listed connections and omit the field otherwise. Matching is exact and
@@ -36,25 +41,32 @@ case-sensitive. Malformed entries are ignored with one warning each. Unset
 or empty changes nothing.
 ---
  src/connection-service.ts                     |    6 +
- src/core/read-only-connections.ts             |   91 ++
- src/mcp.ts                                    |   19 +-
+ src/core/read-only-connections.ts             |  109 ++
+ src/mcp-read-only-grant.test.ts               |  208 +++
+ src/mcp.ts                                    |   35 +-
  src/server/actions/action-runner.ts           |   15 +
  src/server/api/console-catalog-routes.ts      |   12 +-
  src/server/api/runtime-api.ts                 |    5 +-
  src/server/api/runtime-app-routes.ts          |    8 +-
- .../cloudflare-read-only-connections.test.ts  | 1411 +++++++++++++++++
+ .../cloudflare-read-only-connections.test.ts  | 1464 +++++++++++++++++
  ...loudflare-read-only-untyped-action.test.ts |  208 +++
- src/server/cloudflare.ts                      |    3 +
+ src/server/cloudflare.ts                      |   14 +-
  src/server/cloudflare/cloudflare-env.ts       |    1 +
  src/server/connect-app.ts                     |    3 +
  src/server/connector-runtime.ts               |    4 +
+ .../watch-runner-read-only.test.ts            |  105 ++
+ src/server/email-watch/watch-runner.ts        |    4 +
  src/server/index.ts                           |    2 +
  src/server/proxy/proxy-runner.ts              |   20 +
+ src/server/read-only-post-resolve.test.ts     |  271 +++
  src/triggers/trigger-runner.ts                |   19 +
- 16 files changed, 1817 insertions(+), 10 deletions(-)
+ 20 files changed, 2499 insertions(+), 14 deletions(-)
  create mode 100644 src/core/read-only-connections.ts
+ create mode 100644 src/mcp-read-only-grant.test.ts
  create mode 100644 src/server/cloudflare-read-only-connections.test.ts
  create mode 100644 src/server/cloudflare-read-only-untyped-action.test.ts
+ create mode 100644 src/server/email-watch/watch-runner-read-only.test.ts
+ create mode 100644 src/server/read-only-post-resolve.test.ts
 
 diff --git a/src/connection-service.ts b/src/connection-service.ts
 index 032d48cd..1ba61a22 100644
@@ -95,10 +107,10 @@ index 032d48cd..1ba61a22 100644
    async listConnections(): Promise<ConnectionSummary[]> {
 diff --git a/src/core/read-only-connections.ts b/src/core/read-only-connections.ts
 new file mode 100644
-index 00000000..a5534860
+index 00000000..5436c8dd
 --- /dev/null
 +++ b/src/core/read-only-connections.ts
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,109 @@
 +import type { ActionPolicyDecision } from "./action-policy.ts";
 +
 +/**
@@ -148,11 +160,14 @@ index 00000000..a5534860
 +
 +/**
 + * Parse the setting. Malformed entries (not exactly one `:`, or an empty side) are ignored and reported through
-+ * `warn` once each; they never throw.
++ * `warn` once each; they never throw. Entries that are well formed but can never match are kept (matching is
++ * exact) and warned about once each: an uppercase letter in the provider id, `*` in either part (there are no
++ * wildcards), or, when `isKnownProvider` is given, a provider that is not in the catalog.
 + */
 +export function parseReadOnlyConnections(
 +  value: string | undefined,
 +  warn: (message: string) => void = (message) => console.warn(message),
++  isKnownProvider?: (providerId: string) => boolean,
 +): ReadOnlyConnections {
 +  const entries = new Set<string>();
 +  for (const entry of (value ?? "").split(/[\s,]+/).filter(Boolean)) {
@@ -163,9 +178,24 @@ index 00000000..a5534860
 +      );
 +      continue;
 +    }
++    const reason = neverMatches(parts[0], parts[1], isKnownProvider);
++    if (reason) {
++      warn(`OOMOL_CONNECT_READ_ONLY_CONNECTIONS entry "${entry}" can never match (${reason}); it is kept but protects nothing.`);
++    }
 +    entries.add(entry);
 +  }
 +  return entries.size === 0 ? noReadOnlyConnections : createReadOnlyConnections(entries);
++}
++
++function neverMatches(
++  providerId: string,
++  connectionName: string,
++  isKnownProvider: ((providerId: string) => boolean) | undefined,
++): string | undefined {
++  if (providerId.includes("*") || connectionName.includes("*")) return "wildcards are not supported";
++  if (providerId !== providerId.toLowerCase()) return "provider ids are lowercase";
++  if (isKnownProvider && !isKnownProvider(providerId)) return "no such provider in the catalog";
++  return undefined;
 +}
 +
 +function createReadOnlyConnections(entries: ReadonlySet<string>): ReadOnlyConnections {
@@ -190,8 +220,222 @@ index 00000000..a5534860
 +    refuseAll: (connection) => (isReadOnly(connection) ? refusal(connection) : undefined),
 +  };
 +}
+diff --git a/src/mcp-read-only-grant.test.ts b/src/mcp-read-only-grant.test.ts
+new file mode 100644
+index 00000000..3be8056f
+--- /dev/null
++++ b/src/mcp-read-only-grant.test.ts
+@@ -0,0 +1,208 @@
++import type { ActionDefinition, ActionExecutor, ProviderDefinition, ResolvedCredential } from "./core/types.ts";
++import type { IProviderLoader } from "./providers/provider-loader.ts";
++
++import { Client } from "@modelcontextprotocol/client";
++import { InMemoryTransport } from "@modelcontextprotocol/client";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { createCatalogStore } from "./catalog-store.ts";
++import { ConnectionService } from "./connection-service.ts";
++import { ActionPolicyService, emptyPolicyRules } from "./core/action-policy.ts";
++import { parseReadOnlyConnections } from "./core/read-only-connections.ts";
++import { createMcpServer } from "./mcp.ts";
++import { ActionRunner } from "./server/actions/action-runner.ts";
++import { SqliteRuntimeDatabase } from "./server/storage/sqlite/runtime-store.ts";
++
++/**
++ * The read-only rule applies only when the caller's grant allows the connection (#31 round 2, item 1).
++ * The deployment marks `example_auth:default` read-only; the caller's MCP OAuth grant or runtime token
++ * (`allowedConnections`) covers only `example_auth:other`. A caller that is not granted the default connection must
++ * get the same "not granted" answer from every MCP tool that `execute_action` gives, and must never be told
++ * "is read-only" about a connection it cannot see.
++ */
++
++const action = (id: string, operationType: ActionDefinition["operationType"]): ActionDefinition => ({
++  id,
++  service: "example_auth",
++  name: id.split(".")[1]!,
++  description: `${id} description.`,
++  operationType,
++  requiredScopes: [],
++  providerPermissions: [],
++  inputSchema: { type: "object" },
++  outputSchema: { type: "object" },
++});
++const WRITE = action("example_auth.save_record", "write");
++const READ = action("example_auth.get_record", "read");
++const provider: ProviderDefinition = {
++  service: "example_auth",
++  displayName: "Authenticated Example",
++  categories: ["Developer Tools"],
++  authTypes: ["api_key"],
++  auth: [{ type: "api_key" }],
++  actions: [READ, WRITE],
++};
++const credential = (name: string): ResolvedCredential => ({
++  authType: "api_key",
++  apiKey: `key-${name}`,
++  values: { apiKey: `key-${name}` },
++  profile: { accountId: `account-${name}`, displayName: `Account ${name}`, grantedScopes: [] },
++  metadata: {},
++});
++
++class OkLoader implements IProviderLoader {
++  async loadActionExecutor(): Promise<ActionExecutor> {
++    return async () => ({ ok: true, output: { done: true } });
++  }
++  async loadProxyExecutor(): Promise<undefined> {
++    return undefined;
++  }
++  async loadCredentialValidators(): Promise<undefined> {
++    return undefined;
++  }
++}
++
++let database: SqliteRuntimeDatabase;
++beforeEach(() => {
++  database = new SqliteRuntimeDatabase(":memory:");
++});
++afterEach(() => database.close());
++
++/** `granted`: which connections the caller's grant covers; undefined means an ungranted-by-default token (all). */
++async function withClient(
++  options: { readOnly: string; granted: "other" | "default" | "all" },
++  run: (client: Client) => Promise<void>,
++): Promise<void> {
++  const catalog = createCatalogStore([provider], { executableActionIds: [READ.id, WRITE.id] });
++  const loader = new OkLoader();
++  const defaultConnection = await database.connectionStore.set("example_auth", "default", credential("default"));
++  const other = await database.connectionStore.set("example_auth", "other", credential("other"));
++  const connections = new ConnectionService({
++    catalog,
++    providerLoader: loader,
++    store: database.connectionStore,
++    readOnlyConnections: parseReadOnlyConnections(options.readOnly),
++  });
++  const grant = {
++    tokenId: "token-1",
++    allowedActions: [],
++    blockedActions: [],
++    allowedProxies: [],
++    allowedConnections:
++      options.granted === "other" ? [other.id] : options.granted === "default" ? [defaultConnection.id] : [],
++  };
++  const policy = new ActionPolicyService().createSnapshot(emptyPolicyRules(), grant);
++  const server = createMcpServer({
++    catalog,
++    connections,
++    actions: new ActionRunner({ catalog, providerLoader: loader, connections, runs: database.runLogStore }),
++    runtimeGrant: grant,
++    getPolicySnapshot: async () => policy,
++  });
++  const client = new Client({ name: "grant-test", version: "0.0.0" });
++  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++  await server.connect(serverTransport);
++  await client.connect(clientTransport);
++  try {
++    await run(client);
++  } finally {
++    await client.close();
++  }
++}
++
++type Payload = Record<string, any>;
++const call = async (client: Client, name: string, args: Record<string, unknown>): Promise<Payload> =>
++  (await client.callTool({ name, arguments: args })).structuredContent as Payload;
++
++async function searchPolicy(client: Client, actionId: string) {
++  const found = await call(client, "search_actions", { service: "example_auth" });
++  expect(found.ok, JSON.stringify(found)).toBe(true);
++  return (found.data as Payload[]).find((entry) => entry.id === actionId)!.capability as Payload;
++}
++
++describe("read-only default connection, caller granted only other connections", () => {
++  const setup = { readOnly: "example_auth:default", granted: "other" as const };
++
++  it("execute_action gives a not-granted refusal, not a read-only one (the reference answer)", async () => {
++    await withClient(setup, async (client) => {
++      const executed = await call(client, "execute_action", { actionId: WRITE.id, input: {} });
++
++      expect(executed).toMatchObject({ ok: false, error: { code: "connection_not_allowed" } });
++      expect(executed.error.message).not.toContain("read-only");
++    });
++  });
++
++  it("search_actions never says the connection is read-only, and never leaks the connection", async () => {
++    await withClient(setup, async (client) => {
++      const executed = await call(client, "execute_action", { actionId: WRITE.id, input: {} });
++      const capability = await searchPolicy(client, WRITE.id);
++
++      expect(JSON.stringify(capability)).not.toContain("read-only");
++      expect(JSON.stringify(capability)).not.toContain("read-only-connection");
++      expect(capability.policy.checks.map((check: Payload) => check.source)).not.toContain("deployment");
++      expect(capability.connection).toBeUndefined();
++      expect(JSON.stringify(capability)).not.toContain("account-default");
++      // If search denies, it denies with execute_action's code and message, not a different reason.
++      if (capability.policy.allowed === false) {
++        expect(capability.policy).toMatchObject({
++          code: executed.error.code,
++          message: executed.error.message,
++        });
++      }
++    });
++  });
++
++  it("search_actions gives the write and the read action the same answer: the read-only rule plays no part", async () => {
++    await withClient(setup, async (client) => {
++      const write = await searchPolicy(client, WRITE.id);
++      const read = await searchPolicy(client, READ.id);
++
++      expect(write.policy).toEqual(read.policy);
++    });
++  });
++
++  it("control: get_action_guide gives the not-granted error for the default and for a named default", async () => {
++    await withClient(setup, async (client) => {
++      const executed = await call(client, "execute_action", { actionId: WRITE.id, input: {} });
++      const omitted = await call(client, "get_action_guide", { actionId: WRITE.id });
++      const named = await call(client, "get_action_guide", { actionId: WRITE.id, connectionName: "default" });
++
++      expect(omitted).toMatchObject({ ok: false, error: { code: "connection_not_allowed" } });
++      expect(omitted.error.message).toBe(executed.error.message);
++      expect(omitted.error.message).not.toContain("read-only");
++      expect(named).toEqual(omitted);
++    });
++  });
++});
++
++describe("read-only default connection, caller granted that connection (the rule still applies)", () => {
++  it.each([["default"], ["all"]] as const)("search_actions reports the write as read-only with grant %s", async (granted) => {
++    await withClient({ readOnly: "example_auth:default", granted }, async (client) => {
++      const executed = await call(client, "execute_action", { actionId: WRITE.id, input: {} });
++      const write = await searchPolicy(client, WRITE.id);
++      const read = await searchPolicy(client, READ.id);
++
++      expect(executed).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++      expect(write.policy).toMatchObject({ allowed: false, code: "action_blocked", message: executed.error.message });
++      expect(write.policy.message).toContain("read-only");
++      expect(read.policy.allowed).toBe(true);
++    });
++  });
++
++  it("get_action_guide reports the write as read-only with the default granted", async () => {
++    await withClient({ readOnly: "example_auth:default", granted: "default" }, async (client) => {
++      const guide = await call(client, "get_action_guide", { actionId: WRITE.id });
++
++      expect(guide.data.capability.policy).toMatchObject({ allowed: false, code: "action_blocked" });
++    });
++  });
++});
++
++describe("default connection is not read-only", () => {
++  it("search_actions is the same for a caller granted only other connections", async () => {
++    await withClient({ readOnly: "example_auth:other", granted: "other" }, async (client) => {
++      const write = await searchPolicy(client, WRITE.id);
++
++      expect(JSON.stringify(write)).not.toContain("read-only");
++    });
++  });
++});
 diff --git a/src/mcp.ts b/src/mcp.ts
-index 2ab21ceb..de346f62 100644
+index 2ab21ceb..9961aead 100644
 --- a/src/mcp.ts
 +++ b/src/mcp.ts
 @@ -2,6 +2,7 @@ import type { CatalogStore, RuntimeActionDefinition } from "./catalog-store.ts";
@@ -222,21 +466,43 @@ index 2ab21ceb..de346f62 100644
      );
    } catch (error) {
      return connectionErrorPayload(error, policy);
-@@ -273,7 +278,12 @@ async function searchActions(
+@@ -272,15 +277,32 @@ async function searchActions(
+     name: action.name,
      description: action.description,
      operationType: action.operationType,
-     capability: summarizeActionCapability(
+-    capability: summarizeActionCapability(
 -      describeActionCapability(action, policy, await getSelectedConnectionSummary(options, action.service, undefined)),
-+      describeActionCapability(
-+        action,
-+        policy,
-+        await getSelectedConnectionSummary(options, action.service, undefined),
-+        options.connections.readOnlyConnections,
-+      ),
-     ),
+-    ),
++    capability: summarizeActionCapability(await describeDefaultCapability(options, action, policy)),
      inputSummary: summarizeInputSchema(action.inputSchema),
    }));
-@@ -303,7 +313,7 @@ async function getActionGuide(
+ 
+   return successPayload(await Promise.all(actions));
+ }
+ 
++/**
++ * Capability of an action on the default connection. The read-only rule applies only when the caller's grant allows
++ * that connection, so the answer matches `execute_action`, which refuses an ungranted connection first.
++ */
++async function describeDefaultCapability(
++  options: IMcpServerOptions,
++  action: RuntimeActionDefinition,
++  policy: ActionPolicySnapshot,
++): Promise<ActionCapability> {
++  const connection = await getSelectedConnectionSummary(options, action.service, undefined);
++  const granted = evaluateConnectionGrant(policy, connection).allowed;
++  return describeActionCapability(
++    action,
++    policy,
++    connection,
++    granted ? options.connections.readOnlyConnections : undefined,
++  );
++}
++
+ async function getActionGuide(
+   options: IMcpServerOptions,
+   actionId: string,
+@@ -303,7 +325,7 @@ async function getActionGuide(
      if (!connectionDecision.allowed) {
        return errorPayload(connectionDecision.code, connectionDecision.message);
      }
@@ -245,7 +511,7 @@ index 2ab21ceb..de346f62 100644
      return successPayload({
        capability,
        markdown: renderActionMarkdown(action, {
-@@ -401,6 +411,7 @@ function describeActionCapability(
+@@ -401,6 +423,7 @@ function describeActionCapability(
    action: RuntimeActionDefinition,
    policy: ActionPolicySnapshot,
    connection: ConnectionSummary | undefined,
@@ -253,7 +519,7 @@ index 2ab21ceb..de346f62 100644
  ): ActionCapability {
    return {
      operationType: action.operationType,
-@@ -408,7 +419,7 @@ function describeActionCapability(
+@@ -408,7 +431,7 @@ function describeActionCapability(
      authTypes: action.execution.requiredAuthTypes,
      requiredScopes: action.requiredScopes,
      providerPermissions: action.providerPermissions,
@@ -389,10 +655,10 @@ index 05d1d658..3a23f64e 100644
      } catch (error) {
 diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
 new file mode 100644
-index 00000000..31950724
+index 00000000..9341a6d9
 --- /dev/null
 +++ b/src/server/cloudflare-read-only-connections.test.ts
-@@ -0,0 +1,1411 @@
+@@ -0,0 +1,1464 @@
 +import type { AssetsBinding, D1DatabaseBinding } from "./cloudflare/cloudflare-bindings.ts";
 +import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
 +
@@ -714,6 +980,59 @@ index 00000000..31950724
 +
 +    const tightened = site.withReadOnly("notion:a");
 +    expect((await tightened.mcpExecute({ ...NOTION_WRITE, connectionName: "a" })).ok).toBe(false);
++  });
++});
++
++describe("read-only connections: configuration warnings for entries that can never match (#31 round 2)", () => {
++  // The entry text is the operator's own configuration, so a warning may name it. Valid entries stay silent.
++  const warningsMentioning = (warn: { mock: { calls: unknown[][] } }, entry: string) =>
++    warn.mock.calls.filter((call) => JSON.stringify(call).includes(entry));
++
++  it.each([
++    ["an uppercase letter in the provider id", "Notion:upperprovider"],
++    ["a wildcard in the provider part", "*:wildproviderconn"],
++    ["a wildcard in the connection part", "notion:wild*"],
++    ["a provider that is not in the catalog", "nosuchprovider:orphanconn"],
++  ])("warns exactly once, naming the entry, for %s", async (_label, entry) => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    const site = await boot({ readOnly: `${entry} notion:a` });
++
++    // Several requests are served by the same cached app: the warning is a startup one, not per request.
++    expect((await site.admin("/api/connections")).status).toBe(200);
++    expect((await site.admin("/api/connections")).status).toBe(200);
++    expect((await site.mcpExecute({ ...NOTION_WRITE, connectionName: "a" })).ok).toBe(false);
++
++    expect(warningsMentioning(warn, entry), `warnings for ${entry}`).toHaveLength(1);
++  });
++
++  it("warns once per bad entry when several are bad, and nothing for the valid entries", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    const bad = ["Github:badcase", "*:anyconn", "linear:star*", "ghostprovider:ghostconn"];
++    const site = await boot({ readOnly: [...bad, "notion:validname", "github:validwork", "aws_s3:validbucket"].join(",") });
++    expect((await site.admin("/api/connections")).status).toBe(200);
++
++    for (const entry of bad) expect(warningsMentioning(warn, entry), entry).toHaveLength(1);
++    for (const entry of ["notion:validname", "github:validwork", "aws_s3:validbucket"]) {
++      expect(warningsMentioning(warn, entry), entry).toEqual([]);
++    }
++  });
++
++  it("a valid entry for a provider in the catalog logs nothing at all about the setting", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    const site = await boot({ readOnly: "notion:a, github:work" });
++    expect((await site.admin("/api/connections")).status).toBe(200);
++
++    expect(warn.mock.calls.filter((call) => JSON.stringify(call).includes("READ_ONLY"))).toEqual([]);
++    expect(warningsMentioning(warn, "notion:a")).toEqual([]);
++    expect(warningsMentioning(warn, "github:work")).toEqual([]);
++  });
++
++  it("still enforces the valid entries next to bad ones", async () => {
++    vi.spyOn(console, "warn").mockImplementation(() => {});
++    const site = await boot({ readOnly: "Notion:upperprovider, notion:*, nosuchprovider:x, notion:a" });
++
++    expect((await site.mcpExecute({ ...NOTION_WRITE, connectionName: "a" })).ok).toBe(false);
++    expect((await site.mcpExecute({ ...NOTION_WRITE, connectionName: "b" })).ok).toBe(true);
 +  });
 +});
 +
@@ -2019,7 +2338,7 @@ index 00000000..56b43115
 +  };
 +}
 diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
-index a3d37c9f..881d0aed 100644
+index a3d37c9f..3824e07f 100644
 --- a/src/server/cloudflare.ts
 +++ b/src/server/cloudflare.ts
 @@ -9,6 +9,7 @@ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
@@ -2030,15 +2349,42 @@ index a3d37c9f..881d0aed 100644
  import {
    parseEgressTrustedHosts,
    parsePrivateNetworkAccessFlag,
-@@ -273,6 +274,7 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
+@@ -191,8 +192,12 @@ async function createWatchRunner(
+   const assets = env.ASSETS;
+   if (!assets) throw new Error("Cloudflare ASSETS binding is required to load the catalog");
+   const database = await createRuntimeDatabase(env);
++  const catalog = await loadCatalogOnce(assets);
+   const runner = createWatchActionRunner({
+-    catalog: await loadCatalogOnce(assets),
++    catalog,
++    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS, undefined, (id) =>
++      catalog.providers.some((provider) => provider.service === id),
++    ),
+     providerLoader: new ProviderLoader({ gmail: executorModules.gmail! }),
+     runtimeDatabase: database,
+     publicOrigin,
+@@ -231,8 +236,9 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
+   const secretCodec = await createSecretCodec(env.OOMOL_CONNECT_ENCRYPTION_KEY);
+   const runtimeDatabase = await createRuntimeDatabase(env);
+   const watching = parseEmailWatchConfig(env).connections.length > 0;
++  const catalog = await loadCatalogOnce(assets);
+   return await createConnectApp({
+-    catalog: await loadCatalogOnce(assets),
++    catalog,
+     providerLoader: new ProviderLoader({
+       ...executorModules,
+       // The mail_watch executors need the watch's own table, which ExecutionContext does not carry.
+@@ -273,6 +279,9 @@ async function createCloudflareApp(env: CloudflareEnv, publicOrigin: string): Pr
      requireRuntimeAuth: Boolean(env.OAUTH_KV),
      actionPolicy: createActionPolicy(env),
      allowedCustomOAuth: parseActionPolicyList(env.OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH),
-+    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS),
++    readOnlyConnections: parseReadOnlyConnections(env.OOMOL_CONNECT_READ_ONLY_CONNECTIONS, undefined, (id) =>
++      catalog.providers.some((provider) => provider.service === id),
++    ),
      logger: workerLogger,
      computeRuntimeAuthConfigured: false,
      // Cloudflare compresses on egress itself: Response defaults to
-@@ -338,6 +340,7 @@ function createCacheKey(env: CloudflareEnv, publicOrigin: string): string {
+@@ -338,6 +347,7 @@ function createCacheKey(env: CloudflareEnv, publicOrigin: string): string {
      blockedTriggers: env.OOMOL_CONNECT_BLOCKED_TRIGGERS ?? "",
      blockedProxies: env.OOMOL_CONNECT_BLOCKED_PROXIES ?? "",
      allowedCustomOAuth: env.OOMOL_CONNECT_ALLOWED_CUSTOM_OAUTH ?? "",
@@ -2114,6 +2460,144 @@ index 2203151b..84f29a24 100644
        logger: options.logger,
        serveDocumentation: options.apiReference ?? false,
        oauthCloseDelaySeconds,
+diff --git a/src/server/email-watch/watch-runner-read-only.test.ts b/src/server/email-watch/watch-runner-read-only.test.ts
+new file mode 100644
+index 00000000..5b83d3d8
+--- /dev/null
++++ b/src/server/email-watch/watch-runner-read-only.test.ts
+@@ -0,0 +1,105 @@
++import type { AssetsBinding } from "../cloudflare/cloudflare-bindings.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { ActionPolicyService } from "../../core/action-policy.ts";
++import { parseReadOnlyConnections } from "../../core/read-only-connections.ts";
++import { ProviderLoader } from "../../providers/provider-loader.ts";
++import { executorModules } from "../../providers/registry.cloudflare.generated.ts";
++import { provider as gmail } from "../../providers/gmail/definition.ts";
++import { loadCatalogFromAssets } from "../cloudflare/catalog-assets.ts";
++import { createWorkerSecretCodec } from "../secrets/worker-secret-codec.ts";
++import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++import { FakeMailbox, fakeGmailFetch } from "./test-support.ts";
++import { createWatchActionRunner } from "./watch-runner.ts";
++
++/**
++ * The watcher's own ConnectionService (createWatchActionRunner) must honour OOMOL_CONNECT_READ_ONLY_CONNECTIONS
++ * like every other path (#31 round 2, item 2). Chosen level: behaviour. The runner is built the way the Worker's
++ * cron builds it, over a real D1-shaped SQLite database, the real Gmail executors and a fake Gmail REST API behind
++ * `fetch`; the read-only list is passed as the `readOnlyConnections` option, the same object every other runner
++ * receives. (The watch itself only issues reads, so the refusal of a non-read action is observed by calling the
++ * runner it returns, which is exactly the seam the cron hands to the watcher.)
++ */
++
++const catalog = {
++  "/catalog/index.json": { version: 1, providerCount: 1, chunks: ["apps-0000.json"] },
++  "/catalog/apps-0000.json": [JSON.parse(JSON.stringify(gmail))],
++};
++const assets: AssetsBinding = {
++  async fetch(request) {
++    const pathname = new URL(request.url).pathname;
++    return pathname in catalog
++      ? Response.json(catalog[pathname as keyof typeof catalog])
++      : new Response("not found", { status: 404 });
++  },
++};
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++});
++
++async function build(readOnly: string | undefined) {
++  const database = new SqliteD1Database();
++  const runtime = new D1RuntimeDatabase(database, { secretCodec: await createWorkerSecretCodec("watch-ro-key") });
++  const mailboxes = { work: new FakeMailbox({ prefix: "w0" }), other: new FakeMailbox({ prefix: "w1" }) };
++  for (const [name, mailbox] of Object.entries(mailboxes)) {
++    await runtime.connectionStore.set("gmail", name, {
++      authType: "oauth2",
++      accessToken: `token-${name}`,
++      tokenType: "Bearer",
++      metadata: {},
++      profile: { accountId: mailbox.email, displayName: mailbox.email, grantedScopes: [] },
++    });
++  }
++  vi.stubGlobal("fetch", vi.fn(fakeGmailFetch(mailboxes)));
++  const runner = createWatchActionRunner({
++    catalog: await loadCatalogFromAssets(assets, { executableServices: Object.keys(executorModules) }),
++    providerLoader: new ProviderLoader({ gmail: executorModules.gmail! }),
++    runtimeDatabase: runtime,
++    publicOrigin: "https://watch-ro.example.com",
++    logger: { info() {}, warn() {}, error() {}, debug() {} } as never,
++    ...(readOnly === undefined ? {} : { readOnlyConnections: parseReadOnlyConnections(readOnly) }),
++  } as Parameters<typeof createWatchActionRunner>[0]);
++  const policy = new ActionPolicyService({}).createSnapshot();
++  const run = (actionId: string, input: unknown, connectionName: string) =>
++    runner.run({ actionId, input, connectionName, caller: "cron", audit: "failures", policy });
++  return { run, mailboxes };
++}
++
++describe("email watch runner with a read-only gmail connection", () => {
++  it("still reads Gmail through a read-only connection", async () => {
++    const { run, mailboxes } = await build("gmail:work");
++    const result = await run("gmail.get_profile", {}, "work");
++
++    expect(result?.result.ok, JSON.stringify(result?.result)).toBe(true);
++    expect(mailboxes.work.requests.length).toBeGreaterThan(0);
++  });
++
++  it.each([
++    ["write", "gmail.send_email", { recipientEmail: "a@example.com", subject: "s", body: "b" }],
++    ["destructive", "gmail.move_to_trash", { messageId: "m1" }],
++  ])("refuses a %s action on the read-only connection, with no Gmail request", async (_label, actionId, input) => {
++    const { run, mailboxes } = await build("gmail:work");
++    const result = await run(actionId, input, "work");
++
++    expect(result?.result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    expect((result?.result.error as { message: string }).message).toContain('"gmail:work"');
++    expect(mailboxes.work.requests).toEqual([]);
++  });
++
++  it("does not refuse the same non-read action on a gmail connection that is not read-only", async () => {
++    const { run } = await build("gmail:work");
++    const result = await run("gmail.move_to_trash", { messageId: "m1" }, "other");
++
++    expect(result?.result.error?.code).not.toBe("action_blocked");
++  });
++
++  it("refuses nothing when no read-only list is configured", async () => {
++    const { run } = await build(undefined);
++    const result = await run("gmail.move_to_trash", { messageId: "m1" }, "work");
++
++    expect(result?.result.error?.code).not.toBe("action_blocked");
++  });
++});
+diff --git a/src/server/email-watch/watch-runner.ts b/src/server/email-watch/watch-runner.ts
+index a7dee6b1..7998960c 100644
+--- a/src/server/email-watch/watch-runner.ts
++++ b/src/server/email-watch/watch-runner.ts
+@@ -1,4 +1,5 @@
+ import type { CatalogStore } from "../../catalog-store.ts";
++import type { ReadOnlyConnections } from "../../core/read-only-connections.ts";
+ import type { RuntimeLogger } from "../../core/types.ts";
+ import type { IProviderLoader } from "../../providers/provider-loader.ts";
+ import type { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
+@@ -15,6 +16,8 @@ export interface WatchRunnerOptions {
+   runtimeDatabase: D1RuntimeDatabase;
+   publicOrigin: string;
+   logger: RuntimeLogger;
++  /** The same read-only list the main Worker gets, so the watch honours it too. */
++  readOnlyConnections?: ReadOnlyConnections;
+ }
+ 
+ /**
+@@ -34,6 +37,7 @@ export function createWatchActionRunner(options: WatchRunnerOptions): ActionRunn
+     providerLoader: options.providerLoader,
+     store: options.runtimeDatabase.connectionStore,
+     logger: options.logger,
++    readOnlyConnections: options.readOnlyConnections,
+   });
+   return new ActionRunner({
+     catalog: options.catalog,
 diff --git a/src/server/index.ts b/src/server/index.ts
 index 1b483ff6..786e7089 100644
 --- a/src/server/index.ts
@@ -2172,6 +2656,283 @@ index 7b55fdb2..cf358fd1 100644
        this.options.logger?.info(logContext, "proxy request started");
        if (target.kind === "saas") {
          executionId = crypto.randomUUID();
+diff --git a/src/server/read-only-post-resolve.test.ts b/src/server/read-only-post-resolve.test.ts
+new file mode 100644
+index 00000000..219440f3
+--- /dev/null
++++ b/src/server/read-only-post-resolve.test.ts
+@@ -0,0 +1,271 @@
++import type { IConnectionStore } from "../connection-service.ts";
++import type {
++  ActionDefinition,
++  ActionExecutor,
++  ProviderDefinition,
++  ProviderProxyExecutor,
++  ResolvedCredential,
++} from "../core/types.ts";
++import type { IProviderLoader } from "../providers/provider-loader.ts";
++
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { createCatalogStore } from "../catalog-store.ts";
++import { ConnectionService } from "../connection-service.ts";
++import { ActionPolicyService } from "../core/action-policy.ts";
++import { parseReadOnlyConnections } from "../core/read-only-connections.ts";
++import { provider as github } from "../providers/github/definition.ts";
++import { ProviderLoader } from "../providers/provider-loader.ts";
++import { TriggerRunner } from "../triggers/trigger-runner.ts";
++import { ActionRunner } from "./actions/action-runner.ts";
++import { ProxyRunner } from "./proxy/proxy-runner.ts";
++import { RuntimeTokenService } from "./storage/runtime-token-service.ts";
++import { SqliteRuntimeDatabase } from "./storage/sqlite/runtime-store.ts";
++
++/**
++ * Post-resolve (TOCTOU) read-only checks. Each runner asks the connection service twice: a first lookup
++ * (`getConnectionSummary`) for the early checks, then `resolveForExecution` for the connection it will use. The
++ * operator's read-only list must be applied to the connection resolved for execution too, because the two lookups
++ * can disagree (a rename, a reconnect or a swap between them).
++ *
++ * The seam is the connection store under a real ConnectionService: the store answers the first `get` with a
++ * writable connection ("w") and every later `get` with the read-only one ("a", listed as read-only). The runners
++ * are real; nothing else is stubbed except the provider's own call, which is counted. Removing only the
++ * post-resolve check lets the provider call happen, which is what these tests observe.
++ */
++
++const READ_ONLY = parseReadOnlyConnections("example:a, github:a");
++const openPolicy = new ActionPolicyService().createSnapshot();
++
++const writeAction: ActionDefinition = {
++  id: "example.write_thing",
++  service: "example",
++  name: "write_thing",
++  description: "Writes a thing.",
++  operationType: "write",
++  requiredScopes: [],
++  providerPermissions: [],
++  inputSchema: { type: "object" },
++  outputSchema: { type: "object" },
++};
++const example: ProviderDefinition = {
++  service: "example",
++  displayName: "Example",
++  categories: ["Developer Tools"],
++  authTypes: ["api_key"],
++  auth: [{ type: "api_key" }],
++  actions: [writeAction],
++};
++
++function apiKey(key: string): ResolvedCredential {
++  return {
++    authType: "api_key",
++    apiKey: key,
++    values: { apiKey: key },
++    profile: { accountId: `acct-${key}`, displayName: key, grantedScopes: [] },
++    metadata: { providerAccountVerified: true },
++  };
++}
++
++let database: SqliteRuntimeDatabase;
++afterEach(() => {
++  database.close();
++  vi.restoreAllMocks();
++});
++beforeEach(() => {
++  database = new SqliteRuntimeDatabase(":memory:");
++});
++
++/** The first `get` returns connection "w"; every later `get` returns connection "a" (the read-only one). */
++async function swappingStore(service: string): Promise<{ store: IConnectionStore; gets: () => number }> {
++  const inner = database.connectionStore;
++  await inner.set(service, "w", apiKey("w"));
++  await inner.set(service, "a", apiKey("a"));
++  let gets = 0;
++  const store: IConnectionStore = {
++    get: async (svc, name) => {
++      gets += 1;
++      return inner.get(svc, gets === 1 ? "w" : "a");
++    },
++    getRetirementGeneration: inner.getRetirementGeneration.bind(inner),
++    setIfCurrentGeneration: inner.setIfCurrentGeneration.bind(inner),
++    set: inner.set.bind(inner),
++    updateCredential: inner.updateCredential.bind(inner),
++    delete: inner.delete.bind(inner),
++    list: inner.list.bind(inner),
++  };
++  return { store, gets: () => gets };
++}
++
++describe("read-only check on the connection resolved for execution", () => {
++  it("ActionRunner refuses a write when the resolved connection is read-only, and never calls the provider", async () => {
++    const providerCalls = vi.fn();
++    const executor: ActionExecutor = async () => {
++      providerCalls();
++      return { ok: true, output: {} };
++    };
++    const loader: IProviderLoader = {
++      loadActionExecutor: async () => executor,
++      loadProxyExecutor: async () => undefined,
++      loadCredentialValidators: async () => undefined,
++    };
++    const catalog = createCatalogStore([example], { executableActionIds: [writeAction.id] });
++    const { store, gets } = await swappingStore("example");
++    const runner = new ActionRunner({
++      catalog,
++      providerLoader: loader,
++      connections: new ConnectionService({
++        catalog,
++        providerLoader: loader,
++        store,
++        readOnlyConnections: READ_ONLY,
++      }),
++      runs: database.runLogStore,
++    });
++
++    const run = await runner.run({
++      actionId: writeAction.id,
++      input: {},
++      caller: "http",
++      connectionName: "w",
++      policy: openPolicy,
++    });
++
++    expect(gets()).toBeGreaterThanOrEqual(2);
++    expect(run?.result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
++    expect((run?.result.error as { message: string }).message).toContain('"example:a"');
++    expect(providerCalls).not.toHaveBeenCalled();
++  });
++
++  it("ProxyRunner refuses a request when the resolved connection is read-only, and never calls the provider", async () => {
++    const providerCalls = vi.fn();
++    const proxy: ProviderProxyExecutor = async () => {
++      providerCalls();
++      return { ok: true, response: { status: 200, headers: {}, data: {} } };
++    };
++    const loader: IProviderLoader = {
++      loadActionExecutor: async () => undefined,
++      loadProxyExecutor: async () => proxy,
++      loadCredentialValidators: async () => undefined,
++    };
++    const catalog = createCatalogStore([example]);
++    const { store, gets } = await swappingStore("example");
++    const runner = new ProxyRunner({
++      catalog,
++      providerLoader: loader,
++      connections: new ConnectionService({
++        catalog,
++        providerLoader: loader,
++        store,
++        readOnlyConnections: READ_ONLY,
++      }),
++    });
++
++    const result = await runner.run({
++      service: "example",
++      input: { endpoint: "/things", method: "GET", connectionName: "w" },
++      connectionName: "w",
++      policy: openPolicy,
++    });
++
++    expect(gets()).toBeGreaterThanOrEqual(2);
++    expect(result).toMatchObject({ ok: false, status: 403, errorCode: "action_blocked" });
++    expect((result as { message: string }).message).toContain('"example:a"');
++    expect(providerCalls).not.toHaveBeenCalled();
++  });
++
++  it("TriggerRunner refuses a webhook write when the resolved connection is read-only, and never calls the provider", async () => {
++    const providerCalls = vi.fn();
++    const loader = new ProviderLoader({
++      github: async () => {
++        const native = await import("../providers/github/executors.ts");
++        const proxy: ProviderProxyExecutor = async () => {
++          providerCalls();
++          return { ok: true, response: { status: 200, headers: {}, data: {} } };
++        };
++        return { ...native, proxy };
++      },
++    });
++    const catalog = createCatalogStore([github]);
++    const { store, gets } = await swappingStore("github");
++    const created = await new RuntimeTokenService(database.runtimeTokenStore).createToken("Flow", {
++      allowedActions: [],
++      blockedActions: ["*"],
++      allowedProxies: [],
++      allowedTriggers: ["github.on_repo_event"],
++    });
++    const runner = new TriggerRunner({
++      catalog,
++      providerLoader: loader,
++      connections: new ConnectionService({
++        catalog,
++        providerLoader: loader,
++        store,
++        readOnlyConnections: READ_ONLY,
++      }),
++      store: database.triggerStore,
++    });
++
++    await expect(
++      runner.run({
++        service: "github",
++        triggerId: "github.on_repo_event",
++        connectionName: "w",
++        policy: openPolicy,
++        grant: {
++          tokenId: created.record.id,
++          allowedActions: [],
++          blockedActions: [],
++          allowedProxies: [],
++          allowedTriggers: ["github.on_repo_event"],
++        },
++        request: {
++          operation: "reconcile",
++          config: { owner: "octocat", repo: "repository", events: ["issues"] },
++          endpointUrl: "https://flow.example/events/hook",
++          active: true,
++          requestKey: "toctou",
++        },
++        signal: new AbortController().signal,
++      }),
++    ).rejects.toMatchObject({ code: "action_blocked", status: 403 });
++    expect(gets()).toBeGreaterThanOrEqual(2);
++    expect(providerCalls).not.toHaveBeenCalled();
++  });
++
++  it("control: the same runners let a write through when neither lookup is read-only", async () => {
++    const providerCalls = vi.fn();
++    const executor: ActionExecutor = async () => {
++      providerCalls();
++      return { ok: true, output: {} };
++    };
++    const loader: IProviderLoader = {
++      loadActionExecutor: async () => executor,
++      loadProxyExecutor: async () => undefined,
++      loadCredentialValidators: async () => undefined,
++    };
++    const catalog = createCatalogStore([example], { executableActionIds: [writeAction.id] });
++    await database.connectionStore.set("example", "w", apiKey("w"));
++    const runner = new ActionRunner({
++      catalog,
++      providerLoader: loader,
++      connections: new ConnectionService({
++        catalog,
++        providerLoader: loader,
++        store: database.connectionStore,
++        readOnlyConnections: READ_ONLY,
++      }),
++      runs: database.runLogStore,
++    });
++
++    const run = await runner.run({
++      actionId: writeAction.id,
++      input: {},
++      caller: "http",
++      connectionName: "w",
++      policy: openPolicy,
++    });
++
++    expect(run?.result).toMatchObject({ ok: true });
++    expect(providerCalls).toHaveBeenCalledTimes(1);
++  });
++});
 diff --git a/src/triggers/trigger-runner.ts b/src/triggers/trigger-runner.ts
 index 6beee0d9..1ce487fb 100644
 --- a/src/triggers/trigger-runner.ts

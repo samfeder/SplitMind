@@ -68,7 +68,7 @@ around:
 >
 > - `destructive`: `aws_s3.generate_presigned_url` and `aliyun_oss.generate_presigned_url` (both can sign a DELETE).
 > - `write`: `cloudflare_r2.generate_presigned_url`, `tailscale.rotate_webhook_secret`, `pinata.pin_by_cid`,
->   `keygen.ping_machine`, `keygen.ping_process`, `mailgun.verify_domain`, `vercel.verify_project_domain`,
+>   `keygen.ping_machine`, `keygen.ping_process`, `linear.run_query` (it takes arbitrary GraphQL text, so a read-only label cannot be trusted), `mailgun.verify_domain`, `vercel.verify_project_domain`,
 >   `msg91.verify_otp`, `myotp_app.verify_otp`.
 > - `write`, failing closed because the effect is uncertain: `fusion-api.file_upload_generate_presigned_url` and
 >   `..._urls`, `harpa_ai.run_ai_prompt` (open-ended browser actions), and `fuxin.create_pdf_from_document`,

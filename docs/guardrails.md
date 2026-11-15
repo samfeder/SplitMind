@@ -233,9 +233,19 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      `get_action_guide`, the default connection for `search_actions`, `?connectionName=`, `?alias=` or the
      `x-oo-connector-alias` header on the console `agent.md` route), the policy shown for a write, destructive or
      unlabelled action is `Denied:` with the same message. With no connection selected, nothing changes.
-   - **After deploying patch 0019,** revoke the "MCP OAuth" runtime tokens and reconnect claude.ai and Claude Code.
-     Existing read-only grants keep the action ids from consent time (#95), so they do not pick up the relabelled
-     actions. Do this in the same step as the re-issue the 0017 deploy already asks for (#130).
+   - **Set it as a Wrangler secret:** `wrangler secret put OOMOL_CONNECT_READ_ONLY_CONNECTIONS --config
+     wrangler.local.jsonc`. Never set it as a dashboard variable: the next deploy deletes it, which silently turns
+     read-only off.
+   - **After each deploy,** check that `list_connections` still shows `readOnly: true` on the connections you listed.
+   - **After deploying patch 0019,** revoke the runtime tokens whose names start with "MCP OAuth" and reconnect
+     claude.ai and Claude Code. Existing read-only grants keep the action ids from consent time (#95), so they do
+     not pick up the relabelled actions. Do this in the same step as the re-issue the 0017 deploy already asks for
+     (#130). If 0017 was already deployed and its grants re-issued, reconnect again after 0019.
+   - **Startup warnings:** an entry that can never match (an uppercase letter in the provider id, `*` in either
+     part, or a provider that is not in the catalog) is kept but logged once, naming the entry. Malformed entries
+     are ignored with a warning. Nothing throws. Valid entries log nothing.
+   - **Not covered yet:** the `call_tool` and `execute_tool` pass-throughs are not audited for this rule; #134
+     tracks it.
    - **What it trusts:** the catalog's `operationType` labels. Patch 0019 corrects the known mislabels (presigned
      URL generators, one-time verifications and similar actions that were labelled `read` but write), so keep it
      with 0018. An action nobody has audited can still carry a wrong label.

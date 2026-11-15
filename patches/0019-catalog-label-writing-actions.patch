@@ -28,15 +28,19 @@ The last few are uncertain, so they fail closed.
 Billed but non-mutating actions (LLM completions, embeddings, screenshots)
 stay read. Adds a catalog test for every label and Worker tests that a
 read-only aws_s3 connection refuses a presigned URL.
+
+linear.run_query is relabelled write too: it takes arbitrary GraphQL text, which
+the read-only rule cannot vet.
 ---
  src/providers/aliyun_oss/actions.ts           |  2 +-
  src/providers/aws_s3/actions.ts               |  2 +-
- src/providers/catalog-write-labels.test.ts    | 72 +++++++++++++++++++
+ src/providers/catalog-write-labels.test.ts    | 75 +++++++++++++++++++
  src/providers/cloudflare_r2/actions.ts        |  2 +-
  src/providers/fusion-api/operations.ts        |  4 +-
- src/providers/fuxin/actions.ts                |  8 +--
+ src/providers/fuxin/actions.ts                |  8 +-
  src/providers/harpa_ai/actions.ts             |  2 +-
  src/providers/keygen/actions.ts               |  4 +-
+ src/providers/linear/actions.ts               |  2 +-
  src/providers/mailgun/actions.ts              |  2 +-
  src/providers/msg91/actions.ts                |  2 +-
  src/providers/myotp_app/actions.ts            |  2 +-
@@ -44,7 +48,7 @@ read-only aws_s3 connection refuses a presigned URL.
  src/providers/tailscale/operations.ts         |  2 +-
  src/providers/vercel/actions.ts               |  2 +-
  .../cloudflare-read-only-connections.test.ts  | 34 +++++++++
- 15 files changed, 124 insertions(+), 18 deletions(-)
+ 16 files changed, 128 insertions(+), 19 deletions(-)
  create mode 100644 src/providers/catalog-write-labels.test.ts
 
 diff --git a/src/providers/aliyun_oss/actions.ts b/src/providers/aliyun_oss/actions.ts
@@ -75,10 +79,10 @@ index 40417ec3..54e5fb07 100644
        "The input payload for this action.",
 diff --git a/src/providers/catalog-write-labels.test.ts b/src/providers/catalog-write-labels.test.ts
 new file mode 100644
-index 00000000..3707fa36
+index 00000000..29ee56b1
 --- /dev/null
 +++ b/src/providers/catalog-write-labels.test.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +import type { ProviderDefinition } from "../core/types.ts";
 +
 +import { describe, expect, it } from "vitest";
@@ -89,7 +93,7 @@ index 00000000..3707fa36
 + * files behind in the account, so a read-only connection would have let them through. Labels are read from the
 + * provider definitions, the same objects the catalog is generated from.
 + *
-+ * Each expected value is a literal from the revision-2 review list, not derived from the code under test.
++ * Each expected value is a literal from the revision-2 review list and the round-2 review (linear.run_query), not derived from the code under test.
 + */
 +
 +const definitions: Record<string, () => Promise<{ provider: ProviderDefinition }>> = {
@@ -106,6 +110,7 @@ index 00000000..3707fa36
 +  "fusion-api": () => import("./fusion-api/definition.ts"),
 +  harpa_ai: () => import("./harpa_ai/definition.ts"),
 +  fuxin: () => import("./fuxin/definition.ts"),
++  linear: () => import("./linear/definition.ts"),
 +};
 +
 +const expected: [actionId: string, operationType: "write" | "destructive"][] = [
@@ -130,6 +135,8 @@ index 00000000..3707fa36
 +  ["fuxin.create_pdf_from_html", "write"],
 +  ["fuxin.merge_documents", "write"],
 +  ["fuxin.remove_password_from_document", "write"],
++  // Sends any GraphQL document the caller supplies, mutations included, so it cannot be a read.
++  ["linear.run_query", "write"],
 +];
 +
 +async function labelOf(actionId: string): Promise<string | undefined> {
@@ -260,6 +267,19 @@ index d54f9821..66ed07ed 100644
      description: "Ping a Keygen process heartbeat.",
      requiredScopes: [],
      inputSchema: idInputSchema("process"),
+diff --git a/src/providers/linear/actions.ts b/src/providers/linear/actions.ts
+index 84053cb3..8a384412 100644
+--- a/src/providers/linear/actions.ts
++++ b/src/providers/linear/actions.ts
+@@ -380,7 +380,7 @@ const actions: LinearActionSource[] = [
+   ),
+   action(
+     "run_query",
+-    "read",
++    "write",
+     "Execute a read-only query directly against the Linear GraphQL API.",
+     [linearReadScope],
+     input({ query: s.string({ minLength: 1 }), variables: objectSchema }, ["query"]),
 diff --git a/src/providers/mailgun/actions.ts b/src/providers/mailgun/actions.ts
 index 2fd2951d..a047c830 100644
 --- a/src/providers/mailgun/actions.ts
@@ -339,10 +359,10 @@ index 8d5d260b..798d3f7e 100644
      inputSchema: input({ idOrName: projectIdOrName, domain: s.nonEmptyString("Domain name.") }, ["idOrName", "domain"]),
      outputSchema: s.object({ domain }, { required: ["domain"] }),
 diff --git a/src/server/cloudflare-read-only-connections.test.ts b/src/server/cloudflare-read-only-connections.test.ts
-index 31950724..55380515 100644
+index 9341a6d9..180b8204 100644
 --- a/src/server/cloudflare-read-only-connections.test.ts
 +++ b/src/server/cloudflare-read-only-connections.test.ts
-@@ -1137,6 +1137,40 @@ describe("read-only connections: guidance agrees with enforcement (#94)", () =>
+@@ -1190,6 +1190,40 @@ describe("read-only connections: guidance agrees with enforcement (#94)", () =>
    });
  });
  
