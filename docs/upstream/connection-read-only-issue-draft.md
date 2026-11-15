@@ -75,3 +75,18 @@ around:
 >   `create_pdf_from_html`, `merge_documents`, `remove_password_from_document` (may leave files in the account).
 >
 > Billed but non-mutating actions (LLM completions, embeddings, screenshots) are correctly `read`.
+>
+> A later audit (#134, SplitMind patch 0020) found more `read` labels that forward caller-chosen tools, SQL,
+> GraphQL, code or HTTP methods, or that mutate:
+>
+> - `destructive`: `google_bigquery.query` (raw GoogleSQL runs DML and DDL, including DROP TABLE) and
+>   `okta.lifecycle_user` (deactivates or suspends users).
+> - `write`: `gildata.call_tool`, `pkulaw.call_tool`, `investoday_mcp.call_tool`, `finchina.execute_tool`,
+>   `sif.call_tool`, `tongdaxin.call_tool`, `fireflies.execute_graphql_query` (its lexical mutation guard can be
+>   bypassed with a block-string escape, which is worth fixing upstream), `waffo.run_query`, `wandb.query_wandb`,
+>   `turbot_pipes.execute_query`, `vapi.test_code_tool_execution`, `scrapfly.scrape`,
+>   `scrapingant.scrape_with_extended_json_output`, `scrapingant.extract_content_as_markdown` and
+>   `scrapingant.extract_data_with_ai` (the caller picks any HTTP method and body).
+>
+> An executor-level gate (an allowlist plus `readOnlyHint === true`, as baizhi, sellerspace and tongdaxin do for
+> some tools) could let some of these honestly return to `read` later.

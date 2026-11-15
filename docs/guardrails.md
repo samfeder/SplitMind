@@ -242,6 +242,11 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      claude.ai and Claude Code. Existing read-only grants keep the action ids from consent time (#95), so they do
      not pick up the relabelled actions. Do this in the same step as the re-issue the 0017 deploy already asks for
      (#130). If 0017 was already deployed and its grants re-issued, reconnect again after 0019.
+   - **Patch 0020 (#134)** relabels 17 more pass-through and mutating actions (raw SQL and GraphQL runners, MCP
+     `call_tool` forwarders, scrapers that take any HTTP method) as `write` or `destructive`, so read-only
+     connections and read-only grants lose them. Existing read-only grants keep their consent-time action ids
+     (#95), so reconnect again after 0020, or in the same step as 0019 if they deploy together. An executor-level
+     gate that could return some of them to `read` is tracked in #137.
    - **Startup warnings:** an entry that can never match (an uppercase letter in the provider id, `*` in either
      part, or a provider that is not in the catalog) is kept but logged once, naming the entry. Malformed entries
      are ignored with a warning. Nothing throws. Valid entries log nothing.
