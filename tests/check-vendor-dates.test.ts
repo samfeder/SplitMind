@@ -113,6 +113,69 @@ describe("findExpiringDates: numeric Date forms (month is 0-based)", () => {
     expect(found).toHaveLength(1);
     expect(found[0].literal).toContain("2026, 11, 30");
   });
+
+  // #124: the two-argument form may end in a trailing comma and in /* ... */ block comments before the closing paren.
+  // Both are still day 1 of the month; a third argument that is not a literal is still not read as day 1.
+  describe("two-argument forms with a trailing comma or a block comment (#124)", () => {
+    it.each([
+      "new Date(2026, 11,)",
+      "Date.UTC(2026, 11 ,)",
+      "new Date(2026, 11 /* Dec */)",
+      "new Date(2026, 11, )",
+      "new Date(2026,11,)",
+      "new Date(2026, 11, /* day 1 */)",
+      "new Date(2026, 11 /* Dec */,)",
+      "new Date(2026, 11 /* a */ /* b */)",
+      "Date.UTC(2027, 0 /* Jan */,)",
+    ])("flags %s as day 1 of the month, naming the whole call", (call) => {
+      expect(scan(`const d = ${call};`)).toEqual([{ path: "src/a.test.ts", line: 1, literal: call }]);
+    });
+
+    it("flags the call on its own line of a multi-line file, with that line number", () => {
+      const text = ["const a = 1;", "const b = [", "  new Date(2026, 11,),", "];"].join("\n");
+      expect(scan(text)).toEqual([{ path: "src/a.test.ts", line: 3, literal: "new Date(2026, 11,)" }]);
+    });
+
+    it("flags a trailing-comma call that follows a non-literal-day call on the same line", () => {
+      const found = scan("const a = new Date(2026, 11, d), b = new Date(2026, 11,);");
+      expect(found).toHaveLength(1);
+      expect(found[0].literal).toBe("new Date(2026, 11,)");
+    });
+
+    it("keeps the window: a trailing comma or a comment does not flag a month outside it", () => {
+      expect(scan("new Date(2026, 10,)")).toEqual([]); // 2026-11-01, before yesterday
+      expect(scan("new Date(2026, 10 /* Nov */)")).toEqual([]);
+      expect(scan("new Date(2028, 0,)")).toEqual([]); // 2028-01-01, after now + 400 days
+      expect(scan("new Date(2028, 0 /* Jan */)")).toEqual([]);
+      expect(scan("new Date(2027, 11,)")).toHaveLength(1); // 2027-12-01, inside
+    });
+
+    it("does not read a non-literal day as day 1, with or without a comment or a trailing comma", () => {
+      expect(scan("new Date(2026, 11, d)")).toEqual([]);
+      expect(scan("new Date(2026, 11, /* day */ d)")).toEqual([]);
+      expect(scan("new Date(2026, 11, d,)")).toEqual([]);
+      expect(scan("new Date(2026, 11, d /* day */)")).toEqual([]);
+      expect(scan("Date.UTC(2026, 11, /* day */ day + 1)")).toEqual([]);
+      expect(scan("new Date(2026, 11 /* Dec */, d)")).toEqual([]);
+    });
+
+    it("does not read anything that is not a block comment as one: an unclosed comment, a line comment, other text", () => {
+      expect(scan("new Date(2026, 11 /* Dec )")).toEqual([]);
+      expect(scan("new Date(2026, 11 // Dec\n)")).toEqual([]);
+      expect(scan("new Date(2026, 11 d)")).toEqual([]);
+      expect(scan("new Date(2026, 11,,)")).toEqual([]);
+      expect(scan("new Date(2026, 11 /* a */ d)")).toEqual([]);
+    });
+
+    it("a literal day with a trailing comma is still flagged by its own day (three arguments, unchanged)", () => {
+      expect(scan("new Date(2026, 11, 5,)")).toHaveLength(1);
+      expect(scan("new Date(2026, 10, 5,)")).toEqual([]); // 2026-11-05
+    });
+
+    it("an opt-out on the line still skips it", () => {
+      expect(scan("new Date(2026, 11,) // date-guard: ok")).toEqual([]);
+    });
+  });
 });
 
 describe("findExpiringDates: window boundaries", () => {
