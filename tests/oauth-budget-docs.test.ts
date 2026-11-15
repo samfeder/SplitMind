@@ -14,6 +14,16 @@ function runbook(): string {
   return `${read("docs/setup/cloudflare.md")}\n${existsSync(join(root, dedicated)) ? read(dedicated) : ""}`;
 }
 
+/** The part of the runbook under the first heading that matches `heading`, up to the next "## " heading. */
+function runbookSection(heading: RegExp): string {
+  const text = runbook();
+  const match = heading.exec(text);
+  expect(match, `a heading matching ${heading}`).not.toBeNull();
+  const start = match!.index;
+  const next = text.indexOf("\n## ", start + 1);
+  return text.slice(start, next === -1 ? undefined : next);
+}
+
 /** The budget section of docs/guardrails.md, up to the next top-level section. */
 function budgetSection(): string {
   const guardrails = read("docs/guardrails.md");
@@ -57,6 +67,37 @@ describe("rollback runbook for the anonymous-write budget (H1)", () => {
     expect(text).toMatch(/claude\.ai/i);
     expect(text).toMatch(/tool call/i);
     expect(text).toMatch(/existing connection/i);
+  });
+});
+
+describe("runbook order and full-removal consequences (#78 round 3)", () => {
+  it("makes the existing-connection check before the fresh sign-in, so a broken refresh shows before a new grant masks it", () => {
+    const checklist = runbookSection(/^##+ .*checklist/im);
+    const existing = checklist.search(/existing connection/i);
+    const fresh = checklist.search(/fresh sign-in/i);
+    expect(existing).toBeGreaterThan(-1);
+    expect(fresh).toBeGreaterThan(-1);
+    expect(existing).toBeLessThan(fresh);
+  });
+
+  it("says the existing connection must be one idle for over an hour, or Claude Code", () => {
+    const checklist = runbookSection(/^##+ .*checklist/im);
+    expect(checklist).toMatch(/idle/i);
+    expect(checklist).toMatch(/\b(1|one) hour\b/i);
+    expect(checklist).toMatch(/Claude Code/);
+  });
+
+  it("warns in the full-removal section that the client-assertion probe in npm run verify then fails", () => {
+    const removal = runbookSection(/^##+ .*full removal/im);
+    expect(removal).toMatch(/npm run verify/);
+    expect(removal).toMatch(/client[- _]assertion/i);
+    expect(removal).toMatch(/\bfail/i);
+  });
+
+  it("says patches stacked after 0017 must be reversed first", () => {
+    const removal = runbookSection(/^##+ .*full removal/im);
+    expect(removal).toMatch(/after 0017|stacked|later patch|patches (that )?(come|follow)/i);
+    expect(removal).toMatch(/revers\w+[^.\n]{0,80}first|first[^.\n]{0,80}revers\w+|before[^.\n]{0,80}0017/i);
   });
 });
 
