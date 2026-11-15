@@ -1,18 +1,19 @@
 SplitMind patch 0015 for OpenConnector v1.9.2 (after 0001-0005 and 0009-0014).
 Upstream issue: not filed yet.
 Email watch: #96 failure loop, #97 quieter run log, #98 gap start, #101 alias reuse, #102 tests and 90-cap log, #119 wider invisible strip.
-From a6c9a89c169532d0b50c3b277d30ed20f25c10f3 Mon Sep 17 00:00:00 2001
+From cda8ae1948aadcaacc34335410331e92340cfda9 Mon Sep 17 00:00:00 2001
 From: SplitMind <noreply@example.invalid>
-Date: Sun, 15 Nov 2026 08:33:39 -0500
+Date: Sun, 15 Nov 2026 08:58:50 -0500
 Subject: [PATCH] fix(email-watch): failure loop, gap start, alias reuse,
  quieter run log, invisible strip (#96 #97 #98 #101 #102 #119)
 
 #96: an aborted poll clears catch_up (retried on the normal interval); after 24
 hours without a successful read, one pending watch_gap item (rule watch-failing)
 per failure streak. #98: the expired-history gap starts at last_success_at.
-#101: cursors record the Gmail connection id; a different or missing id drops
-the alias's items and cursor, and list/acknowledge hide them until then.
-#97: audit "failures" writes no run row for a successful watcher call.
+#101: cursors record an account fingerprint (sha256 of connection id and provider
+account id); a different or missing one drops the alias's items and cursor in one
+guarded batch, and list/acknowledge hide them (and names with no cursor) until
+then. #97: audit "failures" writes no run row for a successful watcher call.
 #102: warn with the omitted count past the 90-connection cap; race tests assert
 the injection ran. #119: strip every default-ignorable code point, U+2800,
 U+20E3 and marks after digits. Migration 0022 adds the cursor columns.
@@ -20,24 +21,27 @@ U+20E3 and marks after digits. Migration 0022 adds the cursor columns.
  migrations/0022_email_watch_cursor_state.sql  |   7 +
  .../0022_email_watch_cursor_state.sql         |   7 +
  src/core/types.ts                             |   5 +
- src/providers/mail_watch/executors.ts         |  51 +-
+ src/providers/mail_watch/executors.ts         |  56 +-
  .../actions/action-runner-audit.test.ts       |  91 ++-
- src/server/actions/action-runner.ts           |  43 +-
- src/server/cloudflare-email-watch.test.ts     | 412 +++++++++++-
- src/server/email-watch/gmail-access.test.ts   |  11 +-
+ src/server/actions/action-runner.ts           |  45 +-
+ src/server/cloudflare-email-watch.test.ts     | 652 +++++++++++++++-
+ src/server/email-watch/account-fingerprint.ts |  14 +
+ src/server/email-watch/gmail-access.test.ts   |  17 +-
  src/server/email-watch/gmail-access.ts        |   6 +-
- .../email-watch/mail-watch-provider.test.ts   |  82 ++-
- .../email-watch/mail-watch-scope.test.ts      |  95 ++-
- src/server/email-watch/migration.test.ts      | 114 +++-
+ .../email-watch/mail-watch-audit.test.ts      |  13 +-
+ .../email-watch/mail-watch-provider.test.ts   |  82 +-
+ .../email-watch/mail-watch-scope.test.ts      | 187 ++++-
+ src/server/email-watch/migration.test.ts      | 114 ++-
  src/server/email-watch/rules.ts               |  12 +-
- src/server/email-watch/test-support.ts        |  32 +-
- src/server/email-watch/watcher.test.ts        | 597 +++++++++++++++++-
- src/server/email-watch/watcher.ts             | 141 ++++-
+ src/server/email-watch/test-support.ts        |  54 +-
+ src/server/email-watch/watcher.test.ts        | 707 +++++++++++++++++-
+ src/server/email-watch/watcher.ts             | 150 +++-
  .../storage/postgres/runtime-store.test.ts    |  93 ++-
  .../storage/sqlite/runtime-store.test.ts      |   1 +
- 18 files changed, 1715 insertions(+), 85 deletions(-)
+ 20 files changed, 2218 insertions(+), 95 deletions(-)
  create mode 100644 migrations/0022_email_watch_cursor_state.sql
  create mode 100644 migrations/postgresql/0022_email_watch_cursor_state.sql
+ create mode 100644 src/server/email-watch/account-fingerprint.ts
 
 diff --git a/migrations/0022_email_watch_cursor_state.sql b/migrations/0022_email_watch_cursor_state.sql
 new file mode 100644
@@ -82,7 +86,7 @@ index 970be72b..250dedb1 100644
  
  /**
 diff --git a/src/providers/mail_watch/executors.ts b/src/providers/mail_watch/executors.ts
-index 144f2b66..0d9c04f3 100644
+index 144f2b66..70bc8305 100644
 --- a/src/providers/mail_watch/executors.ts
 +++ b/src/providers/mail_watch/executors.ts
 @@ -1,5 +1,5 @@
@@ -135,15 +139,16 @@ index 144f2b66..0d9c04f3 100644
            }
            if (allowed.get(row.connection_name)) permitted.push(row.id);
          }
-@@ -133,6 +139,41 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
+@@ -133,6 +139,46 @@ export function createMailWatchExecutors(deps: MailWatchDependencies): ProviderE
    };
  }
  
 +/**
 + * The caller's connection predicate, narrowed so a name whose cursor was written for a different connection id than
-+ * the name resolves to now is not allowed: its items belong to a previous account, and the next poll deletes them.
++ * the name resolves to now is not allowed (the id is an account fingerprint, so a connection saved over in place for
++ * another account counts too): its items belong to a previous account, and the next poll deletes them.
 + * A cursor without a connection id (written before patch 0015) is not checked. Without a resolver on the context
-+ * nothing is checked. A name that no longer resolves, or whose resolution fails, is hidden.
++ * nothing is checked. A name with no cursor at all is not allowed. A name that no longer resolves, or whose resolution fails, is hidden.
 + */
 +function withAccountCheck(
 +  database: D1DatabaseBinding,
@@ -151,21 +156,25 @@ index 144f2b66..0d9c04f3 100644
 +  allowed: (connectionName: string) => Promise<boolean>,
 +): (connectionName: string) => Promise<boolean> {
 +  const resolve = context.resolveConnectionId;
-+  let recorded: Map<string, string> | undefined;
-+  const recordedIds = async (): Promise<Map<string, string>> => {
++  let recorded: Map<string, string | null> | undefined;
++  const recordedIds = async (): Promise<Map<string, string | null>> => {
 +    if (!recorded) {
 +      const { results } = await database
-+        .prepare("select connection_name, connection_id from email_watch_cursors where connection_id is not null")
-+        .all<{ connection_name: string; connection_id: string }>();
++        .prepare("select connection_name, connection_id from email_watch_cursors")
++        .all<{ connection_name: string; connection_id: string | null }>();
 +      recorded = new Map(results.map((row) => [row.connection_name, row.connection_id]));
 +    }
 +    return recorded;
 +  };
 +  return async (name) => {
 +    if (!(await allowed(name))) return false;
++    // Without a resolver (a caller that is not the action runner) nothing is checked.
 +    if (!resolve) return true;
-+    const expected = (await recordedIds()).get(name);
-+    if (expected === undefined) return true;
++    const ids = await recordedIds();
++    // Fail closed: items of a name with no cursor (a purge that stopped half way) are not shown.
++    if (!ids.has(name)) return false;
++    const expected = ids.get(name);
++    if (expected === null) return true;
 +    try {
 +      return (await resolve(name)) === expected;
 +    } catch {
@@ -284,10 +293,18 @@ index 592c7923..b1deaa63 100644
 +  });
 +});
 diff --git a/src/server/actions/action-runner.ts b/src/server/actions/action-runner.ts
-index 6931981e..a167620d 100644
+index 6931981e..5f5f4b70 100644
 --- a/src/server/actions/action-runner.ts
 +++ b/src/server/actions/action-runner.ts
-@@ -42,9 +42,11 @@ export interface RunActionInput {
+@@ -17,6 +17,7 @@ import {
+   withProviderHttpDispatchResult,
+ } from "../../providers/provider-runtime.ts";
+ import { SaasError } from "../../saas/saas-client.ts";
++import { accountFingerprint } from "../email-watch/account-fingerprint.ts";
+ import { safeRunLogError, summarizeForRunLog } from "./run-log-summary.ts";
+ 
+ export interface ActionRunnerOptions {
+@@ -42,9 +43,11 @@ export interface RunActionInput {
    signal?: AbortSignal;
    /**
     * "outcome" records the run row without an input or output summary, for callers whose data must not reach the
@@ -301,7 +318,7 @@ index 6931981e..a167620d 100644
  }
  
  export interface ActionRunResult {
-@@ -233,7 +235,7 @@ export class ActionRunner {
+@@ -233,7 +236,7 @@ export class ActionRunner {
      const durationMs = completedAtMs - startedAtMs;
      const auditError = safeRunLogError(result.error);
      // Mail-watch runs carry subjects and senders, so they are always recorded outcome-only (patch 0011, #104).
@@ -310,7 +327,7 @@ index 6931981e..a167620d 100644
      const runLog: RunLog = {
        id: executionId,
        remoteExecutionId,
-@@ -254,20 +256,25 @@ export class ActionRunner {
+@@ -254,20 +257,25 @@ export class ActionRunner {
      };
  
      let auditPersisted = false;
@@ -344,17 +361,18 @@ index 6931981e..a167620d 100644
        durationMs,
        ok: result.ok,
        errorCode: result.error?.code,
-@@ -300,6 +307,19 @@ export class ActionRunner {
+@@ -300,6 +308,20 @@ export class ActionRunner {
      return this.options.runs.get(id);
    }
  
 +  /**
-+   * The id of the Gmail connection this name resolves to now (the id the runner records in run logs), or undefined
-+   * when the name has no connection. Any other failure is thrown. It reads the connection store only.
++   * The account fingerprint of the Gmail connection this name resolves to now (see accountFingerprint: its row id,
++   * the one the runner records in run logs, and its provider account id), or undefined when the name has no connection. Any other failure is thrown. It reads the connection store only.
 +   */
 +  async resolveGmailConnectionId(connectionName: string): Promise<string | undefined> {
 +    try {
-+      return (await this.options.connections.getConnectionSummary("gmail", connectionName))?.id;
++      const summary = await this.options.connections.getConnectionSummary("gmail", connectionName);
++      return summary ? await accountFingerprint(summary) : undefined;
 +    } catch (error) {
 +      if (error instanceof ConnectionError && error.code === "connection_not_found") return undefined;
 +      throw error;
@@ -364,7 +382,7 @@ index 6931981e..a167620d 100644
    /** The caller's connection policy for the Gmail connection with this name; a name with no connection has no id. */
    private async isGmailConnectionAllowed(connectionName: string, policy: ActionPolicySnapshot): Promise<boolean> {
      let connectionId: string | undefined;
-@@ -321,6 +341,7 @@ export class ActionRunner {
+@@ -321,6 +343,7 @@ export class ActionRunner {
        signal,
        logger: this.options.logger,
        isConnectionAllowed: (connectionName) => this.isGmailConnectionAllowed(connectionName, policy),
@@ -373,10 +391,18 @@ index 6931981e..a167620d 100644
      if (this.options.transitFiles) {
        context.transitFiles = this.options.transitFiles;
 diff --git a/src/server/cloudflare-email-watch.test.ts b/src/server/cloudflare-email-watch.test.ts
-index ccb1d38d..6065aa33 100644
+index ccb1d38d..567bdef8 100644
 --- a/src/server/cloudflare-email-watch.test.ts
 +++ b/src/server/cloudflare-email-watch.test.ts
-@@ -313,29 +313,29 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+@@ -4,6 +4,7 @@
+ import type { AssetsBinding, D1DatabaseBinding, D1PreparedStatementBinding, R2BucketBinding, R2ObjectBinding } from "./cloudflare/cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+ 
++import { createHash } from "node:crypto";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+ import { provider as gmail } from "../providers/gmail/definition.ts";
+@@ -313,29 +314,29 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
      expect(history.params.get("startHistoryId")).toBe("1000");
    });
  
@@ -418,7 +444,7 @@ index ccb1d38d..6065aa33 100644
      }
      // The run row keeps the connection's own profile (the owner's address) as it does for every caller; what it
      // must not hold is anything from the messages.
-@@ -345,11 +345,13 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+@@ -345,11 +346,13 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
        "no-reply@vercel.com",
        "Dinner at 7",
        "Deployment failed for my-app",
@@ -432,7 +458,7 @@ index ccb1d38d..6065aa33 100644
      ]) {
        expect(dump, secret).not.toContain(secret);
      }
-@@ -461,6 +463,8 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
+@@ -461,6 +464,8 @@ describe("end to end through the real ActionRunner and Gmail executors", () => {
  describe("run log listing", () => {
    it("lists the watcher's runs under caller=cron and still rejects an unknown caller", async () => {
      const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
@@ -441,7 +467,7 @@ index ccb1d38d..6065aa33 100644
      await s.tick(M0);
      const get = (query: string) =>
        worker.fetch(new Request(`${s.env.OOMOL_CONNECT_ORIGIN}/api/runs?${query}`), s.env, {
-@@ -472,7 +476,7 @@ describe("run log listing", () => {
+@@ -472,7 +477,7 @@ describe("run log listing", () => {
      expect(cron.status).toBe(200);
      const page = (await cron.json()) as { items: { actionId: string; caller: string; inputSummary?: unknown; outputSummary?: unknown }[] };
      expect(page.items.map((item) => item.actionId)).toEqual(["gmail.get_profile"]);
@@ -450,7 +476,17 @@ index ccb1d38d..6065aa33 100644
      expect(page.items[0]!.inputSummary).toBeUndefined();
      expect(page.items[0]!.outputSummary).toBeUndefined();
  
-@@ -1135,3 +1139,385 @@ describe("one-time codes through the cron and the list action (patch 0011, #105)
+@@ -916,6 +921,9 @@ describe("mail_watch runs in run logs (patch 0011, #104)", () => {
+ 
+   async function watching() {
+     const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++    // Patch 0015 (#101): a name with items and no cursor is hidden, so the watch polls once first and writes its cursor.
++    // A successful watcher run writes no run-log row (#97), so the run-log assertions below are unaffected.
++    await s.tick(M0);
+     for (const id of ["i1", "i2", "i3", "i4"]) {
+       await insertItem(
+         s.db,
+@@ -1135,3 +1143,621 @@ describe("one-time codes through the cron and the list action (patch 0011, #105)
      for (const code of codes) expect(text, JSON.stringify(code)).not.toContain(code);
    });
  });
@@ -637,29 +673,35 @@ index ccb1d38d..6065aa33 100644
 +});
 +
 +// ---------------------------------------------------------------------------------------------------------------
-+// Patch 0015, #101 through the Worker: an alias that is deleted and recreated as a different account must not hand the
-+// old account's items to the new one. The cursor records the id of the connection the name resolved to; a mismatch
-+// hides the items at once (list and acknowledge) and the next poll deletes them. Real stores, real ActionRunner, real
-+// connection ids; nothing about how the watcher resolves the id is assumed. (Executor level: mail-watch-scope.test.ts.)
++// Patch 0015, #101 through the Worker: an alias that now points at a different Google account must not hand the old
++// account's items to the new one. The cursor's connection_id is an account fingerprint (spec F1): sha256 hex of
++// `summary.id + "|" + summary.profile.accountId`. A mismatch hides the items at once (list and acknowledge) and the next
++// poll deletes them. Two ways to get a different account under one name: delete then save (a new row id), and save
++// over the same name without deleting (an in-place reconnect: SqlConnectionStore upserts on (service, name) and keeps
++// the row id, so only the account id changes). Real stores, real ActionRunner, real connection ids.
++// (Executor level: mail-watch-scope.test.ts.)
 +// ---------------------------------------------------------------------------------------------------------------
 +describe("an alias reused by a different account (patch 0015, #101)", () => {
 +  const ctx = { waitUntil() {}, passThroughOnException() {} };
 +  const OLD_SUBJECT = "Deployment failed for old-account-app";
 +  const OTHER_SUBJECT = "Deployment failed for untouched-b-app";
++  const NEW_EMAIL = "new-owner@example.org";
++  /** The pinned fingerprint, computed here from literals and not by the product code. */
++  const fingerprint = (id: string, accountId: string) => createHash("sha256").update(`${id}|${accountId}`).digest("hex");
 +
 +  async function connections(s: Setup) {
 +    return new D1RuntimeDatabase(s.db, { secretCodec: await createWorkerSecretCodec(s.env.OOMOL_CONNECT_ENCRYPTION_KEY!) }).connectionStore;
 +  }
 +
-+  const credentialFor = (name: string, email: string) => ({
++  const credentialFor = (name: string, email: string, profile: { displayName?: string; grantedScopes?: string[] } = {}) => ({
 +    authType: "oauth2" as const,
 +    accessToken: `token-${name}`,
 +    tokenType: "Bearer",
 +    metadata: {},
-+    profile: { accountId: email, displayName: email, grantedScopes: [] },
++    profile: { accountId: email, displayName: profile.displayName ?? email, grantedScopes: profile.grantedScopes ?? [] },
 +  });
 +
-+  /** Watches a and b, runs the first poll (cursors with their connection ids), and stores one item for each. */
++  /** Watches a and b, runs the first poll (cursors with their fingerprints), and stores items for each. */
 +  async function watched() {
 +    const info = vi.spyOn(console, "info").mockImplementation(() => {});
 +    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -672,14 +714,20 @@ index ccb1d38d..6065aa33 100644
 +    await insertItem(s.db, itemRow({ id: "old-1", connection_name: "a", gmail_message_id: "g-old-1", subject: OLD_SUBJECT, dedup_key: "k-old-1" }));
 +    await insertItem(s.db, itemRow({ id: "old-2", connection_name: "a", gmail_message_id: "g-old-2", subject: `${OLD_SUBJECT} again`, dedup_key: "k-old-2" }));
 +    await insertItem(s.db, itemRow({ id: "b-1", connection_name: "b", gmail_message_id: "g-b-1", subject: OTHER_SUBJECT, dedup_key: "k-b-1" }));
-+    return { s, store, oldId, bId, warn, info, error };
++    return { s, store, oldId, bId, warn, info, error, oldEmail: s.mailboxes.a!.email, bEmail: s.mailboxes.b!.email };
 +  }
 +
 +  /** The connection is deleted and the name is saved again for another Gmail account (a new connection id). */
 +  async function replaceAccount(s: Setup, store: Awaited<ReturnType<typeof connections>>, name: string) {
 +    await store.delete("gmail", name);
-+    s.mailboxes[name] = new FakeMailbox({ prefix: "z", email: "new-owner@example.org", startHistoryId: 5000 });
-+    return (await store.set("gmail", name, credentialFor(name, "new-owner@example.org"))).id;
++    s.mailboxes[name] = new FakeMailbox({ prefix: "z", email: NEW_EMAIL, startHistoryId: 5000 });
++    return (await store.set("gmail", name, credentialFor(name, NEW_EMAIL))).id;
++  }
++
++  /** The name is saved over, without a delete, for another Gmail account: the row id stays. */
++  async function reconnectInPlace(s: Setup, store: Awaited<ReturnType<typeof connections>>, name: string, email: string) {
++    s.mailboxes[name] = new FakeMailbox({ prefix: "z", email, startHistoryId: 5000 });
++    return (await store.set("gmail", name, credentialFor(name, email))).id;
 +  }
 +
 +  async function listText(s: Setup): Promise<string> {
@@ -712,14 +760,22 @@ index ccb1d38d..6065aa33 100644
 +    (await s.watchRows<{ id: string; connection_name: string }>("email_watch_items")).filter((row) => row.connection_name === name).map((row) => row.id).sort();
 +  const cursorOfName = async (s: Setup, name: string) =>
 +    (await s.watchRows<{ connection_name: string; connection_id: string | null; history_id: string }>("email_watch_cursors")).find((row) => row.connection_name === name);
++  const statusesOf = async (s: Setup) =>
++    Object.fromEntries((await s.watchRows<{ id: string; status: string }>("email_watch_items")).map((row) => [row.id, row.status]));
 +  const nameOnlyWarnings = (warn: { mock: { calls: unknown[][] } }, name: string) =>
 +    warn.mock.calls.filter((call) => JSON.stringify(call[1]) === JSON.stringify({ connectionName: name }));
 +
-+  it("the first poll records the connection id each name resolved to", async () => {
-+    const { s, oldId, bId } = await watched();
-+    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: oldId });
-+    expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: bId });
++  it("the first poll records the account fingerprint of each name: sha256 of the connection id, a bar and the account id", async () => {
++    const { s, oldId, bId, oldEmail, bEmail } = await watched();
 +    expect(oldId).not.toBe(bId);
++    expect((await cursorOfName(s, "a"))!.connection_id).toBe(fingerprint(oldId, oldEmail));
++    expect((await cursorOfName(s, "b"))!.connection_id).toBe(fingerprint(bId, bEmail));
++    // Neither the bare row id nor the address is what is stored.
++    for (const row of await s.watchRows<{ connection_id: string }>("email_watch_cursors")) {
++      expect(row.connection_id).toMatch(/^[0-9a-f]{64}$/);
++      expect(row.connection_id).not.toBe(oldId);
++      expect(row.connection_id).not.toBe(bId);
++    }
 +  });
 +
 +  it("before any poll: the list shows none of the old account's items and acknowledge touches none, while the other alias is unaffected", async () => {
@@ -731,30 +787,30 @@ index ccb1d38d..6065aa33 100644
 +    expect(text).not.toContain(OLD_SUBJECT);
 +    expect(text).toContain(OTHER_SUBJECT);
 +    expect(await acknowledge(s, ["old-1", "old-2", "b-1"])).toContain('"acknowledged":1');
-+    const statuses = Object.fromEntries((await s.watchRows<{ id: string; status: string }>("email_watch_items")).map((row) => [row.id, row.status]));
-+    expect(statuses).toEqual({ "old-1": "pending", "old-2": "pending", "b-1": "acknowledged" });
++    expect(await statusesOf(s)).toEqual({ "old-1": "pending", "old-2": "pending", "b-1": "acknowledged" });
 +    // Nothing has been deleted yet: only a poll does that.
 +    expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
 +  });
 +
 +  it("the next poll deletes the old items and cursor, logs one warn line with only the name, and starts fresh", async () => {
-+    const { s, store, oldId, bId, warn, info, error } = await watched();
++    const { s, store, oldId, bId, warn, info, error, oldEmail, bEmail } = await watched();
++    const oldFingerprint = (await cursorOfName(s, "a"))!.connection_id!;
 +    const newId = await replaceAccount(s, store, "a");
 +    const requestsBefore = s.mailboxes.a!.requests.length;
 +    await s.tick(M0 + 10);
 +
 +    expect(await itemIds(s, "a")).toEqual([]);
-+    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: newId, history_id: "5000" });
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(newId, NEW_EMAIL), history_id: "5000" });
 +    // Fresh start: the new mailbox is asked for its profile and for nothing else.
 +    expect(s.mailboxes.a!.requests.slice(requestsBefore).map((request) => request.kind)).toEqual(["profile"]);
 +    // The other alias is untouched.
 +    expect(await itemIds(s, "b")).toEqual(["b-1"]);
-+    expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: bId });
++    expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: fingerprint(bId, bEmail) });
 +
 +    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
 +    expect(nameOnlyWarnings(warn, "b")).toHaveLength(0);
 +    const text = JSON.stringify([...warn.mock.calls, ...info.mock.calls, ...error.mock.calls]);
-+    for (const secret of [oldId, newId, "new-owner@example.org", OWNER_EMAIL, OLD_SUBJECT, "old-1", "g-old-1"]) {
++    for (const secret of [oldId, newId, oldFingerprint, fingerprint(newId, NEW_EMAIL), NEW_EMAIL, oldEmail, OLD_SUBJECT, "old-1", "g-old-1"]) {
 +      expect(text, secret).not.toContain(secret);
 +    }
 +    // And the list no longer has the old items either, nor does anything come back on the poll after.
@@ -779,7 +835,7 @@ index ccb1d38d..6065aa33 100644
 +    expect(nameOnlyWarnings(warn, "b")).toHaveLength(0);
 +  });
 +
-+  it("a pre-patch cursor with a null connection_id is adopted: the id is recorded, the items stay, nothing is logged", async () => {
++  it("a pre-patch cursor with a null connection_id is adopted: the fingerprint is recorded, the items stay, nothing is logged", async () => {
 +    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 +    vi.spyOn(console, "info").mockImplementation(() => {});
 +    const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
@@ -789,8 +845,8 @@ index ccb1d38d..6065aa33 100644
 +    expect((await s.watchRows<{ connection_id: string | null }>("email_watch_cursors"))[0]!.connection_id).toBeNull();
 +    s.mailboxes.work!.deliver(vercelFailure("Deployment failed for a-fresh-one"));
 +    await s.tick(M0 + 10);
-+    expect((await s.watchRows<{ connection_id: string | null }>("email_watch_cursors"))[0]!.connection_id).toBe(id);
-+    // Adopting the id costs no Gmail call: the poll reads history and the one new message, and never the profile.
++    expect((await s.watchRows<{ connection_id: string | null }>("email_watch_cursors"))[0]!.connection_id).toBe(fingerprint(id, s.mailboxes.work!.email));
++    // Adopting costs no Gmail call: the poll reads history and the one new message, and never the profile.
 +    expect(s.mailboxes.work!.requests.map((request) => request.kind)).toEqual(["history", "message"]);
 +    expect((await s.watchRows<{ id: string }>("email_watch_items")).map((row) => row.id).includes("pre-1")).toBe(true);
 +    expect(await s.watchRows("email_watch_items")).toHaveLength(2);
@@ -818,16 +874,16 @@ index ccb1d38d..6065aa33 100644
 +    const newId = await replaceAccount(s, store, "a");
 +    await s.tick(M0 + 20);
 +    expect(await itemIds(s, "a")).toEqual([]);
-+    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: newId, history_id: "5000" });
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(newId, NEW_EMAIL), history_id: "5000" });
 +  });
 +
 +  it("a transient failure while resolving the name deletes nothing, and the next poll that can resolve does the cleanup", async () => {
-+    const { s, store, oldId, warn } = await watched();
++    const { s, store, oldId, warn, oldEmail } = await watched();
 +    await replaceAccount(s, store, "a");
 +    s.db.failWhen = (query) => /\bfrom\s+connections\b/i.test(query);
 +    await s.tick(M0 + 10);
 +    expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
-+    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: oldId });
++    expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(oldId, oldEmail) });
 +    expect(nameOnlyWarnings(warn, "a")).toHaveLength(0);
 +
 +    s.db.failWhen = undefined;
@@ -835,12 +891,255 @@ index ccb1d38d..6065aa33 100644
 +    expect(await itemIds(s, "a")).toEqual([]);
 +    expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
 +  });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // Fail closed: a name with items and no cursor (only a partial purge leaves that) is hidden.
++  // -------------------------------------------------------------------------------------------------------------
++  it("deleting a name's cursor row directly hides its items from list and makes acknowledge refuse them; the other name is unaffected", async () => {
++    const { s } = await watched();
++    expect(await listText(s)).toContain(OLD_SUBJECT);
++    await s.db.inner.prepare("delete from email_watch_cursors where connection_name = 'a'").run();
++    const text = await listText(s);
++    expect(text).not.toContain(OLD_SUBJECT);
++    expect(text).toContain(OTHER_SUBJECT);
++    expect(await acknowledge(s, ["old-1", "old-2", "b-1"])).toContain('"acknowledged":1');
++    expect(await statusesOf(s)).toEqual({ "old-1": "pending", "old-2": "pending", "b-1": "acknowledged" });
++  });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // Spec F2: the purge of a name whose account changed is one batch (item delete and cursor delete), and the cursor
++  // delete is conditional on the connection_id this invocation read. An invocation that read the cursor before another
++  // invocation purged it and started fresh must not delete the new cursor or the new items.
++  // The stale invocation is staged by running "the other invocation" synchronously, against the SQLite behind the
++  // test database, the first time the watcher prepares a per-name delete: that is after the stale invocation read the
++  // cursor and decided to purge, and before any of its delete statements runs.
++  // -------------------------------------------------------------------------------------------------------------
++  describe("a stale invocation's purge (spec F2)", () => {
++    const PURGE = /delete\s+from\s+email_watch_(items|cursors)\b[^;]*connection_name/i;
++    const quote = (value: string | null) => (value === null ? "null" : `'${value.replace(/'/g, "''")}'`);
++
++    /** Calls `act` once, the first time a per-name delete on the watch tables is prepared. Returns whether it fired. */
++    function onFirstPurge(s: Setup, act: () => void): () => boolean {
++      let fired = false;
++      s.db.failWhen = (query) => {
++        if (!fired && PURGE.test(query)) {
++          fired = true;
++          act();
++        }
++        return false;
++      };
++      return () => fired;
++    }
++
++    /** What a second invocation did meanwhile: purged `a`, then started it fresh under fingerprint `y` with a new item. */
++    function otherInvocationRestarted(s: Setup, y: string) {
++      return () => {
++        s.db.inner.exec("delete from email_watch_items where connection_name = 'a'");
++        s.db.inner.exec("delete from email_watch_cursors where connection_name = 'a'");
++        s.db.inner.exec(
++          `insert into email_watch_cursors (connection_name, history_id, page_token, last_run_at, catch_up, last_success_at, failing_notice_at, connection_id)
++           values ('a', '7777', null, ${quote(new Date().toISOString())}, 0, ${quote(new Date().toISOString())}, null, ${quote(y)})`,
++        );
++        const row = itemRow({ id: "fresh-1", connection_name: "a", gmail_message_id: "g-fresh-1", subject: "Deployment failed for fresh-account-app", dedup_key: "k-fresh-1" });
++        const columns = Object.keys(row);
++        s.db.inner.exec(
++          `insert into email_watch_items (${columns.join(", ")}) values (${Object.values(row).map((value) => (typeof value === "number" ? String(value) : quote(value as string | null))).join(", ")})`,
++        );
++      };
++    }
++
++    it.each([
++      ["deleted and saved again (a new row id)", false],
++      ["saved over in place (the same row id)", true],
++    ])("the new cursor and the new items survive when the account was %s", async (_name, inPlace) => {
++      const { s, store } = await watched();
++      const id = inPlace ? await reconnectInPlace(s, store, "a", NEW_EMAIL) : await replaceAccount(s, store, "a");
++      const fired = onFirstPurge(s, otherInvocationRestarted(s, fingerprint(id, NEW_EMAIL)));
++      await s.tick(M0 + 10);
++      expect(fired(), "the stale invocation reached its purge").toBe(true);
++
++      expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(id, NEW_EMAIL), history_id: "7777" });
++      expect(await itemIds(s, "a")).toEqual(["fresh-1"]);
++      expect(await listText(s)).toContain("fresh-account-app");
++      expect(await itemIds(s, "b")).toEqual(["b-1"]);
++    });
++
++    it("the purge runs the item delete and the cursor delete in one batch", async () => {
++      const { s, store } = await watched();
++      await replaceAccount(s, store, "a");
++      const batches: { size: number; recent: string[] }[] = [];
++      const original = s.db.batch.bind(s.db);
++      s.db.batch = (statements) => {
++        batches.push({ size: statements.length, recent: s.db.queries.slice(-statements.length) });
++        return original(statements);
++      };
++      await s.tick(M0 + 10);
++      const purges = batches.filter(
++        (batch) =>
++          batch.size >= 2 &&
++          batch.recent.some((query) => /delete\s+from\s+email_watch_items\b/i.test(query)) &&
++          batch.recent.some((query) => /delete\s+from\s+email_watch_cursors\b/i.test(query)),
++      );
++      expect(purges).toHaveLength(1);
++      expect(await itemIds(s, "a")).toEqual([]);
++    });
++  });
++
++  // -------------------------------------------------------------------------------------------------------------
++  // The same name saved over without a delete: the connection row, and so its id, is kept.
++  // -------------------------------------------------------------------------------------------------------------
++  describe("reconnected in place, with no delete (the row id does not change)", () => {
++    it("premise: saving over the same name keeps the connection id, so an id-only check could not see the change", async () => {
++      const { s, store, oldId } = await watched();
++      expect(await reconnectInPlace(s, store, "a", NEW_EMAIL)).toBe(oldId);
++    });
++
++    it("a different account: before any poll the list and acknowledge hide and leave alone the old account's items", async () => {
++      const { s, store } = await watched();
++      await reconnectInPlace(s, store, "a", NEW_EMAIL);
++
++      const text = await listText(s);
++      expect(text).not.toContain(OLD_SUBJECT);
++      expect(text).toContain(OTHER_SUBJECT);
++      expect(await acknowledge(s, ["old-1", "old-2", "b-1"])).toContain('"acknowledged":1');
++      expect(await statusesOf(s)).toEqual({ "old-1": "pending", "old-2": "pending", "b-1": "acknowledged" });
++      expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++      expect(await cursorOfName(s, "a")).toBeDefined();
++    });
++
++    it("a different account: the next poll purges the items and the cursor, logs only the name, and starts fresh", async () => {
++      const { s, store, oldId, bId, warn, info, error, oldEmail, bEmail } = await watched();
++      const oldFingerprint = (await cursorOfName(s, "a"))!.connection_id!;
++      const sameId = await reconnectInPlace(s, store, "a", NEW_EMAIL);
++      expect(sameId).toBe(oldId);
++      const requestsBefore = s.mailboxes.a!.requests.length;
++      await s.tick(M0 + 10);
++
++      expect(await itemIds(s, "a")).toEqual([]);
++      expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(oldId, NEW_EMAIL), history_id: "5000" });
++      expect((await cursorOfName(s, "a"))!.connection_id).not.toBe(oldFingerprint);
++      expect(s.mailboxes.a!.requests.slice(requestsBefore).map((request) => request.kind)).toEqual(["profile"]);
++      expect(await itemIds(s, "b")).toEqual(["b-1"]);
++      expect(await cursorOfName(s, "b")).toMatchObject({ connection_id: fingerprint(bId, bEmail) });
++
++      expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++      expect(nameOnlyWarnings(warn, "b")).toHaveLength(0);
++      const text = JSON.stringify([...warn.mock.calls, ...info.mock.calls, ...error.mock.calls]);
++      for (const secret of [oldId, oldFingerprint, fingerprint(oldId, NEW_EMAIL), NEW_EMAIL, oldEmail, OLD_SUBJECT, "old-1"]) {
++        expect(text, secret).not.toContain(secret);
++      }
++      expect(await listText(s)).not.toContain(OLD_SUBJECT);
++      await s.tick(M0 + 20);
++      expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++      expect(await itemIds(s, "a")).toEqual([]);
++    });
++
++    it("the same account saved over in place (a new token, a re-consent with another display name and scopes) keeps its items: nothing hidden, nothing purged", async () => {
++      const { s, store, oldId, warn, oldEmail } = await watched();
++      const before = (await cursorOfName(s, "a"))!.connection_id;
++      const sameId = (await store.set("gmail", "a", credentialFor("a", oldEmail, { displayName: "Renamed Owner", grantedScopes: ["https://www.googleapis.com/auth/gmail.readonly"] }))).id;
++      expect(sameId).toBe(oldId);
++
++      expect(await listText(s)).toContain(OLD_SUBJECT);
++      expect(await acknowledge(s, ["old-1"])).toContain('"acknowledged":1');
++      expect(await statusesOf(s)).toMatchObject({ "old-1": "acknowledged", "old-2": "pending" });
++
++      const requestsBefore = s.mailboxes.a!.requests.length;
++      await s.tick(M0 + 10);
++      expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++      expect((await cursorOfName(s, "a"))!.connection_id).toBe(before);
++      expect(s.mailboxes.a!.requests.slice(requestsBefore).map((request) => request.kind)).toEqual(["history"]);
++      expect(nameOnlyWarnings(warn, "a")).toHaveLength(0);
++    });
++
++    it("the same account saved over in place keeps working: mail that arrives afterwards is stored beside the old items", async () => {
++      const { s, store, oldEmail } = await watched();
++      await store.set("gmail", "a", credentialFor("a", oldEmail));
++      s.mailboxes.a!.deliver(vercelFailure("Deployment failed for after-the-reconnect"));
++      await s.tick(M0 + 10);
++      expect((await itemIds(s, "a")).length).toBe(3);
++      expect(await listText(s)).toContain("after-the-reconnect");
++    });
++
++    it("an adopted pre-patch cursor then notices an in-place switch to another account: purged on the next poll", async () => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++      vi.spyOn(console, "info").mockImplementation(() => {});
++      const s = await setup({ vars: { [CONNECTIONS]: "gmail:work" } });
++      const store = await connections(s);
++      const id = (await store.get("gmail", "work"))!.id;
++      await insertCursor(s.db, { connection_name: "work", history_id: "1000", last_run_at: new Date(T0 - HOUR).toISOString() });
++      await insertItem(s.db, itemRow({ id: "pre-1", connection_name: "work", subject: OLD_SUBJECT, dedup_key: "k-pre-1" }));
++      await s.tick(M0 + 10);
++      expect(await itemIds(s, "work")).toEqual(["pre-1"]);
++      expect((await cursorOfName(s, "work"))!.connection_id).toBe(fingerprint(id, s.mailboxes.work!.email));
++
++      expect(await reconnectInPlace(s, store, "work", NEW_EMAIL)).toBe(id);
++      expect(await listText(s)).not.toContain(OLD_SUBJECT);
++      await s.tick(M0 + 20);
++      expect(await itemIds(s, "work")).toEqual([]);
++      expect(await cursorOfName(s, "work")).toMatchObject({ connection_id: fingerprint(id, NEW_EMAIL), history_id: "5000" });
++      expect(warn.mock.calls.filter((call) => JSON.stringify(call[1]) === JSON.stringify({ connectionName: "work" }))).toHaveLength(1);
++    });
++
++    it("a transient resolution failure after an in-place switch deletes nothing; the next poll that can resolve purges", async () => {
++      const { s, store, oldId, warn, oldEmail } = await watched();
++      await reconnectInPlace(s, store, "a", NEW_EMAIL);
++      s.db.failWhen = (query) => /\bfrom\s+connections\b/i.test(query);
++      await s.tick(M0 + 10);
++      expect(await itemIds(s, "a")).toEqual(["old-1", "old-2"]);
++      expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(oldId, oldEmail) });
++      expect(nameOnlyWarnings(warn, "a")).toHaveLength(0);
++      s.db.failWhen = undefined;
++      await s.tick(M0 + 20);
++      expect(await itemIds(s, "a")).toEqual([]);
++      expect(nameOnlyWarnings(warn, "a")).toHaveLength(1);
++    });
++
++    it("switching back to the first account in place after a purge starts fresh again and purges the second account's items", async () => {
++      const { s, store, oldId, oldEmail } = await watched();
++      await reconnectInPlace(s, store, "a", NEW_EMAIL);
++      await s.tick(M0 + 10);
++      await insertItem(s.db, itemRow({ id: "second-1", connection_name: "a", gmail_message_id: "g-second-1", subject: "Deployment failed for second-account-app", dedup_key: "k-second-1" }));
++      await reconnectInPlace(s, store, "a", oldEmail);
++      expect(await listText(s)).not.toContain("second-account-app");
++      await s.tick(M0 + 20);
++      expect(await itemIds(s, "a")).toEqual([]);
++      expect(await cursorOfName(s, "a")).toMatchObject({ connection_id: fingerprint(oldId, oldEmail) });
++    });
++  });
 +});
+diff --git a/src/server/email-watch/account-fingerprint.ts b/src/server/email-watch/account-fingerprint.ts
+new file mode 100644
+index 00000000..bbf93ea9
+--- /dev/null
++++ b/src/server/email-watch/account-fingerprint.ts
+@@ -0,0 +1,14 @@
++import type { ConnectionSummary } from "../../connection-service.ts";
++
++/**
++ * What the email watch records as `connection_id`: sha256 hex of the connection row id, a bar and the provider
++ * account id of its profile ("" when there is none). A connection saved over in place for another Google account
++ * keeps its row id but changes the account id, so it counts as a different account. Neither the id nor the address
++ * is stored or logged, only the hash. The watcher and the list/acknowledge check both get it from the action runner,
++ * which calls this one function.
++ */
++export async function accountFingerprint(summary: Pick<ConnectionSummary, "id" | "profile">): Promise<string> {
++  const text = `${summary.id}|${summary.profile?.accountId ?? ""}`;
++  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
++  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
++}
 diff --git a/src/server/email-watch/gmail-access.test.ts b/src/server/email-watch/gmail-access.test.ts
-index 4ced6617..1fbde714 100644
+index 4ced6617..e9d4175a 100644
 --- a/src/server/email-watch/gmail-access.test.ts
 +++ b/src/server/email-watch/gmail-access.test.ts
-@@ -11,7 +11,8 @@ import type { RunActionInput } from "../actions/action-runner.ts";
+@@ -5,13 +5,14 @@ import { createWatchGmailClient } from "./gmail-access.ts";
+ import type { RunActionInput } from "../actions/action-runner.ts";
+ 
+ // Interface pinned (gmail-access.ts), the allowlist of decision 3:
+-//   createWatchGmailClient(runner: { run(input: RunActionInput): Promise<ActionRunResult | undefined> },
++//   createWatchGmailClient(runner: { run(input: RunActionInput): Promise<ActionRunResult | undefined>; resolveGmailConnectionId(name): Promise<string | undefined> },
+ //                          policy: ActionPolicySnapshot)
+ //     -> { call(connectionName: string, actionId: string, input: unknown): Promise<ActionRunResult | undefined> }
  //   `call` REJECTS (throws) before touching the runner unless the call is one of
  //     gmail.get_profile | gmail.list_history | gmail.fetch_message_by_message_id with input.format === "metadata".
  //   Otherwise it calls runner.run exactly once with { actionId, input, connectionName, policy,
@@ -850,6 +1149,15 @@ index 4ced6617..1fbde714 100644
  
  const policy = new ActionPolicyService().createSnapshot();
  const HEADERS = ["From", "Subject", "Authentication-Results", "X-GitHub-Reason", "List-Id"];
+@@ -22,7 +23,7 @@ function setup() {
+     auditPersisted: true,
+     result: { ok: true as const, output: {} },
+   }));
+-  const client = createWatchGmailClient({ run }, policy);
++  const client = createWatchGmailClient({ run, resolveGmailConnectionId: async () => undefined }, policy);
+   return { run, client };
+ }
+ 
 @@ -90,7 +91,7 @@ describe("the watcher's Gmail allowlist", () => {
      expect(run).not.toHaveBeenCalled();
    });
@@ -877,7 +1185,7 @@ index 4ced6617..1fbde714 100644
      });
    });
  
-@@ -129,7 +130,7 @@ describe("the watcher's Gmail allowlist", () => {
+@@ -129,13 +130,13 @@ describe("the watcher's Gmail allowlist", () => {
        input,
        connectionName: "work",
        caller: "cron",
@@ -886,16 +1194,23 @@ index 4ced6617..1fbde714 100644
      });
    });
  
+   it("returns the runner's refusal as a result, so a policy block can skip a connection", async () => {
+     const refusal = { executionId: "e2", auditPersisted: true, result: { ok: false as const, error: { code: "action_blocked", message: "blocked" } } };
+-    const client = createWatchGmailClient({ run: async () => refusal }, policy);
++    const client = createWatchGmailClient({ run: async () => refusal, resolveGmailConnectionId: async () => undefined }, policy);
+     await expect(client.call("work", "gmail.list_history", { startHistoryId: "1" })).resolves.toBe(refusal);
+   });
+ });
 diff --git a/src/server/email-watch/gmail-access.ts b/src/server/email-watch/gmail-access.ts
-index c46ba93d..dd2474ff 100644
+index c46ba93d..b55f5b57 100644
 --- a/src/server/email-watch/gmail-access.ts
 +++ b/src/server/email-watch/gmail-access.ts
 @@ -3,6 +3,8 @@ import type { ActionPolicySnapshot } from "../../core/action-policy.ts";
  
  export interface WatchActionRunner {
    run(input: RunActionInput): Promise<ActionRunResult | undefined>;
-+  /** The Gmail connection id the name resolves to now, undefined when it has none. Optional: no id, no alias check. */
-+  resolveGmailConnectionId?(connectionName: string): Promise<string | undefined>;
++  /** The account fingerprint of the Gmail connection the name resolves to now, undefined when it has none. */
++  resolveGmailConnectionId(connectionName: string): Promise<string | undefined>;
  }
  
  export interface WatchGmailClient {
@@ -915,6 +1230,50 @@ index c46ba93d..dd2474ff 100644
      },
    };
  }
+diff --git a/src/server/email-watch/mail-watch-audit.test.ts b/src/server/email-watch/mail-watch-audit.test.ts
+index 53644dbe..e1f14e35 100644
+--- a/src/server/email-watch/mail-watch-audit.test.ts
++++ b/src/server/email-watch/mail-watch-audit.test.ts
+@@ -5,6 +5,7 @@
+ import type { ProviderExecutors } from "../../core/types.ts";
+ import type { RunLog, RunLogCaller } from "../storage/runtime-store.ts";
+ 
++import { createHash } from "node:crypto";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { createCatalogStore } from "../../catalog-store.ts";
+ import { ConnectionService } from "../../connection-service.ts";
+@@ -16,7 +17,7 @@ import { ProviderLoader } from "../../providers/provider-loader.ts";
+ import { ActionRunner } from "../actions/action-runner.ts";
+ import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+-import { HOUR, T0, insertItem, itemRow } from "./test-support.ts";
++import { HOUR, T0, insertCursor, insertItem, itemRow } from "./test-support.ts";
+ 
+ const SUBJECT = "Deployment failed for ledger-9QX";
+ const LEAK = `Could not read "${SUBJECT}" at https://mail.google.com/mail/u/owner@example.org/#inbox/18c0ffee from owner@example.org`;
+@@ -32,13 +33,21 @@ async function setup(mailWatchExecutors?: ProviderExecutors) {
+   const binding = new SqliteD1Database();
+   databases.push(binding);
+   const database = new D1RuntimeDatabase(binding);
+-  await database.connectionStore.set("gmail", "work", {
++  const stored = await database.connectionStore.set("gmail", "work", {
+     authType: "oauth2",
+     accessToken: "token-work",
+     tokenType: "Bearer",
+     metadata: {},
+     profile: { accountId: "owner@example.org", displayName: "owner@example.org", grantedScopes: [] },
+   });
++  // Patch 0015 (#101): a name with items and no cursor is hidden, so the watcher has polled `work`: its cursor records
++  // the account fingerprint (spec F1: sha256 hex of `<connection id>|<provider account id>`).
++  await insertCursor(binding, {
++    connection_name: "work",
++    history_id: "1000",
++    last_run_at: iso(T0 - HOUR),
++    connection_id: createHash("sha256").update(`${stored.id}|owner@example.org`).digest("hex"),
++  });
+   for (const id of ["i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8"]) {
+     await insertItem(
+       binding,
 diff --git a/src/server/email-watch/mail-watch-provider.test.ts b/src/server/email-watch/mail-watch-provider.test.ts
 index 2d6716a1..28a2061e 100644
 --- a/src/server/email-watch/mail-watch-provider.test.ts
@@ -1013,10 +1372,18 @@ index 2d6716a1..28a2061e 100644
 +  });
 +});
 diff --git a/src/server/email-watch/mail-watch-scope.test.ts b/src/server/email-watch/mail-watch-scope.test.ts
-index 613224d9..66ba214c 100644
+index 613224d9..ee84162f 100644
 --- a/src/server/email-watch/mail-watch-scope.test.ts
 +++ b/src/server/email-watch/mail-watch-scope.test.ts
-@@ -33,7 +33,7 @@ import { ProviderLoader } from "../../providers/provider-loader.ts";
+@@ -22,6 +22,7 @@
+ import type { D1DatabaseBinding, D1PreparedStatementBinding } from "../cloudflare/cloudflare-bindings.ts";
+ import type { ExecutionContext, ExecutionResult } from "../../core/types.ts";
+ 
++import { createHash } from "node:crypto";
+ import { afterEach, describe, expect, it } from "vitest";
+ import { createCatalogStore } from "../../catalog-store.ts";
+ import { ConnectionService } from "../../connection-service.ts";
+@@ -33,10 +34,12 @@ import { ProviderLoader } from "../../providers/provider-loader.ts";
  import { ActionRunner } from "../actions/action-runner.ts";
  import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
  import { SqliteD1Database } from "../storage/d1/test-database.ts";
@@ -1025,7 +1392,27 @@ index 613224d9..66ba214c 100644
  
  const EMAILS: Record<string, string> = { a: "a-owner@example.org", b: "b-owner@example.net" };
  const iso = (ms: number) => new Date(ms).toISOString();
-@@ -96,10 +96,11 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
++/** The cursor's connection_id (spec F1): sha256 hex of `<connection id>|<provider account id>`, computed here from literals. */
++const fingerprint = (id: string, accountId: string) => createHash("sha256").update(`${id}|${accountId}`).digest("hex");
+ 
+ const databases: SqliteD1Database[] = [];
+ afterEach(() => {
+@@ -57,6 +60,14 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
+       profile: { accountId: EMAILS[name]!, displayName: EMAILS[name]!, grantedScopes: [] },
+     });
+     ids[name] = stored.id;
++    // The watcher has polled this connection: its cursor records the account it was written for. A name with items and
++    // no cursor is hidden (fail closed), so every name with items below has one, except `gone`, which has none.
++    await insertCursor(binding, {
++      connection_name: name,
++      history_id: "1000",
++      last_run_at: iso(T0 - HOUR),
++      connection_id: fingerprint(stored.id, EMAILS[name]!),
++    });
+   }
+   const notion = await database.connectionStore.set("notion", "work", {
+     authType: "api_key",
+@@ -96,10 +107,11 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
    const catalog = createCatalogStore([JSON.parse(JSON.stringify(gmail)), JSON.parse(JSON.stringify(mailWatch))], {
      executableActionIds: mailWatch.actions.map((action) => action.id),
    });
@@ -1038,16 +1425,44 @@ index 613224d9..66ba214c 100644
          enabled: true,
          profileEmail: async (name) => EMAILS[name],
          now: () => T0,
-@@ -126,6 +127,8 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
+@@ -126,6 +138,10 @@ async function setup(wrap?: (binding: SqliteD1Database) => D1DatabaseBinding) {
    };
    return {
      binding,
++    /** The connection store behind the runner's connection service. */
++    store: database.connectionStore,
 +    /** The database the executors use: an InjectingD1 when `wrap` made one. */
 +    watchDatabase,
      ids,
      list: (allowedConnections?: string[], input: Record<string, unknown> = {}) => run("list_pending_mail", input, allowedConnections),
      acknowledge: (allowedConnections: string[] | undefined, itemIds: string[]) => run("acknowledge_mail", { ids: itemIds }, allowedConnections),
-@@ -440,6 +443,8 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+@@ -174,9 +190,11 @@ describe("list_pending_mail under a chosen-account token", () => {
+     expect(result).toMatchObject({ ok: true, output: { enabled: true, items: [] } });
+   });
+ 
+-  it("an unscoped token sees every item, including one whose connection no longer exists", async () => {
++  // Patch 0015 (#101): the item of `gone` (no connection, no cursor) used to be listed here; a name with items and no
++  // cursor is hidden now.
++  it("an unscoped token sees every item of the names that have a cursor, and not one whose connection no longer exists and has no cursor", async () => {
+     const s = await setup();
+-    const expected = ["b2", "a2", "b1", "a1", "gap-a", "gap-b", "ghost"];
++    const expected = ["b2", "a2", "b1", "a1", "gap-a", "gap-b"];
+     expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(expected);
+     expect(items(await s.list([])).map((item) => item.id)).toEqual(expected);
+   });
+@@ -221,9 +239,9 @@ describe("acknowledge_mail under a chosen-account token", () => {
+     expect(await statusOf(s)).toEqual(before);
+   });
+ 
+-  it("an unscoped token acknowledges any item", async () => {
++  it("an unscoped token acknowledges any item of a name that has a cursor (not the cursor-less `gone`)", async () => {
+     const s = await setup();
+-    expect(await s.acknowledge(undefined, ["a1", "b1", "ghost"])).toMatchObject({ ok: true, output: { acknowledged: 3 } });
++    expect(await s.acknowledge(undefined, ["a1", "b1", "ghost"])).toMatchObject({ ok: true, output: { acknowledged: 2 } });
+     expect(await s.acknowledge([], ["b2"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
+   });
+ 
+@@ -440,6 +458,8 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
        const result = await r.executors["mail_watch.list_pending_mail"]!({}, r.context);
        expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList);
        expect(JSON.stringify(result)).not.toContain("intruder");
@@ -1056,7 +1471,7 @@ index 613224d9..66ba214c 100644
      });
  
      it("list with limit 1 returns at most the newest allowed item, never an intruder", async () => {
-@@ -447,6 +452,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+@@ -447,6 +467,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
        await r.seed();
        const result = await r.executors["mail_watch.list_pending_mail"]!({ limit: 1 }, r.context);
        expect(items(result).map((item) => item.id)).toEqual(testCase.expectedList.slice(0, 1));
@@ -1064,7 +1479,7 @@ index 613224d9..66ba214c 100644
      });
  
      it("acknowledge never touches the intruder, and acknowledges exactly the allowed rows it was given", async () => {
-@@ -459,6 +465,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
+@@ -459,6 +480,7 @@ describe.each(MODES)("R3.8 (a) a row for a denied connection inserted mid-run (%
        const rows = await selectAll<{ id: string; status: string }>(r.inner, "select id, status from email_watch_items order by id");
        expect(rows.filter((row) => row.status === "acknowledged").map((row) => row.id).sort()).toEqual([...testCase.expectedAcknowledged].sort());
        expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
@@ -1072,7 +1487,7 @@ index 613224d9..66ba214c 100644
      });
    });
  });
-@@ -469,6 +476,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
+@@ -469,6 +491,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
      const result = await s.list([s.ids.a!]);
      expect(items(result).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
      expect(JSON.stringify(result)).not.toContain("intruder");
@@ -1080,7 +1495,7 @@ index 613224d9..66ba214c 100644
    });
  
    it("acknowledge under that token leaves the intruder rows pending", async () => {
-@@ -477,6 +485,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
+@@ -477,6 +500,7 @@ describe("R3.8 (a) through the real ActionRunner with a scoped token", () => {
      expect(await s.acknowledge([s.ids.a!], given)).toMatchObject({ ok: true, output: { acknowledged: 1 } });
      const rows = await statusOf(s);
      expect(rows.filter((row) => row.id.startsWith("intruder-") && row.status !== "pending")).toEqual([]);
@@ -1088,39 +1503,58 @@ index 613224d9..66ba214c 100644
    });
  });
  
-@@ -518,3 +527,85 @@ describe("R3.8 (b) deny by default: no isConnectionAllowed on the context", () =
-     expect(items(await s.list(undefined)).length).toBe(7);
-   });
- });
+@@ -515,6 +539,155 @@ describe("R3.8 (b) deny by default: no isConnectionAllowed on the context", () =
+ 
+   it("the normal path still works: ActionRunner always supplies the predicate", async () => {
+     const s = await setup();
+-    expect(items(await s.list(undefined)).length).toBe(7);
++    expect(items(await s.list(undefined)).length).toBe(6);
++  });
++});
 +
 +// ---------------------------------------------------------------------------------------------------------------
 +// Patch 0015, #101: an alias that now points at a different account must not show or touch the items stored for the
-+// old one, even before the next poll deletes them. The cursor records the id of the connection the name resolved to
-+// (`connection_id`). A name whose cursor has a connection_id that differs from the name's current connection id is
-+// hidden from list_pending_mail and untouched by acknowledge_mail. A null connection_id (a row from before the patch)
-+// and a name with no cursor are not hidden. Everything here goes through the real ActionRunner and its connection
-+// service: nothing about how the current id is resolved is assumed.
++// old one, even before the next poll deletes them. The cursor's `connection_id` is an account fingerprint (spec F1):
++// sha256 hex of `<connection id>|<provider account id>`. A name whose cursor has a connection_id that differs from the
++// name's current fingerprint is hidden from list_pending_mail and untouched by acknowledge_mail. A null connection_id
++// (a row from before the patch) and a name with no cursor are not hidden. Everything here goes through the real
++// ActionRunner and its connection service.
 +// ---------------------------------------------------------------------------------------------------------------
 +describe("an alias reused by another account (patch 0015, #101)", () => {
-+  const OLD_ID = "00000000-0000-4000-8000-0000000000aa";
++  const OLD_FINGERPRINT = "0".repeat(63) + "a";
 +
 +  async function withCursors(cursors: { a?: string | null; b?: string | null }) {
 +    const s = await setup();
++    // `setup` gives a and b a matching cursor each; start from none and write only what the test asks for.
++    await s.binding.prepare("delete from email_watch_cursors").run();
 +    const base = { history_id: "1000", last_run_at: iso(T0 - HOUR) };
 +    if (cursors.a !== undefined) await insertCursor(s.binding, { connection_name: "a", ...base, connection_id: cursors.a });
 +    if (cursors.b !== undefined) await insertCursor(s.binding, { connection_name: "b", ...base, connection_id: cursors.b });
 +    return s;
 +  }
 +
-+  it("lists nothing for a name whose cursor records another connection id, and everything else as before", async () => {
-+    const s = await withCursors({ a: null, b: OLD_ID });
-+    // `a` is recorded under its own current id.
-+    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'a'").bind(s.ids.a).run();
-+    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a", "ghost"]);
++  const credential = (name: string, accountId: string, displayName = accountId, grantedScopes: string[] = []) => ({
++    authType: "oauth2" as const,
++    accessToken: `token-${name}`,
++    tokenType: "Bearer",
++    metadata: {},
++    profile: { accountId, displayName, grantedScopes },
++  });
++
++  it("lists nothing for a name whose cursor records another fingerprint, and everything else as before", async () => {
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'a'").bind(fingerprint(s.ids.a!, EMAILS.a!)).run();
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++  });
++
++  it("a bare connection id in the cursor is not the name's fingerprint: the name is hidden", async () => {
++    const s = await withCursors({ a: null, b: null });
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(s.ids.b).run();
++    expect(items(await s.list(undefined)).map((item) => item.id)).not.toContain("b1");
 +  });
 +
 +  it("hides the old account's watch_gap item too, and does not delete anything while listing", async () => {
-+    const s = await withCursors({ a: null, b: OLD_ID });
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
 +    expect(items(await s.list(undefined)).map((item) => item.id)).not.toContain("gap-b");
 +    expect((await statusOf(s)).map((row) => row.id).sort()).toEqual(["a1", "a2", "b1", "b2", "gap-a", "gap-b", "ghost"]);
 +    expect(await selectAll(s.binding, "select connection_name from email_watch_cursors order by connection_name")).toEqual([
@@ -1131,49 +1565,101 @@ index 613224d9..66ba214c 100644
 +
 +  it("a cursor with a null connection_id (a pre-patch row) is not hidden", async () => {
 +    const s = await withCursors({ a: null, b: null });
-+    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b", "ghost"]);
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b"]);
 +  });
 +
-+  it("a name with no cursor at all is not hidden", async () => {
++  // Patch 0015 (review): fail closed. A name with items and no cursor (only a partial purge leaves that) is hidden.
++  it("a name that has items and no cursor is hidden by list, and acknowledge refuses its items", async () => {
++    const s = await withCursors({ a: null });
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++    expect(items(await s.list(undefined, { connectionName: "b" }))).toEqual([]);
++    expect(await s.acknowledge(undefined, ["a1", "b1", "b2", "gap-b", "ghost"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
++    expect(status).toMatchObject({ a1: "acknowledged", b1: "pending", b2: "pending", "gap-b": "pending", ghost: "pending" });
++  });
++
++  it("deleting a name's cursor row hides its items at once, whatever the cursor held before", async () => {
 +    const s = await setup();
-+    expect(items(await s.list(undefined))).toHaveLength(7);
++    expect(items(await s.list(undefined)).map((item) => item.id)).toContain("b1");
++    await s.binding.prepare("delete from email_watch_cursors where connection_name = 'b'").run();
++    expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++    expect(items(await s.list([s.ids.b!]))).toEqual([]);
++    expect(await s.acknowledge(undefined, ["b1", "b2", "gap-b"])).toMatchObject({ ok: true, output: { acknowledged: 0 } });
 +  });
 +
-+  it("shows the items again once the cursor records the name's current id", async () => {
-+    const s = await withCursors({ b: OLD_ID });
++  it("shows the items again once the cursor records the name's current fingerprint", async () => {
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
 +    expect(items(await s.list(undefined)).map((item) => item.id)).not.toContain("b1");
-+    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(s.ids.b).run();
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(fingerprint(s.ids.b!, EMAILS.b!)).run();
 +    expect(items(await s.list(undefined)).map((item) => item.id)).toContain("b1");
 +  });
 +
 +  it("hidden items do not use up the limit, and the category filter and name filter apply to what is left", async () => {
-+    const s = await withCursors({ b: OLD_ID });
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
 +    // b2 is the newest item of all and is hidden: limit 1 is a2, not an empty page.
 +    expect(items(await s.list(undefined, { limit: 1 })).map((item) => item.id)).toEqual(["a2"]);
-+    expect(items(await s.list(undefined, { category: "deploy_failed" })).map((item) => item.id)).toEqual(["a1", "ghost"]);
++    expect(items(await s.list(undefined, { category: "deploy_failed" })).map((item) => item.id)).toEqual(["a1"]);
 +    expect(items(await s.list(undefined, { connectionName: "b" }))).toEqual([]);
 +    expect(items(await s.list(undefined, { connectionName: "a" })).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
 +  });
 +
 +  it("a token scoped to the reused alias's connection sees nothing of the old account's items", async () => {
-+    const s = await withCursors({ b: OLD_ID });
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
 +    expect(items(await s.list([s.ids.b!]))).toEqual([]);
 +    expect(items(await s.list([s.ids.a!, s.ids.b!])).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
 +  });
 +
 +  it("acknowledge_mail changes nothing for a hidden name's items and counts only the visible ones", async () => {
-+    const s = await withCursors({ a: null, b: OLD_ID });
++    const s = await withCursors({ a: null, b: OLD_FINGERPRINT });
 +    expect(await s.acknowledge(undefined, ["a1", "b1", "b2", "gap-b"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
 +    const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
 +    expect(status).toMatchObject({ a1: "acknowledged", b1: "pending", b2: "pending", "gap-b": "pending" });
 +  });
 +
-+  it("acknowledge_mail still acknowledges the items of a name whose cursor records its current id or null", async () => {
++  it("acknowledge_mail still acknowledges the items of a name whose cursor records its current fingerprint or null", async () => {
 +    const s = await withCursors({ a: null, b: null });
-+    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(s.ids.b).run();
++    await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(fingerprint(s.ids.b!, EMAILS.b!)).run();
 +    expect(await s.acknowledge(undefined, ["a1", "b1"])).toMatchObject({ ok: true, output: { acknowledged: 2 } });
 +  });
-+});
++
++  describe("the name is saved over in place for another account (no delete: the connection id stays)", () => {
++    async function recordedThenSwitched(newAccountId: string) {
++      const s = await withCursors({ a: null, b: null });
++      await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'a'").bind(fingerprint(s.ids.a!, EMAILS.a!)).run();
++      await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(fingerprint(s.ids.b!, EMAILS.b!)).run();
++      const saved = await s.store.set("gmail", "b", credential("b", newAccountId));
++      expect(saved.id).toBe(s.ids.b);
++      return s;
++    }
++
++    it("list hides that name's items and keeps the other name's, with no poll in between", async () => {
++      const s = await recordedThenSwitched("someone-else@example.net");
++      expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["a2", "a1", "gap-a"]);
++      expect(items(await s.list([s.ids.b!]))).toEqual([]);
++    });
++
++    it("acknowledge leaves that name's items pending and still counts the other name's", async () => {
++      const s = await recordedThenSwitched("someone-else@example.net");
++      expect(await s.acknowledge(undefined, ["a1", "b1", "b2", "gap-b"])).toMatchObject({ ok: true, output: { acknowledged: 1 } });
++      const status = Object.fromEntries((await statusOf(s)).map((row) => [row.id, row.status]));
++      expect(status).toMatchObject({ a1: "acknowledged", b1: "pending", b2: "pending", "gap-b": "pending" });
++    });
++
++    it("saving the same account over in place (new display name and scopes) hides nothing", async () => {
++      const s = await withCursors({ a: null, b: null });
++      await s.binding.prepare("update email_watch_cursors set connection_id = ? where connection_name = 'b'").bind(fingerprint(s.ids.b!, EMAILS.b!)).run();
++      await s.store.set("gmail", "b", credential("b", EMAILS.b!, "Renamed", ["https://www.googleapis.com/auth/gmail.readonly"]));
++      expect(items(await s.list(undefined)).map((item) => item.id)).toEqual(["b2", "a2", "b1", "a1", "gap-a", "gap-b"]);
++      expect(await s.acknowledge(undefined, ["b1", "b2"])).toMatchObject({ ok: true, output: { acknowledged: 2 } });
++    });
++
++    it("a null connection_id is still not hidden after an in-place switch (the poll adopts it)", async () => {
++      const s = await withCursors({ a: null, b: null });
++      await s.store.set("gmail", "b", credential("b", "someone-else@example.net"));
++      expect(items(await s.list(undefined)).map((item) => item.id)).toContain("b1");
++    });
+   });
+ });
 diff --git a/src/server/email-watch/migration.test.ts b/src/server/email-watch/migration.test.ts
 index e4e1438f..5af9c39f 100644
 --- a/src/server/email-watch/migration.test.ts
@@ -1339,10 +1825,52 @@ index 44c0522a..4f55157e 100644
  
  function truncate(subject: string): string {
 diff --git a/src/server/email-watch/test-support.ts b/src/server/email-watch/test-support.ts
-index 6c19369a..ad705667 100644
+index 6c19369a..8a2f6a34 100644
 --- a/src/server/email-watch/test-support.ts
 +++ b/src/server/email-watch/test-support.ts
-@@ -435,15 +435,37 @@ export async function insertItem(database: SqlDatabase, row: ItemRow): Promise<v
+@@ -1,6 +1,7 @@
+ // Shared test fixtures for the email watch (directive #126). Synthetic data only: every address is on
+ // example.com / example.org or on a rule domain (vercel.com, github.com, ...) that the rules table names.
+ // Not imported by product code.
++import { createHash } from "node:crypto";
+ import type { ActionRunResult, RunActionInput } from "../actions/action-runner.ts";
+ import type { D1DatabaseBinding, D1PreparedStatementBinding } from "../cloudflare/cloudflare-bindings.ts";
+ 
+@@ -286,12 +287,33 @@ export class FakeGmailRunner {
+   beforeRun?: (call: RunnerCall) => Promise<void>;
+   /** Awaited after the answer is computed and before it is returned, so a test can hold an invocation holding stale data. */
+   afterRun?: (call: RunnerCall) => Promise<void>;
++  /**
++   * Replaces the answer of `resolveGmailConnectionId` for a name: a string is the account fingerprint it resolves to,
++   * `undefined` is "no connection", an Error is thrown (a resolution failure that is not "not found"). Names with no
++   * entry get their default fingerprint if they have a mailbox, and `undefined` if they do not. Set an entry to
++   * simulate an alias that now points at another account.
++   */
++  resolved: Record<string, string | undefined | Error> = {};
+   private readonly mailboxes: Record<string, FakeMailbox>;
+ 
+   constructor(mailboxes: Record<string, FakeMailbox>) {
+     this.mailboxes = mailboxes;
+   }
+ 
++  /** The stable account fingerprint a name resolves to by default: 64 hex characters, one per name. */
++  fingerprintOf(connectionName: string): string {
++    return createHash("sha256").update(`fake-connection-${connectionName}|${this.mailboxes[connectionName]?.email ?? ""}`).digest("hex");
++  }
++
++  async resolveGmailConnectionId(connectionName: string): Promise<string | undefined> {
++    if (connectionName in this.resolved) {
++      const answer = this.resolved[connectionName];
++      if (answer instanceof Error) throw answer;
++      return answer;
++    }
++    return this.mailboxes[connectionName] ? this.fingerprintOf(connectionName) : undefined;
++  }
++
+   callsTo(actionId: string, connectionName?: string): RunnerCall[] {
+     return this.calls.filter(
+       (call) => call.actionId === actionId && (connectionName === undefined || call.connectionName === connectionName),
+@@ -435,15 +457,37 @@ export async function insertItem(database: SqlDatabase, row: ItemRow): Promise<v
      .run();
  }
  
@@ -1386,7 +1914,7 @@ index 6c19369a..ad705667 100644
  }
  
 diff --git a/src/server/email-watch/watcher.test.ts b/src/server/email-watch/watcher.test.ts
-index 9d93584b..fba212b5 100644
+index 9d93584b..7dfcbe82 100644
 --- a/src/server/email-watch/watcher.test.ts
 +++ b/src/server/email-watch/watcher.test.ts
 @@ -160,7 +160,9 @@ describe("first run", () => {
@@ -1661,7 +2189,7 @@ index 9d93584b..fba212b5 100644
  });
  
  describe("logs carry no mail content (decision 11)", () => {
-@@ -2092,3 +2276,400 @@ describe("retention sweep limits (patch 0012, #111)", () => {
+@@ -2092,3 +2276,510 @@ describe("retention sweep limits (patch 0012, #111)", () => {
      });
    });
  });
@@ -2062,8 +2590,118 @@ index 9d93584b..fba212b5 100644
 +    expect((await itemsOf(r, "rule_id = 'watch-gap'"))[0]!.subject).toBe("Mail between 2026-11-11 12:00 UTC and now was not checked");
 +  });
 +});
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0015, #101 at the watcher: the runner resolves a name to an account fingerprint (WatchActionRunner
++// .resolveGmailConnectionId; FakeGmailRunner answers a stable one per name with a mailbox and lets a test override it).
++// The cursor's connection_id holds that value. The Worker-level tests in cloudflare-email-watch.test.ts use the real
++// connection service; these pin the watcher's own state handling with the fake.
++// ---------------------------------------------------------------------------------------------------------------
++describe("the cursor records the account the name resolved to (patch 0015, #101)", () => {
++  const OTHER = "f".repeat(64);
++  const oldItems = async (r: Rig, name = "work") => {
++    await insertItem(r.db, itemRow({ id: `old-${name}`, connection_name: name, subject: "Deployment failed for old-app", dedup_key: `k-old-${name}` }));
++  };
++  const nameOnly = (r: Rig, name: string) =>
++    r.log.entries.filter((entry) => entry.level === "warn" && JSON.stringify(entry.fields) === JSON.stringify({ connectionName: name }));
++
++  it("the first run writes the fingerprint the runner returned, and the poll after keeps it", async () => {
++    const r = rig();
++    await seed(r);
++    expect((await cursorOf(r))!.connection_id).toBe(r.runner.fingerprintOf("work"));
++    await r.run();
++    expect((await cursorOf(r))!.connection_id).toBe(r.runner.fingerprintOf("work"));
++    expect(r.runner.callsTo("gmail.get_profile")).toHaveLength(1);
++  });
++
++  it("each name gets its own fingerprint", async () => {
++    const r = rig(["work", "ops"]);
++    await r.run();
++    expect((await cursorOf(r, "work"))!.connection_id).toBe(r.runner.fingerprintOf("work"));
++    expect((await cursorOf(r, "ops"))!.connection_id).toBe(r.runner.fingerprintOf("ops"));
++    expect(r.runner.fingerprintOf("work")).not.toBe(r.runner.fingerprintOf("ops"));
++  });
++
++  it("a null connection_id is adopted: written, the items stay, no warn, no extra Gmail call", async () => {
++    const r = rig();
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - HOUR) });
++    await oldItems(r);
++    await r.run();
++    expect((await cursorOf(r))!.connection_id).toBe(r.runner.fingerprintOf("work"));
++    expect((await itemsOf(r)).map((row) => row.id)).toEqual(["old-work"]);
++    expect(nameOnly(r, "work")).toEqual([]);
++    expect(r.runner.calls.map((call) => call.actionId)).toEqual(["gmail.list_history"]);
++  });
++
++  it("a recorded fingerprint that matches changes nothing", async () => {
++    const r = rig();
++    await insertCursor(r.db, { connection_name: "work", history_id: "1000", last_run_at: iso(T0 - HOUR), connection_id: r.runner.fingerprintOf("work") });
++    await oldItems(r);
++    await r.run();
++    expect((await itemsOf(r)).map((row) => row.id)).toEqual(["old-work"]);
++    expect(nameOnly(r, "work")).toEqual([]);
++  });
++
++  it("a different fingerprint purges the name's items and cursor, warns with only the name, and starts fresh from the profile", async () => {
++    const r = rig(["work", "ops"]);
++    await seed(r);
++    await oldItems(r);
++    await oldItems(r, "ops");
++    r.mailboxes.work!.deliver(failed("Deployment failed for before-the-switch"));
++    r.runner.resolved.work = OTHER;
++    r.clock.now = T0 + 10 * 60_000;
++    const callsBefore = r.runner.calls.length;
++    await r.run();
++
++    expect((await itemsOf(r, "connection_name = 'work'"))).toEqual([]);
++    expect(await cursorOf(r)).toMatchObject({ connection_id: OTHER, history_id: "1001", page_token: null, catch_up: 0 });
++    expect(r.runner.calls.slice(callsBefore).filter((call) => call.connectionName === "work").map((call) => call.actionId)).toEqual(["gmail.get_profile"]);
++    expect((await itemsOf(r, "connection_name = 'ops'")).map((row) => row.id)).toEqual(["old-ops"]);
++    expect(nameOnly(r, "work")).toHaveLength(1);
++    expect(nameOnly(r, "ops")).toEqual([]);
++    expect(r.log.text()).not.toContain(OTHER);
++    expect(r.log.text()).not.toContain("old-app");
++  });
++
++  it("a name that no longer resolves is purged and not read", async () => {
++    const r = rig();
++    await seed(r);
++    await oldItems(r);
++    r.runner.resolved.work = undefined;
++    const callsBefore = r.runner.calls.length;
++    await r.run();
++    expect(await itemsOf(r)).toEqual([]);
++    expect(await cursorOf(r)).toBeUndefined();
++    expect(r.runner.calls.length).toBe(callsBefore);
++    expect(nameOnly(r, "work")).toHaveLength(1);
++  });
++
++  it("any other resolution failure aborts the poll and deletes nothing: items, cursor and fingerprint stay", async () => {
++    const r = rig();
++    await seed(r);
++    await oldItems(r);
++    r.runner.resolved.work = new Error("store unavailable");
++    const callsBefore = r.runner.calls.length;
++    r.clock.now = T0 + 10 * 60_000;
++    await r.run();
++    expect((await itemsOf(r)).map((row) => row.id)).toEqual(["old-work"]);
++    expect(await cursorOf(r)).toMatchObject({ connection_id: r.runner.fingerprintOf("work"), history_id: "1000" });
++    expect(r.runner.calls.length).toBe(callsBefore);
++    expect(nameOnly(r, "work")).toEqual([]);
++    expect(r.log.text()).not.toContain("store unavailable");
++  });
++
++  it("a failed resolution does not move last_success_at", async () => {
++    const r = rig();
++    await seed(r);
++    r.runner.resolved.work = new Error("store unavailable");
++    r.clock.now = T0 + 10 * 60_000;
++    await r.run();
++    expect(await cursorOf(r)).toMatchObject({ last_success_at: iso(T0), last_run_at: iso(T0 + 10 * 60_000) });
++  });
++});
 diff --git a/src/server/email-watch/watcher.ts b/src/server/email-watch/watcher.ts
-index c8c0c5d1..5a10b0e4 100644
+index c8c0c5d1..9f75e8c1 100644
 --- a/src/server/email-watch/watcher.ts
 +++ b/src/server/email-watch/watcher.ts
 @@ -17,6 +17,8 @@ const DAY_MS = 86_400_000;
@@ -2137,7 +2775,7 @@ index c8c0c5d1..5a10b0e4 100644
        return;
      }
      const counts: PageCounts = { fetched: 0, stored: 0, merged: 0 };
-@@ -158,8 +174,51 @@ export class EmailWatcher {
+@@ -158,8 +174,60 @@ export class EmailWatcher {
      }
    }
  
@@ -2151,11 +2789,9 @@ index c8c0c5d1..5a10b0e4 100644
 +    name: string,
 +    cursor: Cursor | undefined,
 +  ): Promise<{ kind: "stop" } | { kind: "go"; cursor: Cursor | undefined; connectionId: string | null }> {
-+    const resolve = this.runner.resolveGmailConnectionId?.bind(this.runner);
-+    if (!resolve) return { kind: "go", cursor, connectionId: null };
 +    let current: string | undefined;
 +    try {
-+      current = await resolve(name);
++      current = await this.runner.resolveGmailConnectionId(name);
 +    } catch (error) {
 +      const code = `resolve_${errorName(error)}`;
 +      if (cursor) await this.abort(name, cursor, code);
@@ -2173,8 +2809,19 @@ index c8c0c5d1..5a10b0e4 100644
 +      return { kind: "go", cursor, connectionId: current };
 +    }
 +    if (cursor) {
-+      await this.database.prepare("delete from email_watch_items where connection_name = ?").bind(name).run();
-+      await this.database.prepare("delete from email_watch_cursors where connection_name = ?").bind(name).run();
++      // One batch, and both deletes only while the cursor still holds the fingerprint this invocation read: an
++      // invocation that read it before another one purged and started fresh must not delete the new cursor or items.
++      await this.database.batch([
++        this.database
++          .prepare(
++            `delete from email_watch_items where connection_name = ?
++               and exists (select 1 from email_watch_cursors where connection_name = ? and connection_id is ?)`,
++          )
++          .bind(name, name, cursor.connectionId),
++        this.database
++          .prepare("delete from email_watch_cursors where connection_name = ? and connection_id is ?")
++          .bind(name, cursor.connectionId),
++      ]);
 +      this.logger.warn({ connectionName: name }, "email watch dropped what it had stored for a name that points elsewhere now");
 +    }
 +    if (current === undefined) {
@@ -2190,7 +2837,7 @@ index c8c0c5d1..5a10b0e4 100644
      const reply = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
      const historyId = reply.kind === "ok" ? readString(reply.output.historyId) : undefined;
      if (!historyId) {
-@@ -168,9 +227,11 @@ export class EmailWatcher {
+@@ -168,9 +236,11 @@ export class EmailWatcher {
      }
      await this.database
        .prepare(
@@ -2204,7 +2851,7 @@ index c8c0c5d1..5a10b0e4 100644
        .run();
    }
  
-@@ -182,7 +243,6 @@ export class EmailWatcher {
+@@ -182,7 +252,6 @@ export class EmailWatcher {
      budget: Budget,
      counts: PageCounts,
    ): Promise<PollStep> {
@@ -2212,7 +2859,7 @@ index c8c0c5d1..5a10b0e4 100644
      let list = await this.listPage(name, cursor, pageToken, budget, MAX_PAGE_SIZE);
      if (list.kind === "no_budget") return { state: "pause", pageToken };
      if (list.kind === "failed") {
-@@ -260,8 +320,7 @@ export class EmailWatcher {
+@@ -260,8 +329,7 @@ export class EmailWatcher {
          await this.moveCursor(cursor, { historyId: cursor.historyId, pageToken: step.pageToken, catchUp: true });
          return;
        case "abort":
@@ -2222,7 +2869,7 @@ index c8c0c5d1..5a10b0e4 100644
          return;
        case "reset_expired":
          await this.resetExpired(name, cursor, budget);
-@@ -276,13 +335,17 @@ export class EmailWatcher {
+@@ -276,13 +344,17 @@ export class EmailWatcher {
      const profile = await this.callGmail(budget, name, WATCH_ACTION_IDS.getProfile, {});
      const historyId = profile.kind === "ok" ? readString(profile.output.historyId) : undefined;
      if (!historyId) {
@@ -2244,7 +2891,7 @@ index c8c0c5d1..5a10b0e4 100644
      this.logger.warn({ connectionName: name }, "email watch cursor expired and was reset");
    }
  
-@@ -369,21 +432,26 @@ export class EmailWatcher {
+@@ -369,21 +441,26 @@ export class EmailWatcher {
      return (merged.meta.changes ?? 0) > 0 ? "merged" : "none";
    }
  
@@ -2274,7 +2921,7 @@ index c8c0c5d1..5a10b0e4 100644
          at,
          at,
          await dedupKey("watch_gap", name, subject),
-@@ -406,21 +474,40 @@ export class EmailWatcher {
+@@ -406,21 +483,40 @@ export class EmailWatcher {
    ): Promise<boolean> {
      const result = await this.database
        .prepare(
@@ -2322,7 +2969,7 @@ index c8c0c5d1..5a10b0e4 100644
        .run();
    }
  
-@@ -508,7 +595,10 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
+@@ -508,7 +604,10 @@ export async function hasCatchUp(database: D1DatabaseBinding, connections: reado
  
  async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cursor>> {
    const { results } = await database
@@ -2334,7 +2981,7 @@ index c8c0c5d1..5a10b0e4 100644
      .all<CursorRow>();
    return new Map(
      results.map((row) => [
-@@ -519,6 +609,9 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
+@@ -519,6 +618,9 @@ async function loadCursors(database: D1DatabaseBinding): Promise<Map<string, Cur
          pageToken: row.page_token,
          lastRunAt: row.last_run_at,
          catchUp: row.catch_up === 1,

@@ -240,16 +240,25 @@ limit) leaves the cursor where it was and goes back to the normal interval: it d
 an account the 15-run budget did not reach is flagged for an off-interval run. When the first failed poll of a streak
 comes 24 hours or more after the last successful read, the watcher leaves one pending `watch_gap` item with rule id
 `watch-failing` and the subject `Email watch could not read this account since <time of the last successful read>`.
-It carries no error text, address or subject. There is one per failure streak; the next successful read clears the
+It carries no error text, address or subject. Migration 0022 backfills `last_success_at` from `last_run_at`, which
+overstates the last success for an account that was already failing when the migration ran, so its first item can name
+a later time than the real last read. There is one per failure streak; the next successful read clears the
 streak, and a later 24-hour failure gets a new item.
 
 **An alias reused by another account.** At the start of each poll the watcher asks the connection store (no Gmail
-call) which connection the alias points at and compares its id with the cursor's `connection_id`. A cursor from before
-patch 0015 has none and simply adopts the current id. If the id differs, or the alias no longer points at any
-connection, the alias's items and cursor are deleted, one warn line carrying only the alias is logged, and, if the
-alias resolves, the watch starts fresh for it (no backfill). If the store cannot be read the poll is skipped and
-nothing is deleted. Until the next poll runs, `list_pending_mail` and `acknowledge_mail` hide and leave alone the items
-of an alias whose recorded id differs from the current one, so a different account never sees the previous one's mail.
+call) which connection the alias points at and compares an **account fingerprint** with the cursor's `connection_id`.
+The fingerprint is the sha256 hex of the connection's row id, a bar and the provider account id from its profile; no
+address or id is stored. So deleting the connection and saving the alias again, and saving the alias over in place
+for a different Google account, both count as a different account; reconnecting the same account in place does not. A
+cursor from before patch 0015 has no fingerprint and simply adopts the current one: **if its alias was already reused
+before the patch, the new account is adopted with the old items and nothing can detect it.** If the fingerprint
+differs, or the alias no longer points at any connection, the alias's items and cursor are deleted in one batch (each
+delete only while the cursor still holds the fingerprint that poll read, so a slower overlapping poll cannot delete
+what a newer one stored), one warn line carrying only the alias is logged, and, if the alias resolves, the watch
+starts fresh for it (no backfill). If the store cannot be read the poll is skipped and nothing is deleted. Until the
+next poll runs, `list_pending_mail` and `acknowledge_mail` hide and leave alone the items of an alias whose recorded
+fingerprint differs from the current one, and the items of an alias that has no cursor at all (what a purge that
+stopped half way leaves), so the new account does not see the previous one's mail in either case.
 
 **Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
 pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
