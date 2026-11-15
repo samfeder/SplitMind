@@ -10,10 +10,12 @@ Run after every deploy of 0017, and after any change to the budget:
 
 1. `npm run verify` passes. It probes the gateway's refusal of client assertions, the OAuth library's
    answer for an unknown client, and an authorize request for an unknown client. None of the probes writes to KV.
-2. One fresh sign-in from claude.ai: remove the connector, add it again, enter the administrator token on the consent
+2. One tool call on an existing connection: a claude.ai connection that has been idle for over 1 hour (its access
+   token has expired, so the call must refresh), or Claude Code. For example a read-only `execute_action`. It must
+   succeed. This proves token refresh still works. Do this before step 3, because a fresh sign-in revokes the earlier
+   claude.ai grant, so afterwards there is no old connection left to test.
+3. One fresh sign-in from claude.ai: remove the connector, add it again, enter the administrator token on the consent
    page and allow. It must reach the connected state.
-3. One tool call on an existing connection (one that was signed in before the deploy), for example a read-only
-   `execute_action`. It must succeed. This proves token refresh still works.
 
 If step 2 or 3 fails, use the kill switch below first, then investigate.
 
@@ -29,6 +31,13 @@ and the owner-only consent page are not part of the binding and stay on. To turn
 and deploy again.
 
 ## Full removal
+
+Patches stacked after 0017 must be reversed first, newest first, before 0017 itself: a later patch may edit lines
+0017 added, so 0017 will not reverse cleanly underneath it.
+
+After full removal the client-assertion probe in `npm run verify` fails, because the gateway no longer refuses client
+assertions. That failure is expected. Remove the probe from `scripts/verify-deployment.ts` (and its tests) in the same
+change, or accept the red check knowing what it means.
 
 Warning: reverse-applying 0017 also removes owner-only consent and the client_assertion refusal. That brings back
 anonymous KV writes on `GET /oauth/mcp/authorize` (a consent transaction per request) and on token requests with an

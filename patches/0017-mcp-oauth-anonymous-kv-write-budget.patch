@@ -1,10 +1,10 @@
 SplitMind patch 0017 for OpenConnector v1.9.2.
-Upstream issue: not filed yet. Draft text: docs/upstream/mcp-oauth-issue-drafts.md, Draft 3 (#78).
+Upstream issue: not filed yet. Draft text: docs/upstream/mcp-oauth-issue-drafts.md, Draft 3 (#78, #130).
 Replace this line with the upstream issue or pull request link once it exists.
 
-From 077777f662df1bdaae44c2d07c126703eb201136 Mon Sep 17 00:00:00 2001
+From 976f74cf98eecaa809b4dbe5ba1210eeac232454 Mon Sep 17 00:00:00 2001
 From: Sam Feder <noreply@splitmind.invalid>
-Date: Sun, 15 Nov 2026 10:10:23 -0500
+Date: Sun, 15 Nov 2026 10:37:03 -0500
 Subject: [PATCH] feat(mcp-oauth): budget client registration, owner-only
  sign-in
 
@@ -36,8 +36,16 @@ re-validates the request from its own URL, checks the administrator token
 for Allow and for Deny, then calls completeAuthorization (Allow) or
 redirects with authorizationErrorRedirect (Deny). The authorize path
 never touches the budget. A GET error that carries a redirect target is
-redirected to only when the allowlist accepts that URI; otherwise it is a
+redirected to only when the allowlist accepts the error's redirectUri; otherwise it is a
 local error.
+
+Consent page (#130): the Access and Accounts controls were outside the form,
+so the read-only choice was never submitted. The form now opens above them.
+A wrong or missing administrator token logs one warn object, event
+mcp_oauth_consent_token_refused.
+
+Discovery: private_key_jwt is removed from token_endpoint_auth_methods_supported,
+since client assertions are refused. CIMD support stays advertised.
 
 Token endpoint: a request with client_assertion or client_assertion_type
 gets 401 invalid_client (read from a clone, one console.warn object with
@@ -51,13 +59,13 @@ headers.
  .../cloudflare/mcp-consent-page.test.ts       |   57 +-
  src/server/cloudflare/mcp-consent-page.ts     |    6 +-
  .../mcp-oauth-anonymous-write-budget.ts       |   76 +
- .../cloudflare/mcp-oauth-grant-flow.test.ts   |  279 ++++
+ .../cloudflare/mcp-oauth-grant-flow.test.ts   |  516 ++++++
  .../mcp-oauth-registration-counter.test.ts    |  344 ++++
- .../cloudflare/mcp-oauth-request-env.test.ts  |   95 ++
- src/server/cloudflare/mcp-oauth.test.ts       | 1486 ++++++++++++++++-
- src/server/cloudflare/mcp-oauth.ts            |  293 +++-
+ .../cloudflare/mcp-oauth-request-env.test.ts  |   95 +
+ src/server/cloudflare/mcp-oauth.test.ts       | 1583 ++++++++++++++++-
+ src/server/cloudflare/mcp-oauth.ts            |  313 +++-
  .../cloudflare/test-registration-counter.ts   |  198 +++
- 12 files changed, 2791 insertions(+), 64 deletions(-)
+ 12 files changed, 3145 insertions(+), 64 deletions(-)
  create mode 100644 src/server/cloudflare/mcp-oauth-anonymous-write-budget.ts
  create mode 100644 src/server/cloudflare/mcp-oauth-grant-flow.test.ts
  create mode 100644 src/server/cloudflare/mcp-oauth-registration-counter.test.ts
@@ -79,7 +87,7 @@ index c7baa1943..a3d37c9f6 100644
    waitUntil(promise: Promise<unknown>): void;
    passThroughOnException(): void;
 diff --git a/src/server/cloudflare/cloudflare-bindings.ts b/src/server/cloudflare/cloudflare-bindings.ts
-index f400d97ee..691f8f710 100644
+index 99004fd06..7934f5635 100644
 --- a/src/server/cloudflare/cloudflare-bindings.ts
 +++ b/src/server/cloudflare/cloudflare-bindings.ts
 @@ -41,3 +41,9 @@ export interface KVNamespaceBinding {
@@ -202,7 +210,7 @@ index e2effd65c..dcc52f928 100644
 +  expect(html).toContain('name="decision" value="deny"');
 +});
 diff --git a/src/server/cloudflare/mcp-consent-page.ts b/src/server/cloudflare/mcp-consent-page.ts
-index f02df7287..4d15fb094 100644
+index f02df7287..728a2e51d 100644
 --- a/src/server/cloudflare/mcp-consent-page.ts
 +++ b/src/server/cloudflare/mcp-consent-page.ts
 @@ -1,10 +1,10 @@
@@ -218,12 +226,18 @@ index f02df7287..4d15fb094 100644
    grantedScopes: readonly string[],
    lifetime: Pick<McpOAuthSettings, "grantTTL" | "grantIdleTTL"> = {
      grantTTL: 30 * 86400,
-@@ -33,7 +33,7 @@ ${details.redirectIsLoopback ? "<p>This sends access to an app on your computer.
+@@ -27,13 +27,13 @@ export function renderMcpConsentPage(
+ ${details.redirectIsLoopback ? "<p>This sends access to an app on your computer. Continue only if you started this connection.</p>" : ""}
+ <p>This authorizes:</p><ul>${scopeList}</ul>
+ <p>Actions run with your connected accounts. Your gateway's policies still apply. It does not grant access to administrator settings, raw proxies, or triggers.</p>
++<form method="post" action="/oauth/mcp/authorize?${escapeHtml(query)}">
+ <fieldset><legend>Access</legend>
+ <label><input type="radio" name="access" value="read" checked> Read only: search and read, never send, post, change or delete</label>
+ <label><input type="radio" name="access" value="all"> Read and write: every Action your gateway allows</label></fieldset>
  <label for="accounts">Accounts</label><input id="accounts" name="accounts" autocomplete="off" maxlength="2000" placeholder="All accounts">
  <small>Leave empty for every connected account, or list nicknames such as <code>work, slack:team</code>.</small>
  <p>A separate API Key will appear in your console. Delete it there to revoke this connection.</p>
 -<form method="post" action="/oauth/mcp/authorize"><input type="hidden" name="handle" value="${escapeHtml(handle)}">
-+<form method="post" action="/oauth/mcp/authorize?${escapeHtml(query)}">
  <label for="admin-token">Administrator token</label><input id="admin-token" type="password" name="admin_token" autocomplete="off" required maxlength="1024">
  <small>Your administrator token stays with OpenConnector and is never sent to the client.</small>
  <p><button name="decision" value="approve">Allow access</button><button name="decision" value="deny" formnovalidate>Deny</button></p></form></main></body></html>`;
@@ -311,12 +325,12 @@ index 000000000..4fb9c6d6b
 +}
 diff --git a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
 new file mode 100644
-index 000000000..4a68519a0
+index 000000000..38c8ae988
 --- /dev/null
 +++ b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,516 @@
 +// The consent form's access and accounts choices must reach the backing runtime token through POST approve
-+// (SplitMind #78 review follow-up 9). This lives in its own file because the Worker caches the catalog per module
++// (SplitMind #78 review follow-up 9), and the consent page's form must actually submit them (#130). This lives in its own file because the Worker caches the catalog per module
 +// instance, and these tests need a catalog with read, write and destructive actions. The actions are made up, filed
 +// under the real api_key provider 17track, because the Worker only connects providers it can execute.
 +import type { AssetsBinding, KVNamespaceBinding } from "./cloudflare-bindings.ts";
@@ -592,6 +606,243 @@ index 000000000..4a68519a0
 +    expect((await approve(clientId, { access: "all" }, "wrong")).status).toBe(401);
 +    expect((await approve(clientId, { access: "all" }, null)).status).toBe(401);
 +    expect(await createdSince(before)).toEqual([]);
++  });
++});
++
++interface Control {
++  tag: string;
++  type: string;
++  name: string;
++  value: string;
++  checked: boolean;
++  disabled: boolean;
++  /** An explicit form="id" attribute, which would attach a control to a form it does not sit in. */
++  formAttribute: string | undefined;
++  insideForm: boolean;
++}
++
++interface ParsedPage {
++  forms: { action: string; method: string }[];
++  controls: Control[];
++}
++
++/** The character references the page's escaping uses, decoded in one pass. */
++function decodeEntities(text: string): string {
++  const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
++  return text.replace(
++    /&#x([0-9a-f]+);|&#(\d+);|&(amp|lt|gt|quot|apos);/gi,
++    (_match, hex?: string, decimal?: string, name?: string) =>
++      hex
++        ? String.fromCodePoint(Number.parseInt(hex, 16))
++        : decimal
++          ? String.fromCodePoint(Number(decimal))
++          : named[name!.toLowerCase()]!,
++  );
++}
++
++/**
++ * A small HTML scanner for the consent page. No HTML parser is a dependency of this package, so this walks the tags in
++ * order and tracks whether each control sits between a <form> and its </form>. The page escapes every attribute value
++ * (including < and >), so a tag never contains a bare ">" before it ends. Script and style bodies are skipped.
++ */
++function parsePage(html: string): ParsedPage {
++  const page: ParsedPage = { forms: [], controls: [] };
++  const withoutRawText = html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
++  let formDepth = 0;
++  for (const match of withoutRawText.matchAll(
++    /<(\/?)([a-zA-Z][\w-]*)((?:\s+[^\s=>/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)*)\s*\/?>/g,
++  )) {
++    const [, closing, rawTag, rawAttributes] = match;
++    const tag = rawTag!.toLowerCase();
++    const attributes = new Map<string, string>();
++    const present = new Set<string>();
++    for (const attribute of rawAttributes!.matchAll(/([^\s=>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
++      const name = attribute[1]!.toLowerCase();
++      present.add(name);
++      attributes.set(name, decodeEntities(attribute[2] ?? attribute[3] ?? attribute[4] ?? ""));
++    }
++    if (tag === "form") {
++      if (closing) formDepth = Math.max(0, formDepth - 1);
++      else {
++        formDepth++;
++        page.forms.push({
++          action: attributes.get("action") ?? "",
++          method: (attributes.get("method") ?? "get").toLowerCase(),
++        });
++      }
++      continue;
++    }
++    if (closing || !["input", "button", "select", "textarea"].includes(tag)) continue;
++    page.controls.push({
++      tag,
++      type: (attributes.get("type") ?? (tag === "button" ? "submit" : "text")).toLowerCase(),
++      name: attributes.get("name") ?? "",
++      value: attributes.get("value") ?? "",
++      checked: present.has("checked"),
++      disabled: present.has("disabled"),
++      formAttribute: attributes.get("form"),
++      insideForm: formDepth > 0,
++    });
++  }
++  return page;
++}
++
++/**
++ * What a browser submits for a form: every enabled named control inside it, a radio group's checked member only,
++ * and the submitter's own name and value. `typed` is what the person types into text and password boxes.
++ */
++function submittedFields(
++  page: ParsedPage,
++  submitter: { name: string; value: string },
++  typed: Record<string, string>,
++  chosen: Record<string, string> = {},
++): URLSearchParams {
++  const body = new URLSearchParams();
++  for (const control of page.controls) {
++    if (!control.insideForm || control.disabled || !control.name) continue;
++    if (control.type === "submit" || control.type === "button") continue;
++    if (control.type === "radio") {
++      const selected = chosen[control.name] ?? (control.checked ? control.value : undefined);
++      if (selected === control.value) body.append(control.name, control.value);
++      continue;
++    }
++    if (control.type === "checkbox") {
++      if (control.checked) body.append(control.name, control.value || "on");
++      continue;
++    }
++    body.append(control.name, control.name in typed ? typed[control.name]! : control.value);
++  }
++  body.append(submitter.name, submitter.value);
++  return body;
++}
++
++function authorizeQuery(clientId: string): string {
++  return new URLSearchParams({
++    response_type: "code",
++    client_id: clientId,
++    redirect_uri: claudeCallback,
++    scope: "mcp:access offline_access",
++    resource: `${origin}/mcp`,
++    state: "page-state",
++    code_challenge: "x".repeat(43),
++    code_challenge_method: "S256",
++  }).toString();
++}
++
++async function renderConsentPage(clientId: string): Promise<string> {
++  const response = await worker.fetch(
++    new Request(`${origin}/oauth/mcp/authorize?${authorizeQuery(clientId)}`),
++    env,
++    context(),
++  );
++  expect(response.status).toBe(200);
++  return response.text();
++}
++
++describe("the consent page's single form carries every field the approval needs (#130)", () => {
++  it("has exactly one form, which posts to /oauth/mcp/authorize with the original query", async () => {
++    const clientId = await registerClient();
++    const page = parsePage(await renderConsentPage(clientId));
++    expect(page.forms).toEqual([{ action: `/oauth/mcp/authorize?${authorizeQuery(clientId)}`, method: "post" }]);
++  });
++
++  it("puts both access radios, the accounts box, the administrator token and both decision buttons inside it", async () => {
++    const page = parsePage(await renderConsentPage(await registerClient()));
++    const inside = page.controls.filter((control) => control.insideForm);
++    const radios = inside.filter((control) => control.type === "radio" && control.name === "access");
++    expect(radios.map((radio) => radio.value).sort()).toEqual(["all", "read"]);
++    expect(radios.filter((radio) => radio.checked).map((radio) => radio.value)).toEqual(["read"]);
++    expect(inside.filter((control) => control.name === "accounts")).toHaveLength(1);
++    expect(inside.filter((control) => control.name === "accounts")[0]!.type).toBe("text");
++    const token = inside.filter((control) => control.name === "admin_token");
++    expect(token).toHaveLength(1);
++    expect(token[0]!.type).toBe("password");
++    const decisions = inside.filter((control) => control.name === "decision" && control.type === "submit");
++    expect(decisions.map((button) => button.value).sort()).toEqual(["approve", "deny"]);
++  });
++
++  it("has no named control outside the form and none that attaches itself to another form", async () => {
++    const page = parsePage(await renderConsentPage(await registerClient()));
++    expect(page.controls.filter((control) => control.name && !control.insideForm)).toEqual([]);
++    expect(page.controls.filter((control) => control.formAttribute !== undefined)).toEqual([]);
++  });
++
++  it("round trip: the browser-built body with access=all and an account name gives that backing token's scope", async () => {
++    await connect("work");
++    await connect("home");
++    const ids = await connectionIds();
++    const clientId = await registerClient();
++    const page = parsePage(await renderConsentPage(clientId));
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++
++    const body = submittedFields(
++      page,
++      { name: "decision", value: "approve" },
++      { admin_token: adminToken, accounts: "work" },
++      { access: "all" },
++    );
++    expect(body.getAll("access")).toEqual(["all"]);
++    expect(body.get("accounts")).toBe("work");
++    const response = await worker.fetch(
++      new Request(new URL(page.forms[0]!.action, origin), {
++        method: "POST",
++        headers: { "content-type": "application/x-www-form-urlencoded", origin },
++        body,
++      }),
++      env,
++      context(),
++    );
++
++    expect(response.status).toBe(302);
++    expect(new URL(response.headers.get("location") ?? "").searchParams.get("code")).toBeTruthy();
++    const created = await createdSince(before);
++    expect(created).toHaveLength(1);
++    expect(created[0]!.allowedActions).toEqual(["*"]);
++    expect(created[0]!.allowedConnections).toEqual([ids.work]);
++  });
++
++  it("round trip: leaving the radios and the box alone submits read-only for every account", async () => {
++    await connect("work");
++    const clientId = await registerClient();
++    const page = parsePage(await renderConsentPage(clientId));
++    const before = new Set((await oauthTokens()).map((row) => row.id));
++
++    const body = submittedFields(page, { name: "decision", value: "approve" }, { admin_token: adminToken });
++    expect(body.getAll("access")).toEqual(["read"]);
++    expect(body.get("accounts")).toBe("");
++    const response = await worker.fetch(
++      new Request(new URL(page.forms[0]!.action, origin), {
++        method: "POST",
++        headers: { "content-type": "application/x-www-form-urlencoded", origin },
++        body,
++      }),
++      env,
++      context(),
++    );
++
++    expect(response.status).toBe(302);
++    const created = await createdSince(before);
++    expect(created).toHaveLength(1);
++    expect(created[0]!.allowedActions).not.toContain("*");
++    expect(created[0]!.allowedActions).not.toContain("17track.write_thing");
++    expect(created[0]!.allowedConnections).toEqual([]);
++  });
++
++  it("round trip: the Deny button submitted from the same form redirects with access_denied", async () => {
++    const clientId = await registerClient();
++    const page = parsePage(await renderConsentPage(clientId));
++    const body = submittedFields(page, { name: "decision", value: "deny" }, { admin_token: adminToken });
++    const response = await worker.fetch(
++      new Request(new URL(page.forms[0]!.action, origin), {
++        method: "POST",
++        headers: { "content-type": "application/x-www-form-urlencoded", origin },
++        body,
++      }),
++      env,
++      context(),
++    );
++    expect(response.status).toBe(302);
++    expect(new URL(response.headers.get("location") ?? "").searchParams.get("error")).toBe("access_denied");
 +  });
 +});
 diff --git a/src/server/cloudflare/mcp-oauth-registration-counter.test.ts b/src/server/cloudflare/mcp-oauth-registration-counter.test.ts
@@ -1046,7 +1297,7 @@ index 000000000..8892dcac8
 +  });
 +});
 diff --git a/src/server/cloudflare/mcp-oauth.test.ts b/src/server/cloudflare/mcp-oauth.test.ts
-index 517110e79..1999f993c 100644
+index 517110e79..1c9e6eb72 100644
 --- a/src/server/cloudflare/mcp-oauth.test.ts
 +++ b/src/server/cloudflare/mcp-oauth.test.ts
 @@ -1,17 +1,53 @@
@@ -1119,10 +1370,29 @@ index 517110e79..1999f993c 100644
      const html = await page.text();
      expect(html).toContain('<input type="radio" name="access" value="read" checked>');
      expect(html).not.toContain('value="all" checked');
-@@ -104,6 +144,1339 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
+@@ -104,6 +144,1436 @@ describe("MCP OAuth lifetimes and redirect allowlist", () => {
    });
  });
  
++describe("MCP OAuth discovery metadata", () => {
++  it("does not offer private_key_jwt at the token endpoint, since client assertions are refused", async () => {
++    // The library adds private_key_jwt to the list only when CIMD is on, as it is on the deployed Worker.
++    stubCimd({});
++    const env = createEnv({});
++    const response = await worker.fetch(new Request(`${origin}/.well-known/oauth-authorization-server`), env, context());
++    expect(response.status).toBe(200);
++    const metadata = await response.json();
++    expect(metadata.token_endpoint).toBe(`${origin}/oauth/mcp/token`);
++    // CIMD itself stays on: claude.ai and Claude Code sign in with it.
++    expect(metadata.client_id_metadata_document_supported).toBe(true);
++    const methods = metadata.token_endpoint_auth_methods_supported as string[];
++    expect(Array.isArray(methods)).toBe(true);
++    expect(methods).not.toContain("private_key_jwt");
++    // Public clients (claude.ai, Claude Code) use none; that must stay.
++    expect(methods).toContain("none");
++  });
++});
++
 +describe("MCP OAuth anonymous write budget", () => {
 +  /** An env with the counter bound, the redirect allowlist on, and the given cap variables. */
 +  function cappedEnv(
@@ -1505,6 +1775,22 @@ index 517110e79..1999f993c 100644
 +      }
 +    });
 +
++    it("refuses, logs one error, no warn and sends no Retry-After when the counter says ok: false with no limit", async () => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
++      const kv = new MemoryKV();
++      const env = cappedEnv({}, createStubNamespace(() => Response.json({ ok: false })), kv);
++      const response = await registerResponse(env, [claudeCallback], { "cf-connecting-ip": "203.0.113.31" });
++      await expectLimited(response);
++      expect(response.headers.get("retry-after")).toBeNull();
++      expect(error).toHaveBeenCalledTimes(1);
++      expect(gatewayWarnings(warn)).toEqual([]);
++      expect(serialized(error.mock.calls)).not.toContain("203.0.113.31");
++      expect(await clientCount(kv)).toBe(0);
++      warn.mockRestore();
++      error.mockRestore();
++    });
++
 +    it("logs nothing for a registration that is accepted or that the redirect allowlist rejects", async () => {
 +      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 +      const env = cappedEnv({ global: "5", ip: "5" }, createCounterNamespace());
@@ -1880,7 +2166,7 @@ index 517110e79..1999f993c 100644
 +    env: CloudflareEnv,
 +    query: string,
 +    fields: Record<string, string | undefined> = {},
-+    init: { origin?: string | null; contentType?: string; body?: string } = {},
++    init: { origin?: string | null; contentType?: string; body?: string; headers?: Record<string, string> } = {},
 +  ): Promise<Response> {
 +    const form = new URLSearchParams();
 +    for (const [name, value] of Object.entries({ decision: "approve", admin_token: adminToken, access: "all", ...fields })) {
@@ -1889,6 +2175,7 @@ index 517110e79..1999f993c 100644
 +    }
 +    const headers: Record<string, string> = {
 +      "content-type": init.contentType ?? "application/x-www-form-urlencoded",
++      ...init.headers,
 +    };
 +    if (init.origin !== null) headers.origin = init.origin ?? origin;
 +    return worker.fetch(
@@ -2311,6 +2598,67 @@ index 517110e79..1999f993c 100644
 +    });
 +  });
 +
++  describe("a refused administrator token is logged (review round 3)", () => {
++    const wrongToken = "wrong-token-value-77";
++    const probeIp = "203.0.113.55";
++    const refusedWarning = { event: "mcp_oauth_consent_token_refused" };
++
++    function expectOnlyTheEvent(own: unknown[][], secrets: string[]): void {
++      const text = serialized(own);
++      for (const secret of secrets) expect(text).not.toContain(secret.toLowerCase());
++    }
++
++    it.each([
++      ["approve", "a wrong token", wrongToken],
++      ["approve", "no token", undefined],
++      ["approve", "an empty token", ""],
++      ["deny", "a wrong token", wrongToken],
++      ["deny", "no token", undefined],
++      ["deny", "an empty token", ""],
++    ])("logs exactly one structured warning for a %s POST with %s, naming no token, address or client", async (decision, _name, token) => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const { env, kv } = spiedEnv();
++      const clientId = await register(env, [claudeCallback]);
++      kv.reset();
++      const response = await postAuthorize(env, queryFor(clientId), { decision, admin_token: token }, { headers: { "cf-connecting-ip": probeIp } });
++      expectLocalError(response, 401);
++      const own = gatewayWarnings(warn);
++      expect(own).toEqual([[refusedWarning]]);
++      expectOnlyTheEvent(own, [wrongToken, adminToken, probeIp, clientId, claudeCallback]);
++      expectNoKvWrites(kv);
++      warn.mockRestore();
++    });
++
++    it("logs one line per refused POST", async () => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const { env } = spiedEnv();
++      const clientId = await register(env, [claudeCallback]);
++      for (let i = 0; i < 3; i++) await postAuthorize(env, queryFor(clientId), { admin_token: wrongToken });
++      expect(gatewayWarnings(warn)).toEqual([[refusedWarning], [refusedWarning], [refusedWarning]]);
++      warn.mockRestore();
++    });
++
++    it("logs no such line when the token is right, for approve and for deny", async () => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const { env } = spiedEnv();
++      const clientId = await register(env, [claudeCallback]);
++      expect((await postAuthorize(env, queryFor(clientId), { decision: "approve" })).status).toBe(302);
++      expect((await postAuthorize(env, queryFor(clientId), { decision: "deny" })).status).toBe(302);
++      expect(gatewayWarnings(warn)).toEqual([]);
++      warn.mockRestore();
++    });
++
++    it("logs no such line for a GET of the consent page, or for a POST the query validation already rejected", async () => {
++      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
++      const { env } = spiedEnv();
++      const clientId = await register(env, [claudeCallback]);
++      expect((await getAuthorize(env, queryFor(clientId))).status).toBe(200);
++      expectLocalError(await postAuthorize(env, queryFor("no-such-client"), { admin_token: wrongToken }), 400);
++      expect(gatewayWarnings(warn)).toEqual([]);
++      warn.mockRestore();
++    });
++  });
++
 +  describe("POST deny with the administrator token", () => {
 +    it.each(clientKinds)("redirects %s to its callback with access_denied, state and iss, and writes nothing", async (_name, prepare) => {
 +      const { env, kv } = spiedEnv();
@@ -2459,7 +2807,7 @@ index 517110e79..1999f993c 100644
  async function authorizeAndExchange(
    env: CloudflareEnv,
    redirectUri: string,
-@@ -128,19 +1501,16 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
+@@ -128,19 +1598,16 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
    const clientId = await register(env, [redirectUri]);
    const verifier = randomBytes(48).toString("base64url");
    const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -2485,7 +2833,7 @@ index 517110e79..1999f993c 100644
        }),
        env,
        context(),
-@@ -148,6 +1518,53 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
+@@ -148,6 +1615,53 @@ async function openConsent(env: CloudflareEnv, redirectUri: string) {
    return { clientId, verifier, consent };
  }
  
@@ -2539,7 +2887,7 @@ index 517110e79..1999f993c 100644
  function authorizeUrl(clientId: string, redirectUri: string, challenge: string): string {
    return `${origin}/oauth/mcp/authorize?${new URLSearchParams({
      response_type: "code",
-@@ -167,11 +1584,15 @@ async function register(env: CloudflareEnv, redirectUris: string[]): Promise<str
+@@ -167,11 +1681,15 @@ async function register(env: CloudflareEnv, redirectUris: string[]): Promise<str
    return (await response.json()).client_id;
  }
  
@@ -2557,7 +2905,7 @@ index 517110e79..1999f993c 100644
        body: JSON.stringify({
          client_name: "Test client",
          redirect_uris: redirectUris,
-@@ -185,6 +1606,19 @@ function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<R
+@@ -185,6 +1703,19 @@ function registerResponse(env: CloudflareEnv, redirectUris: string[]): Promise<R
    );
  }
  
@@ -2577,7 +2925,7 @@ index 517110e79..1999f993c 100644
  function post(env: CloudflareEnv, path: string, form: Record<string, string>): Promise<Response> {
    return worker.fetch(
      new Request(`${origin}${path}`, {
-@@ -248,3 +1682,25 @@ class MemoryKV implements KVNamespaceBinding {
+@@ -248,3 +1779,25 @@ class MemoryKV implements KVNamespaceBinding {
      };
    }
  }
@@ -2604,7 +2952,7 @@ index 517110e79..1999f993c 100644
 +  }
 +}
 diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
-index ca245397e..dc574c393 100644
+index ca245397e..3fe4e1f57 100644
 --- a/src/server/cloudflare/mcp-oauth.ts
 +++ b/src/server/cloudflare/mcp-oauth.ts
 @@ -1,17 +1,21 @@
@@ -2685,7 +3033,7 @@ index ca245397e..dc574c393 100644
            }
            if (request.method !== "POST") return localError("Method not allowed.", 405);
            if (request.headers.get("origin") !== origin) return localError("Invalid request origin.", 403);
-@@ -153,16 +164,22 @@ export function createMcpOAuthHandler(
+@@ -153,16 +164,24 @@ export function createMcpOAuthHandler(
              signal: request.signal,
            });
            const form = new URLSearchParams(new TextDecoder().decode(bytes));
@@ -2703,6 +3051,8 @@ index ca245397e..dc574c393 100644
 +          if (decision !== "approve" && decision !== "deny") return localError("Choose Allow or Deny.", 400);
 +          // For both decisions, so an anonymous POST does nothing at all.
            if (!sameToken(form.get("admin_token") ?? "", env.OOMOL_CONNECT_ADMIN_TOKEN.trim())) {
++            // Names no token, address or client: only that a consent was refused.
++            console.warn({ event: "mcp_oauth_consent_token_refused" });
              return localError("Invalid administrator token. Go back and try again.", 401);
            }
 -          // Resolved before the handle is spent, so a mistyped nickname can be fixed by going back.
@@ -2715,7 +3065,7 @@ index ca245397e..dc574c393 100644
            let scope;
            try {
              scope = await resolveMcpGrantScope(readMcpGrantRequest(form), origin, env, runtime);
-@@ -170,9 +187,6 @@ export function createMcpOAuthHandler(
+@@ -170,9 +189,6 @@ export function createMcpOAuthHandler(
              if (error instanceof McpGrantScopeError) return localError(`${error.message} Go back and try again.`, 400);
              throw error;
            }
@@ -2725,7 +3075,7 @@ index ca245397e..dc574c393 100644
            const tokens = runtimeTokens(env);
            const backing = await tokens.createToken(`MCP OAuth • ${client.clientName.slice(0, 120)}`, {
              allowedActions: scope.allowedActions,
-@@ -183,20 +197,29 @@ export function createMcpOAuthHandler(
+@@ -183,20 +199,30 @@ export function createMcpOAuthHandler(
            });
            try {
              const authorization = await oauth.completeAuthorization({
@@ -2755,12 +3105,13 @@ index ca245397e..dc574c393 100644
 +            request.method === "GET" &&
 +            error instanceof AuthorizationError &&
 +            error.redirectTo &&
-+            redirectAllowed(withoutErrorParameters(error.redirectTo))
++            error.redirectUri !== undefined &&
++            redirectAllowed(error.redirectUri)
 +          ) {
              return Response.redirect(error.redirectTo, 302);
            }
            if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
-@@ -220,11 +243,219 @@ export function createMcpOAuthHandler(
+@@ -220,11 +246,236 @@ export function createMcpOAuthHandler(
          url.pathname = "/.well-known/oauth-protected-resource/mcp";
          request = new Request(url, request);
        }
@@ -2772,6 +3123,9 @@ index ca245397e..dc574c393 100644
 +      // The handler is cached across envs, so the callback reads the current request's env from here.
 +      const scope: RequestScope = { env, budgetRefused: false };
 +      const response = await requestScope.run(scope, () => provider.fetch(request, env, context));
++      if (request.method === "GET" && url.pathname === authorizationServerMetadataPath) {
++        return withoutPrivateKeyJwt(response);
++      }
 +      // The library's callback cannot set headers, so a refusal over budget is marked here, after the fact.
 +      return scope.budgetRefused ? withRetryAfter(response, secondsUntilUtcMidnight(Date.now())) : response;
      },
@@ -2783,6 +3137,7 @@ index ca245397e..dc574c393 100644
 +const defaultMaxAnonymousWritesPerDay = 100;
 +const defaultMaxAnonymousWritesPerIpPerDay = 20;
 +const tokenPath = "/oauth/mcp/token";
++const authorizationServerMetadataPath = "/.well-known/oauth-authorization-server";
 +
 +/** The env of the request being served, and what the budget decided for it. Scoped per request, never shared. */
 +interface RequestScope {
@@ -2848,11 +3203,24 @@ index ca245397e..dc574c393 100644
 +  }
 +}
 +
-+/** The redirect URI an error redirect was built from: the library adds only these parameters to it. */
-+function withoutErrorParameters(redirectTo: string): string {
-+  const url = new URL(redirectTo);
-+  for (const name of ["error", "error_description", "error_uri", "state", "iss"]) url.searchParams.delete(name);
-+  return url.href;
++/**
++ * The library lists private_key_jwt at the token endpoint whenever CIMD is on. This gateway refuses client
++ * assertions, so the discovery document must not offer the method. Anything else in it is left as it was.
++ */
++async function withoutPrivateKeyJwt(response: Response): Promise<Response> {
++  if (!response.ok) return response;
++  let metadata: Record<string, unknown>;
++  try {
++    metadata = (await response.clone().json()) as Record<string, unknown>;
++  } catch {
++    return response;
++  }
++  const methods = metadata.token_endpoint_auth_methods_supported;
++  if (!Array.isArray(methods)) return response;
++  metadata.token_endpoint_auth_methods_supported = methods.filter((method) => method !== "private_key_jwt");
++  const headers = new Headers(response.headers);
++  headers.delete("Content-Length");
++  return new Response(JSON.stringify(metadata), { status: response.status, statusText: response.statusText, headers });
 +}
 +
 +/** Whole seconds until the next 00:00 UTC, rounded up, and at least 1. */

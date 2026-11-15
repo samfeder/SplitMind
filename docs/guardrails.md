@@ -98,6 +98,7 @@ use the day's writes up, connected clients could not refresh their tokens. Patch
   The page posts back to the same URL, and the Worker stores the authorization (and writes anything) only after
   checking the administrator token, for Allow and for Deny. An anonymous request therefore never writes, and sign-in
   never touches the budget.
+  A wrong or missing token logs one warning, `{ event: "mcp_oauth_consent_token_refused" }`, with no token, address or client in it.
 - **Client assertions are refused.** A token request with `client_assertion` or `client_assertion_type` gets
   `401 invalid_client`, since this gateway has no use for them (one warning line, no client_id). Token bodies are
   also capped at 64 KiB.
