@@ -217,7 +217,8 @@ apply: an account whose policy refuses one of the three is skipped for that run.
 `OOMOL_CONNECT_BLOCKED_ACTIONS`. A run makes at most 15 Gmail action runs (each can cost two subrequests on Workers Free, which allows 50); more mail than that is read over the next
 minutes.
 
-**What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`):
+**What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`, one of which
+`0021_email_watch_drop_connection_index.sql` drops again):
 
 - `email_watch_cursors`: per account, the Gmail history id it has read up to, a page token while it is part-way
   through a backlog, the last run time and a catch-up flag.
@@ -274,12 +275,13 @@ The sweep uses D1 only: no Gmail call, no KV write, no run-log row. If the table
 any other failure is logged once per sweep by error name and the other cron work still runs. Only the first error
 of a sweep is logged; later, different errors in the same sweep are not logged, on purpose. The pending-expiry delete,
 the acknowledged-expiry delete and each table's purge are independent, so a failure (or a missing table) in one does
-not stop the others. The purge of unwatched accounts has no limit on
-the number of watched accounts (D1 allows 100 bound parameters per statement): it reads the distinct account names in
-each table and deletes the unwatched ones in chunks of 50. **Cost:** with the two status indexes from migration 0020 (the `(connection_name)` index it also created is dropped by
-`0021_email_watch_drop_connection_index.sql`, because the unique `(connection_name, gmail_message_id)` index already
-serves that read), each sweep
-reads about the rows it deletes plus the distinct account names.
+not stop the others. The purge of unwatched accounts has no limit on the number of watched accounts (D1 allows 100
+bound parameters per statement): it reads the distinct account names in each table and deletes the unwatched ones in
+chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
+they delete. The distinct-names read scans the unique `(connection_name, gmail_message_id)` index of
+`email_watch_items` (a covering-index scan, not a table scan), so it reads one index entry per stored item; with 14-day
+retention of machine mail only, that stays small. Migration `0021_email_watch_drop_connection_index.sql` drops 0020's
+`(connection_name)` index, which duplicated the unique index for this read.
 
 **Reading it.** `mail_watch.list_pending_mail` (read; filters `category`, `connectionName`, `limit` 1–100, default 50)
 returns `{ enabled, items }`, newest first, each with a Gmail link built at read time from the account's stored
