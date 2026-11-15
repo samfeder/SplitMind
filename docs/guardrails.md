@@ -218,12 +218,13 @@ apply: an account whose policy refuses one of the three is skipped for that run.
 minutes.
 
 **What it stores.** Two D1 tables (migration `0019_email_watch.sql`, plus indexes in `0020_email_watch_indexes.sql`, one of which
-`0021_email_watch_drop_connection_index.sql` drops again; `0022_email_watch_cursor_state.sql` adds three cursor columns):
+`0021_email_watch_drop_connection_index.sql` drops again; `0022_email_watch_cursor_state.sql` adds three cursor columns; `0023_email_watch_cursor_created_at.sql` adds `created_at`):
 
 - `email_watch_cursors`: per account, the Gmail history id it has read up to, a page token while it is part-way
   through a backlog, the last run time and a catch-up flag, the time of the last successful read (`last_success_at`),
   the time the "could not read" item was left for the current failure streak (`failing_notice_at`) and the id of the
-  Gmail connection the alias pointed at when the cursor was written (`connection_id`).
+  Gmail connection the alias pointed at when the cursor was written (`connection_id`), and when the row was first
+  written (`created_at`; migration 0023 backfills it from `last_success_at`, else `last_run_at`).
 - `email_watch_items`: one row per kept message: the account alias, Gmail's message and thread ids, the sender's
   **domain** (not the address), the subject (control characters removed, at most 200 characters), the category and
   rule id, the received time, status (`pending` or `acknowledged`) and a duplicate key. The same alert in the same
@@ -243,7 +244,16 @@ comes 24 hours or more after the last successful read, the watcher leaves one pe
 It carries no error text, address or subject. Migration 0022 backfills `last_success_at` from `last_run_at`, which
 overstates the last success for an account that was already failing when the migration ran, so its first item can name
 a later time than the real last read. There is one per failure streak; the next successful read clears the
-streak, and a later 24-hour failure gets a new item.
+streak, and a later 24-hour failure gets a new item. The item is claimed only while the cursor still holds the
+`last_success_at` the poll loaded, so a poll that a concurrent success overtook leaves none.
+
+**An account that never started.** If the very first `get_profile` for an alias fails (not for lack of budget), the
+watcher writes a **stub cursor**: empty `history_id`, no `last_success_at`, `connection_id` set, `created_at` now. Each
+later poll asks Gmail for the profile again; the first success fills in `history_id` and `last_success_at` and clears
+the streak on the same row, with no backfill. While it keeps failing, the rules above apply with the time counted from
+`last_success_at`, else `created_at`; after 24 hours one `watch-failing` item says
+`Email watch could not start reading this account (trying since <time>)`. A stub is subject to the alias check and
+the purges like any cursor. An alias the budget did not reach gets no stub.
 
 **An alias reused by another account.** At the start of each poll the watcher asks the connection store (no Gmail
 call) which connection the alias points at and compares an **account fingerprint** with the cursor's `connection_id`.
@@ -257,8 +267,8 @@ delete only while the cursor still holds the fingerprint that poll read, so a sl
 what a newer one stored), one warn line carrying only the alias is logged, and, if the alias resolves, the watch
 starts fresh for it (no backfill). If the store cannot be read the poll is skipped and nothing is deleted. Until the
 next poll runs, `list_pending_mail` and `acknowledge_mail` hide and leave alone the items of an alias whose recorded
-fingerprint differs from the current one, and the items of an alias that has no cursor at all (what a purge that
-stopped half way leaves), so the new account does not see the previous one's mail in either case.
+fingerprint differs from the current one, and the items of an alias that has no cursor at all (a cursor deleted by hand: the sweep skips its cursor purge when
+the items purge failed, and a purge cannot stop half way), so the new account does not see the previous one's mail in either case.
 
 **Rules.** A checked-in table (`src/server/email-watch/rules.ts` in the patch) of sender domains plus a subject
 pattern or a GitHub header: `deploy_failed`, `github`, `account_security`, `billing_quota`. The first rule that
@@ -310,7 +320,8 @@ The sweep uses D1 only: no Gmail call, no KV write, no run-log row. If the table
 any other failure is logged once per sweep by error name and the other cron work still runs. Only the first error
 of a sweep is logged; later, different errors in the same sweep are not logged, on purpose. The pending-expiry delete,
 the acknowledged-expiry delete and each table's purge are independent, so a failure (or a missing table) in one does
-not stop the others. The purge of unwatched accounts has no limit on the number of watched accounts (D1 allows 100
+not stop the others, except that a failed (not missing) items purge skips the cursor purge for that sweep, so
+items are never left without a cursor. The purge of unwatched accounts has no limit on the number of watched accounts (D1 allows 100
 bound parameters per statement): it reads the distinct account names in each table and deletes the unwatched ones in
 chunks of 50. **Cost:** the expiry deletes use the two status indexes from migration 0020, so they read about the rows
 they delete. The distinct-names read scans the unique `(connection_name, gmail_message_id)` index of
