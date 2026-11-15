@@ -267,12 +267,16 @@ export function applyPatches(repoRoot: string, engineDir: string): void {
   }
 }
 
-function build(template: string): void {
+// Runs before any wrangler call or file write, so a broken engine stops the deploy before it touches the account.
+function preparePatchedEngine(): void {
   if (!existsSync(join(engine, "node_modules"))) {
     throw new Error("vendor/open-connector has no node_modules; run scripts/bootstrap.sh first");
   }
   console.log("==> Patches");
   applyPatches(root, engine);
+}
+
+function build(template: string): void {
   console.log("==> Building (catalog, Web Console, trimmed catalog assets)");
   run("npm", ["run", "generate:catalog"], engine);
   run("npm", ["run", "build:web"], engine);
@@ -437,6 +441,7 @@ async function main(): Promise<number> {
   }
 
   if (values["dry-run"]) {
+    preparePatchedEngine();
     const placeholder = "0".repeat(32);
     writeFileSync(
       renderedPath,
@@ -463,6 +468,8 @@ async function main(): Promise<number> {
     render({ ...saved, ...(values.origin ? { origin: values.origin } : {}) });
     return 0;
   }
+
+  preparePatchedEngine();
 
   console.log("==> Checking Cloudflare login");
   wrangler(["whoami"]);
