@@ -75,7 +75,7 @@ git clone --recurse-submodules https://github.com/samfeder/SplitMind.git
 cd SplitMind
 scripts/bootstrap.sh                                  # pinned OpenConnector + patches + dependencies
 (cd vendor/open-connector && npx wrangler login)      # authorize wrangler in the browser
-npm run deploy                                        # resources, migrations, build, deploy, secrets
+npm run deploy                                        # patches, resources, migrations, build, deploy, secrets
 npm run verify                                        # health, OAuth discovery, policy and guardrails
 ```
 

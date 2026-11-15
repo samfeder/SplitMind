@@ -16,6 +16,10 @@ const file = process.env.FAKE_CF_STATE;
 const state = JSON.parse(fs.readFileSync(file, "utf8"));
 const args = process.argv.slice(2);
 state.calls.push(args.join(" "));
+// What the probe file held when this call was made: shows whether the engine was patched before the account was touched.
+if (process.env.FAKE_PROBE_FILE) {
+  (state.probes = state.probes || []).push(fs.existsSync(process.env.FAKE_PROBE_FILE) ? fs.readFileSync(process.env.FAKE_PROBE_FILE, "utf8").trim() : "missing");
+}
 const save = () => fs.writeFileSync(file, JSON.stringify(state));
 const key = args.slice(0, 3).join(" ");
 if (args[0] === "whoami") {
@@ -67,6 +71,7 @@ interface FakeAccount {
   secrets: string[];
   secretValues: Record<string, string>;
   deployedOrigins: string[];
+  probes?: string[];
 }
 
 let dir: string;
@@ -382,6 +387,188 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("patches/0001-greeting.patch does not apply to vendor/open-connector");
     expect(readAccount().calls.some((call) => call.startsWith("deploy"))).toBe(false);
+  });
+
+  describe("patches and the engine check come before anything touches the Cloudflare account", () => {
+    const edit = (file: string, from: string, to: string) =>
+      [`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`, "@@ -1 +1 @@", `-${from}`, `+${to}`, ""].join("\n");
+    const reset = "git -C vendor/open-connector checkout -- . && git -C vendor/open-connector clean -fd";
+    const patchesDir = () => {
+      mkdirSync(join(checkout, "patches"), { recursive: true });
+      return join(checkout, "patches");
+    };
+    // An engine with greeting.txt that patch 0001 can no longer be applied to.
+    const stalePatch = () => {
+      writeFileSync(join(engine, "greeting.txt"), "something else\n");
+      writeFileSync(join(patchesDir(), "0001-greeting.patch"), edit("greeting.txt", "hello", "hello, patched"));
+    };
+    const untouched = (result: { stdout: string }) => {
+      expect(readAccount().calls).toEqual([]);
+      expect(existsSync(join(checkout, "splitmind.local.json"))).toBe(false);
+      expect(existsSync(join(engine, "wrangler.local.jsonc"))).toBe(false);
+      expect(result.stdout).not.toContain("==> Checking Cloudflare login");
+      expect(result.stdout).not.toContain("==> Cloudflare resources");
+      expect(result.stdout).not.toContain("==> Applying D1 migrations");
+    };
+
+    it("a patch that does not apply: exit 1, the existing message, and no wrangler call, no saved state, no rendered config", () => {
+      stalePatch();
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("patches/0001-greeting.patch does not apply to vendor/open-connector");
+      untouched(result);
+    });
+
+    it("a later patch that does not apply, after an earlier one applied: still no wrangler call", () => {
+      writeFileSync(join(engine, "greeting.txt"), "hello\n");
+      writeFileSync(join(engine, "farewell.txt"), "something else\n");
+      writeFileSync(join(patchesDir(), "0001-greeting.patch"), edit("greeting.txt", "hello", "hello, patched"));
+      writeFileSync(join(patchesDir(), "0002-farewell.patch"), edit("farewell.txt", "bye", "bye, patched"));
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("patches/0002-farewell.patch does not apply to vendor/open-connector");
+      untouched(result);
+    });
+
+    it("a missing middle patch (0001 and 0003 on, 0002 not): exit 1 with the recovery message and no wrangler call", () => {
+      writeFileSync(join(engine, "a.txt"), "a.txt one\n");
+      writeFileSync(join(engine, "b.txt"), "b.txt original\n");
+      writeFileSync(join(engine, "c.txt"), "c.txt three\n");
+      writeFileSync(join(patchesDir(), "0001-a.patch"), edit("a.txt", "a.txt original", "a.txt one"));
+      writeFileSync(join(patchesDir(), "0002-b.patch"), edit("b.txt", "b.txt original", "b.txt two"));
+      writeFileSync(join(patchesDir(), "0003-c.patch"), edit("c.txt", "c.txt original", "c.txt three"));
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("patches/0002-b.patch is not applied, but a later patch is");
+      expect(result.stderr).toContain(reset);
+      expect(result.stderr).toMatch(/bootstrap[^\n]*again|again[^\n]*bootstrap/i);
+      expect(readFileSync(join(engine, "b.txt"), "utf8")).toBe("b.txt original\n");
+      untouched(result);
+    });
+
+    it("an engine with no node_modules: exit 1 with the existing message and no wrangler call", () => {
+      rmSync(join(engine, "node_modules"), { recursive: true });
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("vendor/open-connector has no node_modules; run scripts/bootstrap.sh first");
+      untouched(result);
+    });
+
+    it("a re-run with a new patch that does not apply leaves the account and the saved state alone", () => {
+      deploy();
+      const savedBefore = readFileSync(join(checkout, "splitmind.local.json"), "utf8");
+      setAccount({ ...readAccount(), calls: [], deployedOrigins: [] });
+      stalePatch();
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("patches/0001-greeting.patch does not apply to vendor/open-connector");
+      expect(readAccount().calls).toEqual([]);
+      expect(readFileSync(join(checkout, "splitmind.local.json"), "utf8")).toBe(savedBefore);
+    });
+
+    it("--dry-run with a patch that does not apply: exit 1, the existing message, no wrangler call", () => {
+      stalePatch();
+
+      const result = deploy("--dry-run");
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("patches/0001-greeting.patch does not apply to vendor/open-connector");
+      expect(readAccount().calls).toEqual([]);
+      expect(result.stdout).not.toContain("==> Building");
+    });
+
+    it("--dry-run with a missing middle patch or no node_modules: exit 1, no wrangler call, no build", () => {
+      writeFileSync(join(engine, "a.txt"), "a.txt one\n");
+      writeFileSync(join(engine, "b.txt"), "b.txt original\n");
+      writeFileSync(join(engine, "c.txt"), "c.txt three\n");
+      writeFileSync(join(patchesDir(), "0001-a.patch"), edit("a.txt", "a.txt original", "a.txt one"));
+      writeFileSync(join(patchesDir(), "0002-b.patch"), edit("b.txt", "b.txt original", "b.txt two"));
+      writeFileSync(join(patchesDir(), "0003-c.patch"), edit("c.txt", "c.txt original", "c.txt three"));
+      const middle = deploy("--dry-run");
+      expect(middle.status).toBe(1);
+      expect(middle.stderr).toContain(reset);
+      expect(middle.stdout).not.toContain("==> Building");
+
+      rmSync(join(engine, "node_modules"), { recursive: true });
+      const bare = deploy("--dry-run");
+      expect(bare.status).toBe(1);
+      expect(bare.stderr).toContain("vendor/open-connector has no node_modules; run scripts/bootstrap.sh first");
+      expect(bare.stdout).not.toContain("==> Building");
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("--dry-run applies each patch once, then builds, and calls only wrangler deploy --dry-run", () => {
+      writeFileSync(join(engine, "greeting.txt"), "hello\n");
+      writeFileSync(join(patchesDir(), "0001-greeting.patch"), edit("greeting.txt", "hello", "hello, patched"));
+
+      const result = deploy("--dry-run");
+
+      expect(result.status).toBe(0);
+      expect(result.stdout.match(/^\s*applied: patches\/0001-greeting\.patch$/gm)).toHaveLength(1);
+      expect(result.stdout.match(/^==> Patches$/gm)).toHaveLength(1);
+      expect(result.stdout.indexOf("==> Patches")).toBeLessThan(result.stdout.indexOf("==> Building"));
+      expect(result.stdout.indexOf("applied: patches/0001-greeting.patch")).toBeLessThan(result.stdout.indexOf("==> Building"));
+      expect(readFileSync(join(engine, "greeting.txt"), "utf8")).toBe("hello, patched\n");
+      const calls = readAccount().calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatch(/^deploy .*--dry-run/);
+    });
+
+    it("--render-only needs no patches, no node_modules and no wrangler call", () => {
+      deploy();
+      rmSync(join(engine, "node_modules"), { recursive: true });
+      stalePatch();
+      setAccount({ ...readAccount(), calls: [] });
+
+      const result = deploy("--render-only");
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).not.toContain("==> Patches");
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("happy path: patches are on disk at the first wrangler call and applied once; then login, resources, migrations, build, deploy", () => {
+      writeFileSync(join(engine, "greeting.txt"), "hello\n");
+      writeFileSync(join(patchesDir(), "0001-greeting.patch"), edit("greeting.txt", "hello", "hello, patched"));
+
+      const result = deployWith({ FAKE_PROBE_FILE: join(engine, "greeting.txt") });
+
+      const out = result.stdout;
+      expect(result.stdout.match(/^\s*applied: patches\/0001-greeting\.patch$/gm)).toHaveLength(1);
+      expect(out.match(/^==> Patches$/gm)).toHaveLength(1);
+      const order = [
+        "==> Patches",
+        "applied: patches/0001-greeting.patch",
+        "==> Checking Cloudflare login",
+        "==> Cloudflare resources",
+        "==> Applying D1 migrations",
+        "==> Building",
+        "==> Deploying",
+      ].map((marker) => ({ marker, at: out.indexOf(marker) }));
+      for (const { marker, at } of order) expect(at, `${marker} is in the output`).toBeGreaterThanOrEqual(0);
+      const positions = order.map((entry) => entry.at);
+      expect(positions).toEqual([...positions].sort((a, b) => a - b));
+
+      const state = readAccount();
+      expect(state.calls[0]).toBe("whoami");
+      const indexOf = (prefix: string) => state.calls.findIndex((call) => call.startsWith(prefix));
+      const sequence = [indexOf("whoami"), indexOf("d1 list"), indexOf("kv namespace list"), indexOf("d1 migrations apply"), indexOf("deploy")];
+      expect(sequence.every((index) => index >= 0)).toBe(true);
+      expect(sequence).toEqual([...sequence].sort((a, b) => a - b));
+      // Every wrangler call, the very first included, saw the patched file.
+      expect(state.probes).toHaveLength(state.calls.length);
+      expect(new Set(state.probes)).toEqual(new Set(["hello, patched"]));
+    });
   });
 
   it("keeps the saved state out of git", () => {
