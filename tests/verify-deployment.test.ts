@@ -19,17 +19,30 @@ interface Behaviour {
   blockOpen?: boolean;
   noCsp?: boolean;
   registrationOpen?: boolean;
+  /** How the stand-in answers the OAuth probes (#78). Unset means the refusals the real gateway gives. */
+  assertion?: "open" | "wrong-text" | "wrong-status" | "wrong-error";
+  unknownClient?: "not-the-librarys-answer";
+  authorize?: "redirects" | "shows-consent";
+}
+
+interface OAuthRequest {
+  method: string;
+  path: string;
+  params: URLSearchParams;
+  authorization: string | undefined;
 }
 
 let server: Server | undefined;
 let deletedTokens: string[] = [];
 let toolCalls: unknown[] = [];
+let oauthRequests: OAuthRequest[] = [];
 
 afterEach(async () => {
   if (server) await new Promise((done) => server!.close(done));
   server = undefined;
   deletedTokens = [];
   toolCalls = [];
+  oauthRequests = [];
 });
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -48,6 +61,40 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
     request.on("end", () => route(request, response, key, url, auth, body));
   });
   const route = (request: IncomingMessage, response: ServerResponse, key: string, url: string, auth: string | undefined, body: string) => {
+    const parsed = new URL(url, "http://stub.invalid");
+    if (parsed.pathname === "/redirect-sink") {
+      // Where the stand-in's redirect points. A probe that follows redirects ends up here.
+      oauthRequests.push({ method: request.method ?? "", path: parsed.pathname, params: parsed.searchParams, authorization: auth });
+      return send(response, 200, { followed: true });
+    }
+    if (parsed.pathname === "/oauth/mcp/token" || parsed.pathname === "/oauth/mcp/authorize") {
+      const params = request.method === "GET" ? parsed.searchParams : new URLSearchParams(body);
+      oauthRequests.push({ method: request.method ?? "", path: parsed.pathname, params, authorization: auth });
+      if (request.method === "GET" && parsed.pathname === "/oauth/mcp/authorize") {
+        if (behaviour.authorize === "redirects") {
+          response.writeHead(302, { location: "/redirect-sink?error=invalid_request" });
+          return response.end();
+        }
+        if (behaviour.authorize === "shows-consent") {
+          response.writeHead(200, { "content-type": "text/html" });
+          return response.end("<h1>Allow access?</h1>");
+        }
+        response.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+        return response.end("Invalid client_id");
+      }
+      if (request.method === "POST" && parsed.pathname === "/oauth/mcp/token") {
+        if (params.has("client_assertion") || params.has("client_assertion_type")) {
+          if (behaviour.assertion === "open") return send(response, 400, { error: "invalid_grant", error_description: "Grant not found" });
+          if (behaviour.assertion === "wrong-text") return send(response, 401, { error: "invalid_client", error_description: "Client authentication failed." });
+          if (behaviour.assertion === "wrong-status") return send(response, 400, { error: "invalid_client", error_description: "Client assertions are not supported by this gateway." });
+          if (behaviour.assertion === "wrong-error") return send(response, 401, { error: "invalid_request", error_description: "Client assertions are not supported by this gateway." });
+          return send(response, 401, { error: "invalid_client", error_description: "Client assertions are not supported by this gateway." });
+        }
+        if (behaviour.unknownClient) return send(response, 400, { error: "invalid_grant", error_description: "Grant not found" });
+        return send(response, 401, { error: "invalid_client", error_description: "Client not found" });
+      }
+      return send(response, 405, { error: "method_not_allowed" });
+    }
     if (key === "GET /health") return send(response, 200, '{"ok":true}\n');
     if (key === "GET /setup/") {
       const csp = "default-src 'none'; script-src 'self'; frame-ancestors 'none'";
@@ -59,6 +106,7 @@ async function startWorker(behaviour: Behaviour): Promise<string> {
       return response.end("<h1>SplitMind privacy policy</h1>");
     }
     if (key === "POST /oauth/mcp/register") {
+      oauthRequests.push({ method: "POST", path: "/oauth/mcp/register", params: new URLSearchParams(), authorization: auth });
       return behaviour.registrationOpen
         ? send(response, 201, { client_id: "stranger" })
         : send(response, 400, { error: "invalid_client_metadata" });
@@ -132,7 +180,7 @@ describe("scripts/verify-deployment.ts", () => {
     expect(result.stdout).toContain("PASS  an action outside the allowlist is refused  (404 unknown_action)");
     expect(result.stdout).toContain("PASS  no default notion connection  (200 0 connection(s): [])");
     expect(result.stdout).toContain("PASS  a client with a non-Claude redirect URI can't register  (400 invalid_client_metadata)");
-    expect(result.stdout).toContain("All 25 checks passed.");
+    expect(result.stdout).toContain("All 28 checks passed.");
     expect(result.status).toBe(0);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -161,7 +209,7 @@ describe("scripts/verify-deployment.ts", () => {
     const result = await verify(origin, ADMIN);
 
     expect(result.stdout).toContain("FAIL  raw slack proxy is blocked by deployment policy  (200)");
-    expect(result.stdout).toContain("7 of 25 checks failed.");
+    expect(result.stdout).toContain("7 of 28 checks failed.");
     expect(result.status).toBe(1);
     expect(deletedTokens).toEqual(["token-1"]);
   });
@@ -246,6 +294,65 @@ describe("scripts/verify-deployment.ts", () => {
     );
     expect(wrong.status).toBe(1);
     expect(wrong.stdout + wrong.stderr).not.toContain("not-the-admin-token");
+  });
+});
+
+describe("scripts/verify-deployment.ts OAuth probes (#78)", () => {
+  const probesFor = (path: string) => oauthRequests.filter((entry) => entry.path === path);
+
+  it("sends a client_assertion token request, an unknown-client token request and an authorize GET for an unknown client", async () => {
+    const origin = await startWorker({ proxyOpen: false });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("All 28 checks passed.");
+    expect(result.status).toBe(0);
+    const tokenPosts = probesFor("/oauth/mcp/token").filter((entry) => entry.method === "POST");
+    const withAssertion = tokenPosts.filter((entry) => entry.params.has("client_assertion") || entry.params.has("client_assertion_type"));
+    const without = tokenPosts.filter((entry) => !entry.params.has("client_assertion") && !entry.params.has("client_assertion_type"));
+    expect(withAssertion).toHaveLength(1);
+    expect(without).toHaveLength(1);
+    expect(without[0]!.params.get("client_id")).toBeTruthy();
+    const authorizeGets = probesFor("/oauth/mcp/authorize");
+    expect(authorizeGets).toHaveLength(1);
+    expect(authorizeGets[0]!.method).toBe("GET");
+    expect(authorizeGets[0]!.params.get("client_id")).toBeTruthy();
+  });
+
+  it("makes no request that could write to the gateway's KV, and sends no credential with the probes", async () => {
+    const origin = await startWorker({ proxyOpen: false });
+
+    await verify(origin, ADMIN);
+
+    // The refused registration the allowlist check already made, two token requests and one authorize GET. Nothing is
+    // approved, denied or registered for real.
+    expect(oauthRequests).toHaveLength(4);
+    expect(probesFor("/oauth/mcp/register")).toHaveLength(1);
+    expect(oauthRequests.filter((entry) => entry.path === "/oauth/mcp/authorize" && entry.method !== "GET")).toEqual([]);
+    for (const entry of oauthRequests.filter((item) => item.path !== "/oauth/mcp/register")) {
+      expect(entry.authorization).toBeUndefined();
+    }
+  });
+
+  it.each([
+    ["the gateway does not refuse a client assertion", { assertion: "open" }],
+    ["the refusal has another description", { assertion: "wrong-text" }],
+    ["the refusal is not a 401", { assertion: "wrong-status" }],
+    ["the refusal is not invalid_client", { assertion: "wrong-error" }],
+    ["an unknown client_id is not answered with the library's Client not found", { unknownClient: "not-the-librarys-answer" }],
+    ["an authorize GET for an unknown client redirects", { authorize: "redirects" }],
+    ["an authorize GET for an unknown client shows the consent page", { authorize: "shows-consent" }],
+  ] as [string, Partial<Behaviour>][])("fails exactly one check when %s", async (_name, behaviour) => {
+    const origin = await startWorker({ proxyOpen: false, ...behaviour });
+
+    const result = await verify(origin, ADMIN);
+
+    expect(result.stdout).toContain("1 of 28 checks failed.");
+    expect(result.stdout.split("\n").filter((line) => line.startsWith("FAIL  "))).toHaveLength(1);
+    expect(result.status).toBe(1);
+    expect(deletedTokens).toEqual(["token-1"]);
+    // The authorize probe reads the first answer and never follows a redirect to a client's callback.
+    expect(probesFor("/redirect-sink")).toEqual([]);
   });
 });
 
