@@ -62,7 +62,9 @@ beforeEach(() => {
   git(upstream, "init", "-q", "-b", "main");
   writeFileSync(join(upstream, "greeting.txt"), "hello from upstream\n");
   for (const f of ["a.txt", "b.txt", "c.txt"]) writeFileSync(join(upstream, f), `${f} original\n`);
-  git(upstream, "add", "greeting.txt", "a.txt", "b.txt", "c.txt");
+  // Two identical six-line blocks, so a hunk's context also matches the other block.
+  writeFileSync(join(upstream, "rep.txt"), "a\nb\nc\nd\ne\nf\na\nb\nc\nd\ne\nf\n");
+  git(upstream, "add", "greeting.txt", "a.txt", "b.txt", "c.txt", "rep.txt");
   git(upstream, "commit", "-q", "-m", "upstream");
   git(upstream, "tag", "v1.0.0");
 
@@ -308,6 +310,67 @@ describe.skipIf(!hasGit)("scripts/bootstrap.sh: stacked patches", () => {
     expect(run.stdout).toContain(`already applied: patches/${P2}`);
     expect(run.stdout).toMatch(appliedLine(P3));
     expect(engineFile("c.txt")).toBe("c.txt three\n");
+  });
+
+  // 0001 inserts X into the SECOND block of rep.txt; its context (a b c / d e f) also appears in the first block, so on a
+  // patched tree the patch still applies forward (at an offset, to the first block) as well as reversing.
+  const REPEATED_CONTEXT_PATCH = [
+    "diff --git a/rep.txt b/rep.txt",
+    "--- a/rep.txt",
+    "+++ b/rep.txt",
+    "@@ -7,6 +7,7 @@",
+    " a",
+    " b",
+    " c",
+    "+X",
+    " d",
+    " e",
+    " f",
+    "",
+  ].join("\n");
+  const NEW_FILE_PATCH = [
+    "diff --git a/new.txt b/new.txt",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/new.txt",
+    "@@ -0,0 +1 @@",
+    "+new file",
+    "",
+  ].join("\n");
+  const REP_PATCHED = "a\nb\nc\nd\ne\nf\na\nb\nc\nX\nd\ne\nf\n";
+  const REP_ORIGINAL = "a\nb\nc\nd\ne\nf\na\nb\nc\nd\ne\nf\n";
+
+  it("reports a patch as already applied when its context also appears elsewhere in the file", () => {
+    addPatch(P1, REPEATED_CONTEXT_PATCH);
+    addPatch(P2, NEW_FILE_PATCH);
+    const first = bootstrap(checkout, "--skip-install");
+    expect(first.status).toBe(0);
+    expect(first.stdout).toMatch(appliedLine(P1));
+    expect(first.stdout).toMatch(appliedLine(P2));
+    expect(engineFile("rep.txt")).toBe(REP_PATCHED);
+
+    const second = bootstrap(checkout, "--skip-install");
+
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toContain("not applied");
+    expect(second.stdout).toContain(`already applied: patches/${P1}`);
+    expect(second.stdout).toContain(`already applied: patches/${P2}`);
+    expect(second.stdout).not.toMatch(/^\s*applied: /m);
+    expect(engineFile("rep.txt")).toBe(REP_PATCHED);
+  });
+
+  it("still stops on a repeated-context patch that really is missing while a later one is on", () => {
+    addPatch(P1, REPEATED_CONTEXT_PATCH);
+    addPatch(P2, NEW_FILE_PATCH);
+    applyByHand(P2);
+
+    const run = bootstrap(checkout, "--skip-install");
+
+    expect(run.status).not.toBe(0);
+    expect(run.stdout + run.stderr).toContain(P1);
+    expect(run.stdout + run.stderr).toContain(RESET);
+    expect(run.stdout).not.toMatch(appliedLine(P1));
+    expect(engineFile("rep.txt")).toBe(REP_ORIGINAL);
   });
 
   it("stops with the does-not-apply message on a conflicting patch in the middle of a clean tree", () => {

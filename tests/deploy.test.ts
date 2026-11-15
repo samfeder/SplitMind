@@ -308,6 +308,59 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
     expect(readFileSync(join(engine, "farewell.txt"), "utf8")).toBe("bye, patched\n");
   });
 
+  describe("patches missing from the middle of the stack, or with repeated context", () => {
+    const edit = (file: string, from: string, to: string) =>
+      [`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`, "@@ -1 +1 @@", `-${from}`, `+${to}`, ""].join("\n");
+    const reset = "git -C vendor/open-connector checkout -- . && git -C vendor/open-connector clean -fd";
+    const deployed = () => readAccount().calls.some((call) => call.startsWith("deploy"));
+
+    it("stops before building, naming the patch and the recovery steps, when 0002 is missing but 0001 and 0003 are on", () => {
+      // Engine as it would be with 0001 and 0003 applied by hand and 0002 left out.
+      writeFileSync(join(engine, "a.txt"), "a.txt one\n");
+      writeFileSync(join(engine, "b.txt"), "b.txt original\n");
+      writeFileSync(join(engine, "c.txt"), "c.txt three\n");
+      mkdirSync(join(checkout, "patches"));
+      writeFileSync(join(checkout, "patches/0001-a.patch"), edit("a.txt", "a.txt original", "a.txt one"));
+      writeFileSync(join(checkout, "patches/0002-b.patch"), edit("b.txt", "b.txt original", "b.txt two"));
+      writeFileSync(join(checkout, "patches/0003-c.patch"), edit("c.txt", "c.txt original", "c.txt three"));
+
+      const result = deploy();
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("0002-b.patch");
+      expect(result.stderr).toContain(reset);
+      expect(result.stderr).toMatch(/bootstrap[^\n]*again|again[^\n]*bootstrap/i);
+      expect(result.stdout).not.toMatch(/^\s*applied: patches\/0002/m);
+      expect(readFileSync(join(engine, "b.txt"), "utf8")).toBe("b.txt original\n");
+      expect(deployed()).toBe(false);
+    });
+
+    it("treats a patch as applied when its context also appears elsewhere in the file, and goes on to deploy", () => {
+      writeFileSync(join(engine, "rep.txt"), "a\nb\nc\nd\ne\nf\na\nb\nc\nd\ne\nf\n");
+      mkdirSync(join(checkout, "patches"));
+      writeFileSync(
+        join(checkout, "patches/0001-rep.patch"),
+        ["diff --git a/rep.txt b/rep.txt", "--- a/rep.txt", "+++ b/rep.txt", "@@ -7,6 +7,7 @@", " a", " b", " c", "+X", " d", " e", " f", ""].join("\n"),
+      );
+      writeFileSync(
+        join(checkout, "patches/0002-new.patch"),
+        ["diff --git a/new.txt b/new.txt", "new file mode 100644", "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+new file", ""].join("\n"),
+      );
+      const first = deploy();
+      expect(first.stdout).toMatch(/^\s*applied: patches\/0001-rep\.patch/m);
+      expect(first.stdout).toMatch(/^\s*applied: patches\/0002-new\.patch/m);
+      setAccount({ ...readAccount(), calls: [], deployedOrigins: [] });
+
+      const second = deploy();
+
+      expect(second.stderr).not.toContain("not applied");
+      expect(second.stderr).not.toContain("does not apply");
+      expect(second.stdout).not.toMatch(/^\s*applied: /m);
+      expect(readFileSync(join(engine, "rep.txt"), "utf8")).toBe("a\nb\nc\nd\ne\nf\na\nb\nc\nX\nd\ne\nf\n");
+      expect(deployed()).toBe(true);
+    });
+  });
+
   it("says to run bootstrap when wrangler is not installed", () => {
     const result = deployWith({ SPLITMIND_WRANGLER: join(engine, "node_modules/.bin/wrangler") });
 
