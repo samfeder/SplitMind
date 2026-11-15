@@ -40,7 +40,7 @@ the read-only rule cannot vet.
  src/providers/fuxin/actions.ts                |  8 +-
  src/providers/harpa_ai/actions.ts             |  2 +-
  src/providers/keygen/actions.ts               |  4 +-
- src/providers/linear/actions.ts               |  2 +-
+ src/providers/linear/actions.ts               |  4 +-
  src/providers/mailgun/actions.ts              |  2 +-
  src/providers/msg91/actions.ts                |  2 +-
  src/providers/myotp_app/actions.ts            |  2 +-
@@ -48,7 +48,7 @@ the read-only rule cannot vet.
  src/providers/tailscale/operations.ts         |  2 +-
  src/providers/vercel/actions.ts               |  2 +-
  .../cloudflare-read-only-connections.test.ts  | 34 +++++++++
- 16 files changed, 128 insertions(+), 19 deletions(-)
+ 16 files changed, 129 insertions(+), 20 deletions(-)
  create mode 100644 src/providers/catalog-write-labels.test.ts
 
 diff --git a/src/providers/aliyun_oss/actions.ts b/src/providers/aliyun_oss/actions.ts
@@ -268,18 +268,20 @@ index d54f9821..66ed07ed 100644
      requiredScopes: [],
      inputSchema: idInputSchema("process"),
 diff --git a/src/providers/linear/actions.ts b/src/providers/linear/actions.ts
-index 84053cb3..8a384412 100644
+index 84053cb3..891c8d6f 100644
 --- a/src/providers/linear/actions.ts
 +++ b/src/providers/linear/actions.ts
-@@ -380,7 +380,7 @@ const actions: LinearActionSource[] = [
+@@ -380,8 +380,8 @@ const actions: LinearActionSource[] = [
    ),
    action(
      "run_query",
 -    "read",
+-    "Execute a read-only query directly against the Linear GraphQL API.",
 +    "write",
-     "Execute a read-only query directly against the Linear GraphQL API.",
++    "Execute a GraphQL document (queries or mutations) against the Linear API.",
      [linearReadScope],
      input({ query: s.string({ minLength: 1 }), variables: objectSchema }, ["query"]),
+     rawGraphqlResult,
 diff --git a/src/providers/mailgun/actions.ts b/src/providers/mailgun/actions.ts
 index 2fd2951d..a047c830 100644
 --- a/src/providers/mailgun/actions.ts

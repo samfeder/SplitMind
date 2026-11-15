@@ -2462,7 +2462,7 @@ index 2203151b..84f29a24 100644
        oauthCloseDelaySeconds,
 diff --git a/src/server/email-watch/watch-runner-read-only.test.ts b/src/server/email-watch/watch-runner-read-only.test.ts
 new file mode 100644
-index 00000000..5b83d3d8
+index 00000000..35d62fcd
 --- /dev/null
 +++ b/src/server/email-watch/watch-runner-read-only.test.ts
 @@ -0,0 +1,105 @@
@@ -2553,7 +2553,7 @@ index 00000000..5b83d3d8
 +    const result = await run(actionId, input, "work");
 +
 +    expect(result?.result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
-+    expect((result?.result.error as { message: string }).message).toContain('"gmail:work"');
++    expect((result!.result.error as { message: string }).message).toContain('"gmail:work"');
 +    expect(mailboxes.work.requests).toEqual([]);
 +  });
 +
@@ -2658,7 +2658,7 @@ index 7b55fdb2..cf358fd1 100644
          executionId = crypto.randomUUID();
 diff --git a/src/server/read-only-post-resolve.test.ts b/src/server/read-only-post-resolve.test.ts
 new file mode 100644
-index 00000000..219440f3
+index 00000000..5d0f5731
 --- /dev/null
 +++ b/src/server/read-only-post-resolve.test.ts
 @@ -0,0 +1,271 @@
@@ -2746,7 +2746,7 @@ index 00000000..219440f3
 +  await inner.set(service, "a", apiKey("a"));
 +  let gets = 0;
 +  const store: IConnectionStore = {
-+    get: async (svc, name) => {
++    get: async (svc, _name) => {
 +      gets += 1;
 +      return inner.get(svc, gets === 1 ? "w" : "a");
 +    },
@@ -2796,7 +2796,7 @@ index 00000000..219440f3
 +
 +    expect(gets()).toBeGreaterThanOrEqual(2);
 +    expect(run?.result).toMatchObject({ ok: false, error: { code: "action_blocked" } });
-+    expect((run?.result.error as { message: string }).message).toContain('"example:a"');
++    expect((run!.result.error as { message: string }).message).toContain('"example:a"');
 +    expect(providerCalls).not.toHaveBeenCalled();
 +  });
 +
