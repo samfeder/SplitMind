@@ -18,8 +18,8 @@ or that plainly mutate:
   suspends users).
 - write: gildata.call_tool, pkulaw.call_tool, investoday_mcp.call_tool,
   finchina.execute_tool, sif.call_tool, tongdaxin.call_tool,
-  fireflies.execute_graphql_query (its mutation guard can be bypassed with
-  a block-string escape), waffo.run_query, wandb.query_wandb,
+  fireflies.execute_graphql_query (its read-only guard has a bypass,
+  reported privately upstream), waffo.run_query, wandb.query_wandb,
   turbot_pipes.execute_query, vapi.test_code_tool_execution,
   scrapfly.scrape, scrapingant.scrape_with_extended_json_output,
   scrapingant.extract_content_as_markdown and
