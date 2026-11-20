@@ -82,8 +82,8 @@ around:
 > - `destructive`: `google_bigquery.query` (raw GoogleSQL runs DML and DDL, including DROP TABLE) and
 >   `okta.lifecycle_user` (deactivates or suspends users).
 > - `write`: `gildata.call_tool`, `pkulaw.call_tool`, `investoday_mcp.call_tool`, `finchina.execute_tool`,
->   `sif.call_tool`, `tongdaxin.call_tool`, `fireflies.execute_graphql_query` (its lexical mutation guard can be
->   bypassed with a block-string escape, which is worth fixing upstream), `waffo.run_query`, `wandb.query_wandb`,
+>   `sif.call_tool`, `tongdaxin.call_tool`, `fireflies.execute_graphql_query` (its read-only guard has a
+>   bypass, reported privately upstream), `waffo.run_query`, `wandb.query_wandb`,
 >   `turbot_pipes.execute_query`, `vapi.test_code_tool_execution`, `scrapfly.scrape`,
 >   `scrapingant.scrape_with_extended_json_output`, `scrapingant.extract_content_as_markdown` and
 >   `scrapingant.extract_data_with_ai` (the caller picks any HTTP method and body).
