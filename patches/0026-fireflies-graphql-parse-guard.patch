@@ -1,0 +1,632 @@
+SplitMind patch 0026 for OpenConnector v1.9.2. Apply after 0025.
+Upstream: reported privately upstream. Parse GraphQL to enforce read-only Fireflies queries (#137).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Fri, 20 Nov 2026 11:42:20 -0500
+Subject: [PATCH 1/4] test: Fireflies read-only GraphQL guard (#137)
+
+---
+ src/providers/catalog-write-labels.test.ts |   3 +-
+ src/providers/fireflies/runtime.test.ts    | 157 +++++++++++++++++++++
+ 2 files changed, 159 insertions(+), 1 deletion(-)
+ create mode 100644 src/providers/fireflies/runtime.test.ts
+
+diff --git a/src/providers/catalog-write-labels.test.ts b/src/providers/catalog-write-labels.test.ts
+index aa3505bc..a0a878ae 100644
+--- a/src/providers/catalog-write-labels.test.ts
++++ b/src/providers/catalog-write-labels.test.ts
+@@ -90,7 +90,6 @@ const passThrough: [actionId: string, operationType: "write" | "destructive"][]
+   ["sif.call_tool", "write"],
+   ["tongdaxin.call_tool", "write"],
+   // Caller-supplied GraphQL, SQL or code.
+-  ["fireflies.execute_graphql_query", "write"],
+   ["waffo.run_query", "write"],
+   ["wandb.query_wandb", "write"],
+   ["turbot_pipes.execute_query", "write"],
+@@ -108,6 +107,8 @@ const staysRead: string[] = [
+   "helium10.call_tool",
+   "scrape_creators.invoke_endpoint",
+   "tikhub.invoke_endpoint",
++  // Patch 0026: parsed, so only documents made entirely of queries get through.
++  "fireflies.execute_graphql_query",
+ ];
+ 
+ async function actionOf(actionId: string) {
+diff --git a/src/providers/fireflies/runtime.test.ts b/src/providers/fireflies/runtime.test.ts
+new file mode 100644
+index 00000000..29c6a714
+--- /dev/null
++++ b/src/providers/fireflies/runtime.test.ts
+@@ -0,0 +1,157 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { firefliesActions } from "./actions.ts";
++import { provider } from "./definition.ts";
++import { firefliesActionHandlers } from "./runtime.ts";
++
++/**
++ * fireflies.execute_graphql_query forwards a caller-supplied document, so it only accepts documents whose
++ * operations are all queries. Expected outcomes below are literals chosen from the GraphQL grammar, not derived
++ * from the code under test.
++ */
++
++const rejectionMessage = "execute_graphql_query only allows read-only query operations";
++
++interface Sent {
++  url: string;
++  body: Record<string, unknown>;
++}
++
++let sent: Sent[];
++let globalFetch: ReturnType<typeof vi.spyOn>;
++
++const fetcher: typeof fetch = async (url, init) => {
++  sent.push({ url: String(url), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
++  return Response.json({ data: { ok: true } });
++};
++
++function run(input: Record<string, unknown>) {
++  return firefliesActionHandlers.execute_graphql_query(input, { apiKey: "ff-key", fetcher });
++}
++
++beforeEach(() => {
++  sent = [];
++  globalFetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ data: { ok: true } }));
++});
++
++afterEach(() => {
++  globalFetch.mockRestore();
++});
++
++const accepted: [name: string, query: string][] = [
++  ["anonymous shorthand query", "{ user { name } }"],
++  ["named query", "query Q { transcripts { id } }"],
++  ["fragment defined before the query", "fragment F on User { name } query Q { user { ...F } }"],
++  ["fragment defined after the query", "query Q { user { ...F } } fragment F on User { name }"],
++  [
++    "fragments on both sides of the query",
++    "fragment A on User { name } query Q { user { ...A ...B } } fragment B on User { email }",
++  ],
++  ["two queries", "query A { user { name } } query B { transcripts { id } }"],
++  ["the word mutation in a comment", "# mutation\nquery Q { user { name } }"],
++  ["the word subscription in a comment", "query Q { user { name } } # subscription { x }"],
++  ["the word mutation in a double-quoted argument", 'query Q { transcripts(title: "mutation") { id } }'],
++  ["a mutation-looking string argument", 'query Q { transcripts(title: "mutation { deleteTranscript }") { id } }'],
++  ["fields named mutation and subscription", "query Q { mutation { id } subscription { id } }"],
++  ["a query named mutation", "query mutation { user { name } }"],
++  ["a query named subscription", "query subscription { user { name } }"],
++];
++
++describe("fireflies execute_graphql_query accepts read-only documents", () => {
++  it.each(accepted)("%s: sent once and unchanged", async (_name, query) => {
++    const result = await run({ query });
++
++    expect(globalFetch).not.toHaveBeenCalled();
++    expect(sent).toHaveLength(1);
++    expect(sent[0]!.url).toBe("https://api.fireflies.ai/graphql");
++    expect(sent[0]!.body.query).toBe(query);
++    expect(result).toMatchObject({ data: { ok: true } });
++  });
++
++  it("forwards operationName and variables", async () => {
++    await run({
++      query: "query A { user { name } } query B { transcripts { id } }",
++      operationName: "B",
++      variables: { limit: 3 },
++    });
++
++    expect(sent).toHaveLength(1);
++    expect(sent[0]!.body).toEqual({
++      query: "query A { user { name } } query B { transcripts { id } }",
++      operationName: "B",
++      variables: { limit: 3 },
++    });
++  });
++
++  it("sends neither operationName nor variables when none were given", async () => {
++    await run({ query: "{ user { name } }" });
++
++    expect(sent[0]!.body).toEqual({ query: "{ user { name } }" });
++  });
++});
++
++const rejected: [name: string, input: Record<string, unknown>][] = [
++  ["anonymous mutation", { query: 'mutation { deleteTranscript(id: "1") { id } }' }],
++  [
++    "named mutation selected by operationName",
++    { query: 'mutation Drop { deleteTranscript(id: "1") { id } }', operationName: "Drop" },
++  ],
++  ["subscription", { query: "subscription { x }" }],
++  ["query then mutation", { query: 'query Q { user { name } } mutation M { deleteTranscript(id: "1") { id } }' }],
++  ["mutation then query", { query: 'mutation M { deleteTranscript(id: "1") { id } } query Q { user { name } }' }],
++  [
++    "query then mutation with operationName naming the query",
++    { query: 'query Q { user { name } } mutation M { deleteTranscript(id: "1") { id } }', operationName: "Q" },
++  ],
++  [
++    "mutation then query with operationName naming the query",
++    { query: 'mutation M { deleteTranscript(id: "1") { id } } query Q { user { name } }', operationName: "Q" },
++  ],
++  ["query then subscription", { query: "query Q { user { name } } subscription S { x }" }],
++  ["subscription then query", { query: "subscription S { x } query Q { user { name } }" }],
++  [
++    "fragment, query and mutation",
++    { query: 'fragment F on User { name } query Q { user { ...F } } mutation { deleteTranscript(id: "1") { id } }' },
++  ],
++  ["syntax error: unbalanced brace", { query: "query Q { user { name }" }],
++  ["syntax error: not a document", { query: "this is not graphql" }],
++  ["unterminated ordinary string", { query: 'query Q { transcripts(title: "abc) { id } }' }],
++  ["fragment-only document", { query: "fragment F on User { name }" }],
++  ["comment-only input", { query: "# just a comment" }],
++  ["comment-only input over several lines", { query: "# one\n# two\n" }],
++  ["empty input", { query: "" }],
++  ["whitespace-only input", { query: "  \n\t  " }],
++];
++
++describe("fireflies execute_graphql_query rejects anything that is not all queries", () => {
++  it.each(rejected)("%s: 400 and no request", async (_name, input) => {
++    await expect(run(input)).rejects.toMatchObject({ status: 400 });
++
++    expect(sent).toHaveLength(0);
++    expect(globalFetch).not.toHaveBeenCalled();
++  });
++
++  it.each(rejected.filter(([, input]) => String(input.query).trim() !== ""))(
++    "%s: uses the read-only message",
++    async (_name, input) => {
++      await expect(run(input)).rejects.toMatchObject({ status: 400, message: rejectionMessage });
++    },
++  );
++});
++
++describe("fireflies execute_graphql_query label", () => {
++  it("is read in the action list and in the provider definition", () => {
++    const fromList = firefliesActions.find((action) => action.id === "fireflies.execute_graphql_query");
++    const fromProvider = provider.actions.find((action) => action.id === "fireflies.execute_graphql_query");
++
++    expect(fromList?.operationType).toBe("read");
++    expect(fromProvider?.operationType).toBe("read");
++  });
++
++  it("keeps delete_transcript destructive", () => {
++    const fromList = firefliesActions.find((action) => action.id === "fireflies.delete_transcript");
++    const fromProvider = provider.actions.find((action) => action.id === "fireflies.delete_transcript");
++
++    expect(fromList?.operationType).toBe("destructive");
++    expect(fromProvider?.operationType).toBe("destructive");
++  });
++});
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Fri, 20 Nov 2026 10:20:01 -0500
+Subject: [PATCH 2/4] fix(fireflies): parse GraphQL to enforce read-only
+ queries (#137)
+
+---
+ package-lock.json                  |  10 ++
+ package.json                       |   1 +
+ src/providers/fireflies/actions.ts |   2 +-
+ src/providers/fireflies/runtime.ts | 141 ++---------------------------
+ 4 files changed, 20 insertions(+), 134 deletions(-)
+
+diff --git a/package-lock.json b/package-lock.json
+index aead2d76..09d885f0 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -24,6 +24,7 @@
+         "fast-xml-builder": "^1.3.1",
+         "fast-xml-parser": "^5.11.2",
+         "fast-xml-validator": "^1.4.2",
++        "graphql": "16.15.0",
+         "hono": "^4.13.13",
+         "iconv-lite": "^0.7.3",
+         "imapflow": "^2.4.0",
+@@ -6147,6 +6148,15 @@
+       "integrity": "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==",
+       "license": "ISC"
+     },
++    "node_modules/graphql": {
++      "version": "16.15.0",
++      "resolved": "https://registry.npmjs.org/graphql/-/graphql-16.15.0.tgz",
++      "integrity": "sha512-32kz9FecohDiC/tgcViwnRXM7HFBVTPiW7pHO+DikKOI5KjhU/jNULOReXsrFqt2WAYbE9xFXsTffJw6iTO8qw==",
++      "license": "MIT",
++      "engines": {
++        "node": "^12.22.0 || ^14.16.0 || ^16.0.0 || >=17.0.0"
++      }
++    },
+     "node_modules/has-symbols": {
+       "version": "1.1.0",
+       "resolved": "https://registry.npmjs.org/has-symbols/-/has-symbols-1.1.0.tgz",
+diff --git a/package.json b/package.json
+index 75a871e6..3ee8f039 100644
+--- a/package.json
++++ b/package.json
+@@ -42,6 +42,7 @@
+     "fast-xml-builder": "^1.3.1",
+     "fast-xml-parser": "^5.11.2",
+     "fast-xml-validator": "^1.4.2",
++    "graphql": "16.15.0",
+     "hono": "^4.13.13",
+     "iconv-lite": "^0.7.3",
+     "imapflow": "^2.4.0",
+diff --git a/src/providers/fireflies/actions.ts b/src/providers/fireflies/actions.ts
+index 87c6f409..b0e004e5 100644
+--- a/src/providers/fireflies/actions.ts
++++ b/src/providers/fireflies/actions.ts
+@@ -974,7 +974,7 @@ export const firefliesActions: ActionDefinition[] = [
+   }),
+   defineProviderAction(service, {
+     name: "execute_graphql_query",
+-    operationType: "write",
++    operationType: "read",
+     description: "Execute a raw Fireflies GraphQL document and return the raw response.",
+     inputSchema: executeGraphqlQueryInputSchema,
+     outputSchema: executeGraphqlQueryOutputSchema,
+diff --git a/src/providers/fireflies/runtime.ts b/src/providers/fireflies/runtime.ts
+index 7b371696..e6290e09 100644
+--- a/src/providers/fireflies/runtime.ts
++++ b/src/providers/fireflies/runtime.ts
+@@ -2,6 +2,7 @@ import type { CredentialValidationResult } from "../../core/types.ts";
+ import type { ProviderActionHandlers } from "../provider-runtime.ts";
+ import type { ApiKeyProviderContext } from "../provider-runtime.ts";
+ 
++import { Kind, OperationTypeNode, parse } from "graphql";
+ import { compactObject, optionalRecord, optionalString } from "../../core/cast.ts";
+ import { providerUserAgent, ProviderRequestError } from "../provider-runtime.ts";
+ 
+@@ -1076,142 +1077,16 @@ function requireNestedObjectResponse(
+   return innerValue;
+ }
+ 
++/** True only for a document that parses and whose every operation is a query (fragments are allowed). */
+ function isReadOnlyGraphqlQuery(query: string): boolean {
+-  const normalized = trimLeadingFragmentDefinitions(stripGraphqlIgnoredSections(query).toLowerCase());
+-  if (containsGraphqlKeyword(normalized, "mutation") || containsGraphqlKeyword(normalized, "subscription")) {
++  let document;
++  try {
++    document = parse(query);
++  } catch {
+     return false;
+   }
+-  return normalized.startsWith("query") || normalized.startsWith("{");
+-}
+-
+-function stripGraphqlIgnoredSections(query: string): string {
+-  let result = "";
+-  let index = 0;
+-  let inComment = false;
+-  let stringDelimiter: '"' | "'" | null = null;
+-
+-  while (index < query.length) {
+-    const char = query[index];
+-    const nextChar = query[index + 1];
+-
+-    if (inComment) {
+-      if (char === "\n") {
+-        inComment = false;
+-        result += char;
+-      }
+-      index += 1;
+-      continue;
+-    }
+-
+-    if (stringDelimiter) {
+-      if (char === "\\") {
+-        index += 2;
+-        continue;
+-      }
+-      if (char === stringDelimiter) {
+-        stringDelimiter = null;
+-      }
+-      index += 1;
+-      continue;
+-    }
+-
+-    if (char === "#") {
+-      inComment = true;
+-      index += 1;
+-      continue;
+-    }
+-
+-    if (char === '"' || char === "'") {
+-      if (char === '"' && nextChar === '"' && query[index + 2] === '"') {
+-        const blockStringEnd = query.indexOf('"""', index + 3);
+-        if (blockStringEnd === -1) {
+-          return result;
+-        }
+-        index = blockStringEnd + 3;
+-        continue;
+-      }
+-      stringDelimiter = char;
+-      index += 1;
+-      continue;
+-    }
+-
+-    result += char;
+-    index += 1;
+-  }
+-
+-  return result;
+-}
+-
+-function trimLeadingFragmentDefinitions(query: string): string {
+-  let index = skipWhitespace(query, 0);
+-
+-  while (query.startsWith("fragment", index) && isGraphqlBoundary(query[index + "fragment".length])) {
+-    const selectionSetStart = query.indexOf("{", index + "fragment".length);
+-    if (selectionSetStart === -1) {
+-      return "";
+-    }
+-
+-    index = findSelectionSetEnd(query, selectionSetStart);
+-    if (index === -1) {
+-      return "";
+-    }
+-    index = skipWhitespace(query, index);
+-  }
+-
+-  return query.slice(index);
+-}
+-
+-function skipWhitespace(query: string, start: number): number {
+-  let index = start;
+-  while (index < query.length && /\s/.test(query[index]!)) {
+-    index += 1;
+-  }
+-  return index;
+-}
+-
+-function findSelectionSetEnd(query: string, selectionSetStart: number): number {
+-  let depth = 0;
+-  for (let index = selectionSetStart; index < query.length; index += 1) {
+-    const char = query[index];
+-    if (char === "{") {
+-      depth += 1;
+-      continue;
+-    }
+-    if (char !== "}") {
+-      continue;
+-    }
+-    depth -= 1;
+-    if (depth === 0) {
+-      return index + 1;
+-    }
+-  }
+-  return -1;
+-}
+-
+-function containsGraphqlKeyword(query: string, keyword: string): boolean {
+-  let index = query.indexOf(keyword);
+-  while (index !== -1) {
+-    const previousChar = query[index - 1];
+-    const nextChar = query[index + keyword.length];
+-    if (isGraphqlBoundary(previousChar) && isGraphqlBoundary(nextChar)) {
+-      return true;
+-    }
+-    index = query.indexOf(keyword, index + keyword.length);
+-  }
+-  return false;
+-}
+-
+-function isGraphqlBoundary(char: string | undefined): boolean {
+-  if (char === undefined) {
+-    return true;
+-  }
+-
+-  return !(
+-    (char >= "a" && char <= "z") ||
+-    (char >= "A" && char <= "Z") ||
+-    (char >= "0" && char <= "9") ||
+-    char === "_"
+-  );
++  const operations = document.definitions.filter((definition) => definition.kind === Kind.OPERATION_DEFINITION);
++  return operations.length > 0 && operations.every((operation) => operation.operation === OperationTypeNode.QUERY);
+ }
+ 
+ function createFirefliesRequestError(error: unknown, query: string, operationName?: string): ProviderRequestError {
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Fri, 20 Nov 2026 12:02:13 -0500
+Subject: [PATCH 3/4] test: Fireflies guard sends the printed document and only
+ executable definitions (#137)
+
+---
+ src/providers/fireflies/runtime.test.ts | 63 ++++++++++++++++++++-----
+ 1 file changed, 50 insertions(+), 13 deletions(-)
+
+diff --git a/src/providers/fireflies/runtime.test.ts b/src/providers/fireflies/runtime.test.ts
+index 29c6a714..f5ad55fc 100644
+--- a/src/providers/fireflies/runtime.test.ts
++++ b/src/providers/fireflies/runtime.test.ts
+@@ -1,12 +1,13 @@
++import { parse, print } from "graphql";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { firefliesActions } from "./actions.ts";
+ import { provider } from "./definition.ts";
+ import { firefliesActionHandlers } from "./runtime.ts";
+ 
+ /**
+- * fireflies.execute_graphql_query forwards a caller-supplied document, so it only accepts documents whose
+- * operations are all queries. Expected outcomes below are literals chosen from the GraphQL grammar, not derived
+- * from the code under test.
++ * fireflies.execute_graphql_query only accepts documents that hold executable definitions, with every operation a
++ * query, and it forwards the printed form of the document it parsed. Rejections are literals chosen from the
++ * GraphQL grammar; the forwarded text is computed with print(parse(...)) from the graphql package.
+  */
+ 
+ const rejectionMessage = "execute_graphql_query only allows read-only query operations";
+@@ -57,26 +58,42 @@ const accepted: [name: string, query: string][] = [
+ ];
+ 
+ describe("fireflies execute_graphql_query accepts read-only documents", () => {
+-  it.each(accepted)("%s: sent once and unchanged", async (_name, query) => {
++  it.each(accepted)("%s: sent once as the printed form", async (_name, query) => {
+     const result = await run({ query });
+ 
+     expect(globalFetch).not.toHaveBeenCalled();
+     expect(sent).toHaveLength(1);
+     expect(sent[0]!.url).toBe("https://api.fireflies.ai/graphql");
+-    expect(sent[0]!.body.query).toBe(query);
++    expect(sent[0]!.body.query).toBe(print(parse(query)));
+     expect(result).toMatchObject({ data: { ok: true } });
+   });
+ 
+-  it("forwards operationName and variables", async () => {
+-    await run({
+-      query: "query A { user { name } } query B { transcripts { id } }",
+-      operationName: "B",
+-      variables: { limit: 3 },
+-    });
++  it("sends the canonical printed text, not the caller's text", async () => {
++    await run({ query: "{   user   {  name  }  }" });
++
++    expect(sent).toHaveLength(1);
++    expect(sent[0]!.body.query).toBe("{\n  user {\n    name\n  }\n}");
++  });
++
++  it("sends no comment text in the request body", async () => {
++    await run({ query: "# note about this query\nquery Q {\n  user { name } # trailing remark\n}\n# closing note" });
++
++    expect(sent).toHaveLength(1);
++    const raw = JSON.stringify(sent[0]!.body);
++    expect(raw).not.toContain("note about");
++    expect(raw).not.toContain("trailing remark");
++    expect(raw).not.toContain("closing note");
++    expect(raw).not.toContain("#");
++    expect(sent[0]!.body.query).toBe("query Q {\n  user {\n    name\n  }\n}");
++  });
++
++  it("forwards operationName and variables as given", async () => {
++    const query = "query A { user { name } } query B { transcripts { id } }";
++    await run({ query, operationName: "B", variables: { limit: 3 } });
+ 
+     expect(sent).toHaveLength(1);
+     expect(sent[0]!.body).toEqual({
+-      query: "query A { user { name } } query B { transcripts { id } }",
++      query: print(parse(query)),
+       operationName: "B",
+       variables: { limit: 3 },
+     });
+@@ -85,7 +102,7 @@ describe("fireflies execute_graphql_query accepts read-only documents", () => {
+   it("sends neither operationName nor variables when none were given", async () => {
+     await run({ query: "{ user { name } }" });
+ 
+-    expect(sent[0]!.body).toEqual({ query: "{ user { name } }" });
++    expect(sent[0]!.body).toEqual({ query: print(parse("{ user { name } }")) });
+   });
+ });
+ 
+@@ -118,6 +135,26 @@ const rejected: [name: string, input: Record<string, unknown>][] = [
+   ["fragment-only document", { query: "fragment F on User { name }" }],
+   ["comment-only input", { query: "# just a comment" }],
+   ["comment-only input over several lines", { query: "# one\n# two\n" }],
++  ["type definition next to a query", { query: "type T { a: Int } query Q { user { name } }" }],
++  ["query next to a type definition", { query: "query Q { user { name } } type T { a: Int }" }],
++  ["schema definition next to a query", { query: "schema { query: Q } query Q { user { name } }" }],
++  ["query next to a schema definition", { query: "query Q { user { name } } schema { query: Q }" }],
++  ["type extension next to a query", { query: "extend type T { b: Int } query Q { user { name } }" }],
++  ["query next to a type extension", { query: "query Q { user { name } } extend type T { b: Int }" }],
++  ["schema extension next to a query", { query: "extend schema { subscription: S } query Q { user { name } }" }],
++  ["scalar definition next to a query", { query: "scalar Date query Q { user { name } }" }],
++  ["enum definition next to a query", { query: "query Q { user { name } } enum E { A B }" }],
++  ["input definition next to a query", { query: "input I { a: Int } query Q { user { name } }" }],
++  ["interface definition next to a query", { query: "interface N { id: ID } query Q { user { name } }" }],
++  ["union definition next to a query", { query: "union U = A | B query Q { user { name } }" }],
++  ["directive definition next to a query", { query: "directive @d on FIELD query Q { user { name } }" }],
++  [
++    "type definition next to a fragment and a query",
++    {
++      query: "fragment F on User { name } type T { a: Int } query Q { user { ...F } }",
++    },
++  ],
++  ["type definition alone", { query: "type T { a: Int }" }],
+   ["empty input", { query: "" }],
+   ["whitespace-only input", { query: "  \n\t  " }],
+ ];
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Fri, 20 Nov 2026 12:03:35 -0500
+Subject: [PATCH 4/4] fix(fireflies): send the printed document; accept only
+ executable definitions (#137)
+
+---
+ src/providers/fireflies/runtime.ts | 26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/src/providers/fireflies/runtime.ts b/src/providers/fireflies/runtime.ts
+index e6290e09..219ec2bc 100644
+--- a/src/providers/fireflies/runtime.ts
++++ b/src/providers/fireflies/runtime.ts
+@@ -2,7 +2,7 @@ import type { CredentialValidationResult } from "../../core/types.ts";
+ import type { ProviderActionHandlers } from "../provider-runtime.ts";
+ import type { ApiKeyProviderContext } from "../provider-runtime.ts";
+ 
+-import { Kind, OperationTypeNode, parse } from "graphql";
++import { Kind, OperationTypeNode, parse, print } from "graphql";
+ import { compactObject, optionalRecord, optionalString } from "../../core/cast.ts";
+ import { providerUserAgent, ProviderRequestError } from "../provider-runtime.ts";
+ 
+@@ -915,13 +915,14 @@ async function deleteTranscript(input: Record<string, unknown>, context: Firefli
+ 
+ async function executeGraphqlQuery(input: Record<string, unknown>, context: FirefliesActionContext): Promise<unknown> {
+   const query = requireStringInput(input, "query");
+-  if (!isReadOnlyGraphqlQuery(query)) {
++  const printedQuery = printReadOnlyGraphqlQuery(query);
++  if (printedQuery === undefined) {
+     throw new ProviderRequestError(400, "execute_graphql_query only allows read-only query operations");
+   }
+ 
+   const response = await firefliesGraphqlRequest<Record<string, unknown>>(
+     context,
+-    query,
++    printedQuery,
+     optionalRecord(input.variables),
+     optionalString(input.operationName),
+   );
+@@ -1077,16 +1078,27 @@ function requireNestedObjectResponse(
+   return innerValue;
+ }
+ 
+-/** True only for a document that parses and whose every operation is a query (fragments are allowed). */
+-function isReadOnlyGraphqlQuery(query: string): boolean {
++/**
++ * Returns the printed form of the document when it parses, contains only executable definitions
++ * (operations and fragments) and every operation is a query; otherwise undefined.
++ * The printed form is what gets sent, so the server sees exactly what was checked.
++ */
++function printReadOnlyGraphqlQuery(query: string): string | undefined {
+   let document;
+   try {
+     document = parse(query);
+   } catch {
+-    return false;
++    return undefined;
++  }
++  const executableOnly = document.definitions.every(
++    (definition) => definition.kind === Kind.OPERATION_DEFINITION || definition.kind === Kind.FRAGMENT_DEFINITION,
++  );
++  if (!executableOnly) {
++    return undefined;
+   }
+   const operations = document.definitions.filter((definition) => definition.kind === Kind.OPERATION_DEFINITION);
+-  return operations.length > 0 && operations.every((operation) => operation.operation === OperationTypeNode.QUERY);
++  const allQueries = operations.every((operation) => operation.operation === OperationTypeNode.QUERY);
++  return operations.length > 0 && allQueries ? print(document) : undefined;
+ }
+ 
+ function createFirefliesRequestError(error: unknown, query: string, operationName?: string): ProviderRequestError {
+-- 
+2.34.1
+
