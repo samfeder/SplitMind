@@ -1,0 +1,241 @@
+SplitMind patch 0027 for OpenConnector v1.9.2. Apply after 0026.
+Upstream issue: not filed yet. Types for the grant-key listing added in 0025 (#131, #149).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Fri, 20 Nov 2026 12:10:34 -0500
+Subject: [PATCH] fix(mcp-oauth): type the KV grant listing (types only)
+
+---
+ src/server/cloudflare/cloudflare-bindings.ts  | 20 ++++++++++--
+ .../cloudflare/mcp-oauth-grant-flow.test.ts   | 31 ++++++++++---------
+ src/server/cloudflare/mcp-oauth.ts            | 20 ++++++++----
+ 3 files changed, 49 insertions(+), 22 deletions(-)
+
+diff --git a/src/server/cloudflare/cloudflare-bindings.ts b/src/server/cloudflare/cloudflare-bindings.ts
+index 7934f563..a3e517aa 100644
+--- a/src/server/cloudflare/cloudflare-bindings.ts
++++ b/src/server/cloudflare/cloudflare-bindings.ts
+@@ -1,5 +1,7 @@
+ export interface D1DatabaseBinding {
+-  batch(statements: D1PreparedStatementBinding[]): Promise<{ results: Record<string, unknown>[] | null; meta?: { changes?: number } }[]>;
++  batch(
++    statements: D1PreparedStatementBinding[],
++  ): Promise<{ results: Record<string, unknown>[] | null; meta?: { changes?: number } }[]>;
+   prepare(query: string): D1PreparedStatementBinding;
+ }
+ 
+@@ -35,13 +37,27 @@ export interface KVNamespaceBinding {
+   put(
+     key: string,
+     value: string | ArrayBuffer | ArrayBufferView | ReadableStream,
+-    options?: { expirationTtl?: number; expiration?: number },
++    options?: { expirationTtl?: number; expiration?: number; metadata?: unknown },
+   ): Promise<void>;
+   get(key: string, type: "text"): Promise<string | null>;
+   get(key: string, type: "arrayBuffer"): Promise<ArrayBuffer | null>;
+   delete(key: string): Promise<void>;
+ }
+ 
++/** One page of a KV key listing. `cursor` is present when `list_complete` is false. */
++export interface KVListPage {
++  keys: { name: string; metadata?: unknown }[];
++  list_complete: boolean;
++  cursor?: string;
++}
++
++/** The slice of KV the MCP OAuth library uses: JSON reads and key listings, on top of the transit-file slice. */
++export interface OAuthKVNamespaceBinding extends KVNamespaceBinding {
++  // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return JSON of a caller-chosen shape.
++  get<T = any>(key: string, options: string | { type: string }): Promise<T | null>;
++  list(options?: { prefix?: string; cursor?: string }): Promise<KVListPage>;
++}
++
+ /** The slice of a Durable Object namespace the MCP OAuth anonymous-write budget uses. */
+ export interface DurableObjectNamespaceBinding {
+   idFromName(name: string): unknown;
+diff --git a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+index 962e67a5..75c2217b 100644
+--- a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
++++ b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+@@ -2,7 +2,7 @@
+ // (SplitMind #78 review follow-up 9), and the consent page's form must actually submit them (#130). This lives in its own file because the Worker caches the catalog per module
+ // instance, and these tests need a catalog with read, write and destructive actions. The actions are made up, filed
+ // under the real api_key provider 17track, because the Worker only connects providers it can execute.
+-import type { AssetsBinding, KVNamespaceBinding } from "./cloudflare-bindings.ts";
++import type { AssetsBinding, KVListPage, OAuthKVNamespaceBinding } from "./cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ 
+ import { createHash } from "node:crypto";
+@@ -72,7 +72,7 @@ function context(): Parameters<typeof worker.fetch>[2] {
+   return { waitUntil() {}, passThroughOnException() {} };
+ }
+ 
+-class MemoryKV implements KVNamespaceBinding {
++class MemoryKV implements OAuthKVNamespaceBinding {
+   private readonly store = new Map<string, string>();
+   private readonly keyMetadata = new Map<string, unknown>();
+   /** Decides whether a put keeps its key metadata. Tests use it to write grants as a pre-metadata library would. */
+@@ -81,7 +81,8 @@ class MemoryKV implements KVNamespaceBinding {
+   async put(key: string, value: unknown, options?: { metadata?: unknown }): Promise<void> {
+     const text = typeof value === "string" ? value : new TextDecoder().decode(value as ArrayBuffer);
+     this.store.set(key, text);
+-    if (options?.metadata !== undefined && this.keepsKeyMetadata(key, text)) this.keyMetadata.set(key, options.metadata);
++    if (options?.metadata !== undefined && this.keepsKeyMetadata(key, text))
++      this.keyMetadata.set(key, options.metadata);
+     else this.keyMetadata.delete(key);
+   }
+   // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return text, JSON or bytes by option.
+@@ -101,7 +102,7 @@ class MemoryKV implements KVNamespaceBinding {
+   protected listedKey(name: string): { name: string; metadata?: unknown } {
+     return this.keyMetadata.has(name) ? { name, metadata: this.keyMetadata.get(name) } : { name };
+   }
+-  async list(options?: { prefix?: string }): Promise<{ keys: { name: string; metadata?: unknown }[]; list_complete: true }> {
++  async list(options?: { prefix?: string; cursor?: string }): Promise<KVListPage> {
+     const prefix = options?.prefix ?? "";
+     return {
+       keys: [...this.store.keys()].filter((key) => key.startsWith(prefix)).map((name) => this.listedKey(name)),
+@@ -637,7 +638,7 @@ async function liveIds(testEnv: CloudflareEnv): Promise<Set<string>> {
+ 
+ /** Backing token ids of the administrator's grants that are in the KV right now. */
+ async function grantBackedIds(testEnv: CloudflareEnv): Promise<Set<string>> {
+-  const kv = testEnv.OAUTH_KV as KVNamespaceBinding;
++  const kv = testEnv.OAUTH_KV as OAuthKVNamespaceBinding;
+   const ids = new Set<string>();
+   let cursor: string | undefined;
+   do {
+@@ -710,9 +711,7 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+     expect(exchanged.status).toBe(200);
+     expect((await exchanged.json()).access_token).toBeTruthy();
+ 
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([
+-      expect.objectContaining({ count: 1 }),
+-    ]);
++    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([expect.objectContaining({ count: 1 })]);
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+   });
+ 
+@@ -891,7 +890,7 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+ 
+ /** The grants in the KV, as grantId -> backing token id. */
+ async function grantIdsByToken(testEnv: CloudflareEnv): Promise<Map<string, string>> {
+-  const kv = testEnv.OAUTH_KV as KVNamespaceBinding;
++  const kv = testEnv.OAUTH_KV as OAuthKVNamespaceBinding;
+   const map = new Map<string, string>();
+   const page = (await kv.list({ prefix: "grant:administrator:" })) as { keys: { name: string }[] };
+   for (const key of page.keys) {
+@@ -1009,8 +1008,7 @@ class ProbeKV extends MemoryKV {
+     if (this.armed) this.gets.push(key);
+     return super.get(key, options);
+   }
+-  // oxlint-disable-next-line typescript/no-explicit-any -- the KV list signature carries a cursor and a limit.
+-  override async list(options?: any): Promise<any> {
++  override async list(options?: { prefix?: string; cursor?: string }): Promise<KVListPage> {
+     const isGrantList = this.armed && typeof options?.prefix === "string" && options.prefix.startsWith("grant:");
+     const phase = this.grantWritten ? "after" : "before";
+     if (isGrantList) {
+@@ -1023,7 +1021,7 @@ class ProbeKV extends MemoryKV {
+     }
+     const result = await super.list(options);
+     if (isGrantList && phase === "after" && this.hideAfter.size > 0) {
+-      return { ...result, keys: result.keys.filter((key: { name: string }) => !this.hideAfter.has(key.name)) };
++      return { ...result, keys: result.keys.filter((key) => !this.hideAfter.has(key.name)) };
+     }
+     return result;
+   }
+@@ -1227,7 +1225,10 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     const targetKey = await onlyGrantKeyOf(kv, target);
+     expect(listed.get(targetKey)).not.toHaveProperty("metadata");
+     expect(listed.get(await onlyGrantKeyOf(kv, legacyOther))).not.toHaveProperty("metadata");
+-    expect(listed.get(await onlyGrantKeyOf(kv, modernOther))).toHaveProperty("metadata", expect.objectContaining({ clientId: modernOther }));
++    expect(listed.get(await onlyGrantKeyOf(kv, modernOther))).toHaveProperty(
++      "metadata",
++      expect.objectContaining({ clientId: modernOther }),
++    );
+ 
+     const targetToken = await tokenOfGrant(kv, targetKey);
+     const legacyOtherToken = await tokenOfGrant(kv, await onlyGrantKeyOf(kv, legacyOther));
+@@ -1263,7 +1264,9 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+ 
+     codeOf(await consent(e, clientId));
+ 
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").filter((event) => (event.count as number) > 0)).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_tokens_revoked").filter((event) => (event.count as number) > 0)).toEqual(
++      [],
++    );
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+     expect((await liveIds(e)).size).toBe(1);
+   });
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index 15c32704..44dd30e7 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -1,3 +1,4 @@
++import type { OAuthKVNamespaceBinding } from "./cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ import type { BudgetLimit } from "./mcp-oauth-anonymous-write-budget.ts";
+ import type { OAuthProviderOptions, OAuthResourceAuth } from "@cloudflare/workers-oauth-provider";
+@@ -197,7 +198,7 @@ export function createMcpOAuthHandler(
+             allowedConnections: scope.allowedConnections,
+             allowedTriggers: [],
+           });
+-          const grantsBefore = await listClientGrantsBestEffort(env.OAUTH_KV, auth.clientId);
++          const grantsBefore = await listClientGrantsBestEffort(env.OAUTH_KV as OAuthKVNamespaceBinding, auth.clientId);
+           let authorization;
+           try {
+             authorization = await oauth.completeAuthorization({
+@@ -212,7 +213,7 @@ export function createMcpOAuthHandler(
+             throw error;
+           }
+           // The library deletes superseded grants' KV entries only; revoke their backing tokens too.
+-          await revokeSupersededTokens(env.OAUTH_KV, tokens, grantsBefore);
++          await revokeSupersededTokens(env.OAUTH_KV as OAuthKVNamespaceBinding, tokens, grantsBefore);
+           return new Response(null, {
+             status: 302,
+             headers: { Location: authorization.redirectTo, "Cache-Control": "no-store" },
+@@ -544,7 +545,7 @@ function errorName(error: unknown): string {
+ }
+ 
+ /** Every administrator grant key and its key metadata, following the cursor to the end. Keys only: no values are read. */
+-async function listAdministratorGrantKeys(kv: KVNamespace): Promise<GrantKey[]> {
++async function listAdministratorGrantKeys(kv: OAuthKVNamespaceBinding): Promise<GrantKey[]> {
+   const keys: GrantKey[] = [];
+   let cursor: string | undefined;
+   do {
+@@ -559,7 +560,11 @@ async function listAdministratorGrantKeys(kv: KVNamespace): Promise<GrantKey[]>
+  * The grants of one client, with their backing token ids. Only matching grants are read: a key whose metadata names
+  * another client is skipped, and a key without metadata (written by an older library) is read and compared.
+  */
+-async function readClientGrants(kv: KVNamespace, keys: GrantKey[], clientId: string): Promise<AdministratorGrant[]> {
++async function readClientGrants(
++  kv: OAuthKVNamespaceBinding,
++  keys: GrantKey[],
++  clientId: string,
++): Promise<AdministratorGrant[]> {
+   const grants: AdministratorGrant[] = [];
+   for (const key of keys) {
+     const keyClientId = (key.metadata as { clientId?: unknown } | null | undefined)?.clientId;
+@@ -574,7 +579,10 @@ async function readClientGrants(kv: KVNamespace, keys: GrantKey[], clientId: str
+ }
+ 
+ /** Null when listing fails: the consent still completes, and nothing is revoked afterwards. */
+-async function listClientGrantsBestEffort(kv: KVNamespace, clientId: string): Promise<AdministratorGrant[] | null> {
++async function listClientGrantsBestEffort(
++  kv: OAuthKVNamespaceBinding,
++  clientId: string,
++): Promise<AdministratorGrant[] | null> {
+   try {
+     return await readClientGrants(kv, await listAdministratorGrantKeys(kv), clientId);
+   } catch (error) {
+@@ -589,7 +597,7 @@ async function listClientGrantsBestEffort(kv: KVNamespace, clientId: string): Pr
+ 
+ /** This client's grants present before and absent after the library's own supersede step lose their backing token. Best effort. */
+ async function revokeSupersededTokens(
+-  kv: KVNamespace,
++  kv: OAuthKVNamespaceBinding,
+   tokens: ReturnType<typeof runtimeTokens>,
+   before: AdministratorGrant[] | null,
+ ): Promise<void> {
+-- 
+2.34.1
+
