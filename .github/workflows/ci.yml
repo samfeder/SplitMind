@@ -60,6 +60,8 @@ jobs:
         run: scripts/bootstrap.sh
       - name: No test fixture dates near expiry
         run: node scripts/check-vendor-dates.ts
+      - name: OpenConnector typecheck (patched)
+        run: cd vendor/open-connector && npm run -s typecheck
       - name: OpenConnector test suite (patched)
         run: cd vendor/open-connector && npx vitest run --reporter=dot --testTimeout=30000
       - name: Submodule is at the pinned commit

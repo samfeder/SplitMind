@@ -1,0 +1,809 @@
+SplitMind patch 0028 for OpenConnector v1.9.2. Apply after 0027.
+Upstream issue: not filed yet. Confirm superseded grants with a get and bound the scan (#143, #145).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sat, 21 Nov 2026 15:29:34 -0300
+Subject: [PATCH 1/2] test: exact, bounded superseded-token revoke (#143, #145)
+
+---
+ .../cloudflare/mcp-oauth-grant-flow.test.ts   | 556 ++++++++++++++++--
+ 1 file changed, 496 insertions(+), 60 deletions(-)
+
+diff --git a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+index 75c2217b..b38fa34e 100644
+--- a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
++++ b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+@@ -711,11 +711,13 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+     expect(exchanged.status).toBe(200);
+     expect((await exchanged.json()).access_token).toBeTruthy();
+ 
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([expect.objectContaining({ count: 1 })]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+   });
+ 
+-  it("A1b: a third approve revokes only the second's token, and the count logged is 1 each time", async () => {
++  it("A1b: a third approve revokes only the second's token, and one candidate and one revoke are logged each time", async () => {
+     const clientId = await registerClient();
+     const before = await liveIds(env);
+     const logs = captureEvents();
+@@ -730,10 +732,15 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+     const created = difference(await liveIds(env), before);
+     expect(created).toHaveLength(1);
+     expect(created).not.toContain(secondToken[0]);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").map((event) => event.count)).toEqual([1, 1]);
++    expect(
++      logs.events("mcp_oauth_superseded_tokens_checked").map((event) => [event.candidates, event.revoked]),
++    ).toEqual([
++      [1, 1],
++      [1, 1],
++    ]);
+   });
+ 
+-  it("A1c: the first approve for a client revokes nothing and logs no revocation", async () => {
++  it("A1c: the first approve for a client revokes nothing and logs no check", async () => {
+     const clientId = await registerClient();
+     const before = await liveIds(env);
+     const logs = captureEvents();
+@@ -743,7 +750,7 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+     expect(difference(await liveIds(env), before)).toHaveLength(1);
+     // Nothing that was live before went away.
+     expect(difference(before, await liveIds(env))).toEqual([]);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").every((event) => event.count === 0)).toBe(true);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([]);
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+   });
+ 
+@@ -818,7 +825,9 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+     // No token values: not the runtime token prefix, and not the administrator token.
+     expect(logs.text()).not.toMatch(/oct_[A-Za-z0-9_-]{10,}/);
+     expect(logs.text()).not.toContain(adminToken);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").every((event) => event.count === 0)).toBe(true);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 0 }),
++    ]);
+   });
+ 
+   it("A4: a deny POST after an approve leaves the first token live", async () => {
+@@ -861,7 +870,7 @@ describe("a repeated approve leaves no second live runtime token (#131)", () =>
+ 
+     expect(refused.status).toBe(400);
+     expect(difference(await liveIds(env), before)).toEqual(first);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([]);
+   });
+ 
+   it("A6: a grant listing that spans several KV pages is followed to the end, and unrelated grants keep their tokens", async () => {
+@@ -987,12 +996,32 @@ class ProbeKV extends MemoryKV {
+   listPhases: ("before" | "after")[] = [];
+   failFirst: { before?: Error; after?: Error } = {};
+   hideAfter = new Set<string>();
++  /** Patch 0028: every get() and list() issued after the new grant was written, which is all the handler's own. */
++  getsAfterWrite: string[] = [];
++  listPrefixesAfterWrite: (string | undefined)[] = [];
++  /** A get() of one of these keys after the new grant was written throws (once per call), and is recorded here. */
++  failGetAfterWrite = new Map<string, Error>();
++  getFaultsHit: string[] = [];
++  /** A delete() of one of these keys is silently dropped, as a delete the library failed to make would be. */
++  keepOnDelete = new Set<string>();
++  /**
++   * The handler's own before-step reads, apart from the library's. The handler lists (with no `limit`) and reads
++   * first; the library's findGrants then lists with a `limit`, and everything read from there to its put is the
++   * library's. `libraryScanSeen` lets a test check that boundary still exists.
++   */
++  handlerBeforeGets: string[] = [];
++  libraryScanSeen = false;
+   private armed = false;
+   private grantWritten = false;
+ 
+   arm(): void {
+     this.gets = [];
+     this.listPhases = [];
++    this.getsAfterWrite = [];
++    this.listPrefixesAfterWrite = [];
++    this.getFaultsHit = [];
++    this.handlerBeforeGets = [];
++    this.libraryScanSeen = false;
+     this.grantWritten = false;
+     this.armed = true;
+   }
+@@ -1006,9 +1035,26 @@ class ProbeKV extends MemoryKV {
+   // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return text, JSON or bytes by option.
+   override async get(key: string, options?: unknown): Promise<any> {
+     if (this.armed) this.gets.push(key);
++    if (this.armed && !this.grantWritten && !this.libraryScanSeen) this.handlerBeforeGets.push(key);
++    if (this.armed && this.grantWritten) {
++      this.getsAfterWrite.push(key);
++      const fault = this.failGetAfterWrite.get(key);
++      if (fault) {
++        this.getFaultsHit.push(key);
++        throw fault;
++      }
++    }
+     return super.get(key, options);
+   }
++  override async delete(key: string): Promise<void> {
++    if (this.armed && this.keepOnDelete.has(key)) return;
++    return super.delete(key);
++  }
+   override async list(options?: { prefix?: string; cursor?: string }): Promise<KVListPage> {
++    if (this.armed && this.grantWritten) this.listPrefixesAfterWrite.push(options?.prefix);
++    if (this.armed && !this.grantWritten && (options as { limit?: number } | undefined)?.limit !== undefined) {
++      this.libraryScanSeen = true;
++    }
+     const isGrantList = this.armed && typeof options?.prefix === "string" && options.prefix.startsWith("grant:");
+     const phase = this.grantWritten ? "after" : "before";
+     if (isGrantList) {
+@@ -1065,33 +1111,6 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     vi.restoreAllMocks();
+   });
+ 
+-  it("(a) a KV list that fails only after completeAuthorization still redirects with a code, logs stage list_after, and leaves the old token live", async () => {
+-    const kv = new ProbeKV();
+-    const e = envWith(kv);
+-    const clientId = await register(e, "Budget (a)");
+-    codeOf(await consent(e, clientId));
+-    const old = [...(await liveIds(e))];
+-    expect(old).toHaveLength(1);
+-    const logs = captureEvents();
+-
+-    kv.failFirst.after = new Error("simulated KV list failure after completeAuthorization");
+-    kv.arm();
+-    const response = await consent(e, clientId);
+-    kv.disarm();
+-
+-    const code = codeOf(response);
+-    // The fault was really hit: the handler listed grants after the library had written the new one.
+-    expect(kv.listPhases).toContain("after");
+-    expect(kv.failFirst.after).toBeUndefined();
+-    const failed = logs.events("mcp_oauth_superseded_token_revoke_failed");
+-    expect(failed).toHaveLength(1);
+-    expect(failed[0]).toEqual(expect.objectContaining({ stage: "list_after" }));
+-    expect(await liveIds(e)).toContain(old[0]);
+-    expect((await liveIds(e)).size).toBe(2);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").every((event) => event.count === 0)).toBe(true);
+-    expect((await exchange(e, clientId, code)).status).toBe(200);
+-  });
+-
+   it("(b) a KV list that fails before completeAuthorization still redirects with a code, logs stage list_before, and the new token is valid", async () => {
+     const kv = new ProbeKV();
+     const e = envWith(kv);
+@@ -1116,7 +1135,8 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     expect(await liveIds(e)).toContain(backed[0]);
+     const exchanged = await exchange(e, clientId, code);
+     expect(exchanged.status).toBe(200);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").every((event) => event.count === 0)).toBe(true);
++    // The before-step failed, so there were no candidates and nothing was checked.
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([]);
+   });
+ 
+   it("(c) with 60 other clients' grants and one earlier grant for this client, a re-approve reads none of the others and stays within 15 KV gets", async () => {
+@@ -1172,14 +1192,15 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     kv.disarm();
+ 
+     codeOf(response);
+-    expect(kv.listPhases).toContain("after");
+     const live = await liveIds(e);
+     expect(live.has(bystanderToken)).toBe(true);
+     expect(live.has(targetToken)).toBe(false);
+     expect(live.size).toBe(2);
+     // The bystander's grant itself is untouched in the KV.
+     expect((await grantClients(kv)).get(bystanderKey)).toBe(bystander);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([expect.objectContaining({ count: 1 })]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
+   });
+ 
+   it("(d2) the same stale after-list cannot cost a bystander its token when the bystander's grant has no key metadata", async () => {
+@@ -1244,7 +1265,9 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     expect(live.has(modernOtherToken)).toBe(true);
+     expect(live.size).toBe(3);
+     expect(difference(live, await grantBackedIds(e))).toEqual([]);
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked")).toEqual([expect.objectContaining({ count: 1 })]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+     expect((await exchange(e, target, code)).status).toBe(200);
+   });
+@@ -1264,32 +1287,32 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+ 
+     codeOf(await consent(e, clientId));
+ 
+-    expect(logs.events("mcp_oauth_superseded_tokens_revoked").filter((event) => (event.count as number) > 0)).toEqual(
+-      [],
+-    );
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 0 }),
++    ]);
+     expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
+     expect((await liveIds(e)).size).toBe(1);
+   });
+ 
+-  it.each([
+-    ["list_before", "before"],
+-    ["list_after", "after"],
+-  ] as const)("R4: a %s failure logs the error's name and never its message", async (stage, phase) => {
+-    const kv = new ProbeKV();
+-    const e = envWith(kv);
+-    const clientId = await register(e, `Error name ${stage}`);
+-    codeOf(await consent(e, clientId));
+-    const logs = captureEvents();
+-
+-    kv.failFirst[phase] = new RangeError("kv-detail-that-must-not-be-logged-31337");
+-    kv.arm();
+-    codeOf(await consent(e, clientId));
+-    kv.disarm();
+-
+-    const failed = logs.events("mcp_oauth_superseded_token_revoke_failed");
+-    expect(failed).toEqual([expect.objectContaining({ stage, errorName: "RangeError" })]);
+-    expect(logs.text()).not.toContain("kv-detail-that-must-not-be-logged-31337");
+-  });
++  it.each([["list_before", "before"]] as const)(
++    "R4: a %s failure logs the error's name and never its message",
++    async (stage, phase) => {
++      const kv = new ProbeKV();
++      const e = envWith(kv);
++      const clientId = await register(e, `Error name ${stage}`);
++      codeOf(await consent(e, clientId));
++      const logs = captureEvents();
++
++      kv.failFirst[phase] = new RangeError("kv-detail-that-must-not-be-logged-31337");
++      kv.arm();
++      codeOf(await consent(e, clientId));
++      kv.disarm();
++
++      const failed = logs.events("mcp_oauth_superseded_token_revoke_failed");
++      expect(failed).toEqual([expect.objectContaining({ stage, errorName: "RangeError" })]);
++      expect(logs.text()).not.toContain("kv-detail-that-must-not-be-logged-31337");
++    },
++  );
+ 
+   it("R4: a revoke failure logs the grant id and the error's name, never its message or a token value", async () => {
+     const clientId = await registerClient();
+@@ -1308,3 +1331,416 @@ describe("the superseded-token revoke is cheap in KV reads and only touches the
+     expect(logs.text()).not.toMatch(/oct_[A-Za-z0-9_-]{10,}/);
+   });
+ });
++
++// ---------------------------------------------------------------------------------------------------------------
++// Patch 0028 (#143, #145): an exact and bounded superseded-token revoke.
++//
++// The handler no longer lists grants after completeAuthorization. It `get`s each candidate's key (a candidate is one
++// of this client's grants from the before-step) and revokes the backing token only when that get returns null.
++// The before-step's reads of keys without metadata are capped at 50 per approve.
++//
++// How T1 is built: the OAuth library replaces an earlier grant only when it has the same client, and the same resource
++// (and, for a CIMD client, the same redirect URI). This Worker has exactly one resource, so "another resource" cannot
++// be set up through it; a CIMD client approved with two different redirect URIs can, and is a real library path
++// (completeAuthorization's `isCimdClient && grant.redirectUri === request.redirectUri`). The CIMD document is served
++// through the global fetch, as in mcp-oauth.test.ts.
++// ---------------------------------------------------------------------------------------------------------------
++
++const cimdClientUrl = "https://cimd.example.net/client.json";
++const callbackA = claudeCallback;
++const callbackB = "https://claude.com/api/mcp/auth_callback";
++
++/** Serves the CIMD document for `cimdClientUrl` (two redirect URIs) through the global fetch, and turns CIMD on. */
++function stubCimdTwoRedirects(): void {
++  vi.stubGlobal("Cloudflare", { compatibilityFlags: { global_fetch_strictly_public: true } });
++  vi.stubGlobal("fetch", async (input: string | URL | Request) => {
++    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
++    return url === cimdClientUrl
++      ? Response.json({
++          client_id: cimdClientUrl,
++          client_name: "CIMD client",
++          redirect_uris: [callbackA, callbackB],
++          grant_types: ["authorization_code", "refresh_token"],
++          response_types: ["code"],
++          token_endpoint_auth_method: "none",
++        })
++      : new Response("not found", { status: 404 });
++  });
++}
++
++/** Keys of the administrator grants a client holds for one redirect URI, read from the stored records. */
++async function grantKeysFor(kv: MemoryKV, clientId: string, redirectUri: string): Promise<string[]> {
++  const keys: string[] = [];
++  for (const key of (await kv.list({ prefix: grantPrefix })).keys) {
++    if (key.name.slice(grantPrefix.length).includes(":")) continue;
++    const grant = await kv.get(key.name, { type: "json" });
++    if (grant?.clientId === clientId && grant.redirectUri === redirectUri) keys.push(key.name);
++  }
++  return keys;
++}
++
++interface TwoRedirectState {
++  keyA: string;
++  keyB: string;
++  tokenA: string;
++  tokenB: string;
++}
++
++/** A CIMD client approved once with redirect URI A and once with redirect URI B: two live grants, two live tokens. */
++async function approveCimdOnAThenB(kv: MemoryKV, e: CloudflareEnv): Promise<TwoRedirectState> {
++  codeOf(await consent(e, cimdClientUrl, { redirectUri: callbackA }));
++  codeOf(await consent(e, cimdClientUrl, { redirectUri: callbackB }));
++  const [keyA] = await grantKeysFor(kv, cimdClientUrl, callbackA);
++  const [keyB] = await grantKeysFor(kv, cimdClientUrl, callbackB);
++  expect(keyA).toBeTruthy();
++  expect(keyB).toBeTruthy();
++  const state = {
++    keyA: keyA!,
++    keyB: keyB!,
++    tokenA: await tokenOfGrant(kv, keyA!),
++    tokenB: await tokenOfGrant(kv, keyB!),
++  };
++  expect(state.tokenA).not.toBe(state.tokenB);
++  const live = await liveIds(e);
++  expect(live.has(state.tokenA)).toBe(true);
++  expect(live.has(state.tokenB)).toBe(true);
++  return state;
++}
++
++describe("patch 0028: the superseded-token revoke confirms with a get and is bounded (#143, #145)", () => {
++  afterEach(() => {
++    vi.restoreAllMocks();
++  });
++
++  it("T1: re-approving a CIMD client with redirect URI A keeps its grant for redirect URI B, and that grant's token stays live", async () => {
++    stubCimdTwoRedirects();
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const first = await approveCimdOnAThenB(kv, e);
++
++    codeOf(await consent(e, cimdClientUrl, { redirectUri: callbackA }));
++
++    // The library really did keep B's grant and replace A's: this is the case the revoke must not get wrong.
++    expect(await grantKeysFor(kv, cimdClientUrl, callbackB)).toEqual([first.keyB]);
++    const keysA = await grantKeysFor(kv, cimdClientUrl, callbackA);
++    expect(keysA).toHaveLength(1);
++    expect(keysA).not.toContain(first.keyA);
++    const live = await liveIds(e);
++    expect(live.has(first.tokenB)).toBe(true);
++    expect(live.has(first.tokenA)).toBe(false);
++    expect(live.size).toBe(2);
++    expect(difference(live, await grantBackedIds(e))).toEqual([]);
++  });
++
++  it("T1b: the same, when a stale key listing hides B's grant after the library's write", async () => {
++    stubCimdTwoRedirects();
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const first = await approveCimdOnAThenB(kv, e);
++    const logs = captureEvents();
++
++    kv.hideAfter.add(first.keyB);
++    kv.arm();
++    const response = await consent(e, cimdClientUrl, { redirectUri: callbackA });
++    kv.disarm();
++
++    codeOf(response);
++    expect(await grantKeysFor(kv, cimdClientUrl, callbackB)).toEqual([first.keyB]);
++    const live = await liveIds(e);
++    expect(live.has(first.tokenB)).toBe(true);
++    expect(live.has(first.tokenA)).toBe(false);
++    expect(live.size).toBe(2);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 2, revoked: 1 }),
++    ]);
++  });
++
++  it("T2: a candidate whose key is still there on get (the library failed to delete it) is not revoked, even if a listing hides it", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const clientId = await register(e, "Stale after-state");
++    codeOf(await consent(e, clientId));
++    const oldKey = await onlyGrantKeyOf(kv, clientId);
++    const oldToken = await tokenOfGrant(kv, oldKey);
++    const logs = captureEvents();
++
++    kv.keepOnDelete.add(oldKey);
++    kv.hideAfter.add(oldKey);
++    kv.arm();
++    const response = await consent(e, clientId);
++    kv.disarm();
++
++    const code = codeOf(response);
++    // The premise held: the key survived the approve, and its record still reads.
++    expect((await kv.get(oldKey, { type: "json" }))?.clientId).toBe(clientId);
++    const live = await liveIds(e);
++    expect(live.has(oldToken)).toBe(true);
++    expect(live.size).toBe(2);
++    expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 0 }),
++    ]);
++    expect((await exchange(e, clientId, code)).status).toBe(200);
++  });
++
++  it("T3: when the confirming get throws for a candidate, the consent still answers 302, the token stays live, and the confirm-stage log names the error", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const clientId = await register(e, "Confirm get throws");
++    codeOf(await consent(e, clientId));
++    const oldKey = await onlyGrantKeyOf(kv, clientId);
++    const oldToken = await tokenOfGrant(kv, oldKey);
++    const logs = captureEvents();
++
++    kv.failGetAfterWrite.set(oldKey, new RangeError("kv-confirm-detail-that-must-not-be-logged-77123"));
++    kv.arm();
++    const response = await consent(e, clientId);
++    kv.disarm();
++
++    const code = codeOf(response);
++    // The fault was really hit, on the candidate's own key.
++    expect(kv.getFaultsHit).toEqual([oldKey]);
++    const live = await liveIds(e);
++    expect(live.has(oldToken)).toBe(true);
++    expect(live.size).toBe(2);
++    expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([
++      expect.objectContaining({
++        stage: "confirm",
++        grantId: oldKey.slice(grantPrefix.length),
++        errorName: "RangeError",
++      }),
++    ]);
++    expect(logs.text()).not.toContain("kv-confirm-detail-that-must-not-be-logged-77123");
++    expect((await exchange(e, clientId, code)).status).toBe(200);
++  });
++
++  it("T3b: one candidate's failing get does not stop the other candidate from being confirmed and revoked", async () => {
++    stubCimdTwoRedirects();
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const first = await approveCimdOnAThenB(kv, e);
++    const logs = captureEvents();
++
++    // Re-approving with A: the candidates are A's old grant (deleted by the library) and B's. B's confirm get throws.
++    // A's must still be confirmed gone and revoked, whichever order the candidates are visited in.
++    kv.failGetAfterWrite.set(first.keyB, new TypeError("b-confirm-failure"));
++    kv.arm();
++    const response = await consent(e, cimdClientUrl, { redirectUri: callbackA });
++    kv.disarm();
++
++    codeOf(response);
++    expect(kv.getFaultsHit).toEqual([first.keyB]);
++    const live = await liveIds(e);
++    expect(live.has(first.tokenB)).toBe(true);
++    expect(live.has(first.tokenA)).toBe(false);
++    expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([
++      expect.objectContaining({ stage: "confirm", errorName: "TypeError" }),
++    ]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 2, revoked: 1 }),
++    ]);
++  });
++
++  it("T4: no key listing is made after completeAuthorization, and the superseded token is still revoked by a get of the old key", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const clientId = await register(e, "No list after");
++    codeOf(await consent(e, clientId));
++    const oldKey = await onlyGrantKeyOf(kv, clientId);
++    const oldToken = await tokenOfGrant(kv, oldKey);
++
++    kv.arm();
++    const response = await consent(e, clientId);
++    kv.disarm();
++
++    codeOf(response);
++    // Premise: the handler listed before the write, so the probe is watching the right thing.
++    expect(kv.listPhases).toContain("before");
++    expect(kv.listPhases.filter((phase) => phase === "after")).toHaveLength(0);
++    // Everything the handler reads after the write is a get of the one candidate's key.
++    expect(kv.getsAfterWrite).toEqual([oldKey]);
++    const live = await liveIds(e);
++    expect(live.has(oldToken)).toBe(false);
++    expect(live.size).toBe(1);
++    expect(difference(live, await grantBackedIds(e))).toEqual([]);
++  });
++
++  it("T5: the before-step reads at most 50 keys without metadata, logs scan_capped once with the skipped count, and still revokes a candidate found earlier", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    // This client's earlier grant carries metadata and is first in the KV; it is a candidate before the cap bites.
++    const target = await register(e, "Cap target");
++    codeOf(await consent(e, target));
++    const targetKey = await onlyGrantKeyOf(kv, target);
++    const targetOld = await tokenOfGrant(kv, targetKey);
++    const others: string[] = [];
++    for (let index = 0; index < 60; index++) others.push(await register(e, `Cap other ${index}`));
++    kv.keepsKeyMetadata = isLegacyWrite(new Set(others));
++    for (const other of others) codeOf(await consent(e, other));
++    kv.keepsKeyMetadata = () => true;
++
++    const legacyKeys = new Set(
++      [...(await grantClients(kv))].filter(([, owner]) => owner !== target).map(([key]) => key),
++    );
++    expect(legacyKeys.size).toBe(60);
++    // Premise: those 60 keys list with no metadata, so each is a fallback read.
++    const listed = (await kv.list({ prefix: grantPrefix })).keys;
++    expect(listed.filter((key) => legacyKeys.has(key.name) && "metadata" in key)).toEqual([]);
++    const otherTokens: string[] = [];
++    for (const key of legacyKeys) otherTokens.push(await tokenOfGrant(kv, key));
++    const logs = captureEvents();
++
++    kv.arm();
++    const response = await consent(e, target);
++    kv.disarm();
++
++    codeOf(response);
++    expect(kv.libraryScanSeen).toBe(true);
++    expect(kv.handlerBeforeGets.filter((key) => legacyKeys.has(key)).length).toBeLessThanOrEqual(50);
++    const capped = logs.events("mcp_oauth_superseded_token_scan_capped");
++    expect(capped).toHaveLength(1);
++    expect(capped[0]!.skipped).toBe(10);
++    expect(Object.keys(capped[0]!).sort()).toEqual(["event", "skipped"]);
++    // The candidate found before the cap was still processed, and nobody else lost a token.
++    const live = await liveIds(e);
++    expect(live.has(targetOld)).toBe(false);
++    for (const id of otherTokens) expect(live.has(id)).toBe(true);
++    expect(live.size).toBe(61);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
++  }, 180_000);
++
++  it("T5b: this client's own legacy grant, found within the cap, is still revoked when 60 other legacy grants follow it", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const target = await register(e, "Legacy cap target");
++    const others: string[] = [];
++    for (let index = 0; index < 60; index++) others.push(await register(e, `Legacy cap other ${index}`));
++    kv.keepsKeyMetadata = isLegacyWrite(new Set([target, ...others]));
++    codeOf(await consent(e, target));
++    for (const other of others) codeOf(await consent(e, other));
++    kv.keepsKeyMetadata = () => true;
++
++    const targetKey = await onlyGrantKeyOf(kv, target);
++    const targetOld = await tokenOfGrant(kv, targetKey);
++    const otherKeys = new Set(
++      [...(await grantClients(kv))].filter(([, owner]) => owner !== target).map(([key]) => key),
++    );
++    expect(otherKeys.size).toBe(60);
++    const legacyKeys = new Set([...otherKeys, targetKey]);
++    const listed = (await kv.list({ prefix: grantPrefix })).keys;
++    expect(listed.filter((key) => legacyKeys.has(key.name) && "metadata" in key)).toEqual([]);
++    const otherTokens: string[] = [];
++    for (const key of otherKeys) otherTokens.push(await tokenOfGrant(kv, key));
++    const logs = captureEvents();
++
++    kv.arm();
++    const response = await consent(e, target);
++    kv.disarm();
++
++    codeOf(response);
++    expect(kv.libraryScanSeen).toBe(true);
++    // 61 keys without metadata, 50 read: 11 skipped.
++    expect(kv.handlerBeforeGets.filter((key) => legacyKeys.has(key)).length).toBeLessThanOrEqual(50);
++    expect(kv.handlerBeforeGets).toContain(targetKey);
++    const capped = logs.events("mcp_oauth_superseded_token_scan_capped");
++    expect(capped).toHaveLength(1);
++    expect(capped[0]!.skipped).toBe(11);
++    const live = await liveIds(e);
++    expect(live.has(targetOld)).toBe(false);
++    for (const id of otherTokens) expect(live.has(id)).toBe(true);
++    expect(live.size).toBe(61);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
++  }, 180_000);
++
++  it("T5c: under the cap nothing is skipped and scan_capped is not logged", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const target = await register(e, "Under cap target");
++    const others: string[] = [];
++    for (let index = 0; index < 5; index++) others.push(await register(e, `Under cap other ${index}`));
++    kv.keepsKeyMetadata = isLegacyWrite(new Set([target, ...others]));
++    codeOf(await consent(e, target));
++    for (const other of others) codeOf(await consent(e, other));
++    kv.keepsKeyMetadata = () => true;
++    const logs = captureEvents();
++
++    codeOf(await consent(e, target));
++
++    expect(logs.events("mcp_oauth_superseded_token_scan_capped")).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      expect.objectContaining({ candidates: 1, revoked: 1 }),
++    ]);
++  });
++
++  it("T6: a first approve for a client does no KV read after completeAuthorization, and logs no checked event", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const modern = await register(e, "First approve modern bystander");
++    const legacy = await register(e, "First approve legacy bystander");
++    const target = await register(e, "First approve target");
++    kv.keepsKeyMetadata = isLegacyWrite(new Set([legacy]));
++    codeOf(await consent(e, legacy));
++    kv.keepsKeyMetadata = () => true;
++    codeOf(await consent(e, modern));
++    const bystanderTokens = [...(await liveIds(e))];
++    expect(bystanderTokens).toHaveLength(2);
++    const logs = captureEvents();
++
++    kv.arm();
++    const response = await consent(e, target);
++    kv.disarm();
++
++    const code = codeOf(response);
++    expect(kv.listPhases).toContain("before");
++    expect(kv.getsAfterWrite).toEqual([]);
++    expect(kv.listPrefixesAfterWrite).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_token_scan_capped")).toEqual([]);
++    expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
++    const live = await liveIds(e);
++    for (const id of bystanderTokens) expect(live.has(id)).toBe(true);
++    expect(live.size).toBe(3);
++    expect((await exchange(e, target, code)).status).toBe(200);
++  });
++
++  it("T7: the checked event carries exactly the candidate and revoke counts, and no token value", async () => {
++    stubCimdTwoRedirects();
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const first = await approveCimdOnAThenB(kv, e);
++    const logs = captureEvents();
++
++    codeOf(await consent(e, cimdClientUrl, { redirectUri: callbackA }));
++
++    const checked = logs.events("mcp_oauth_superseded_tokens_checked");
++    expect(checked).toHaveLength(1);
++    // Two candidates (A's old grant and B's), one revoked (A's: the library kept B's).
++    expect(checked[0]).toEqual({ event: "mcp_oauth_superseded_tokens_checked", candidates: 2, revoked: 1 });
++    const everything = logs.text();
++    expect(everything).not.toMatch(/oct_[A-Za-z0-9_-]{10,}/);
++    expect(everything).not.toContain(adminToken);
++    expect(everything).not.toContain(first.tokenA);
++    expect(everything).not.toContain(first.tokenB);
++    expect(logs.events("mcp_oauth_superseded_token_revoke_failed")).toEqual([]);
++  });
++
++  it("T7b: a candidate whose token was already gone is counted as a candidate but not as revoked", async () => {
++    const kv = new ProbeKV();
++    const e = envWith(kv);
++    const clientId = await register(e, "Checked counts gone");
++    codeOf(await consent(e, clientId));
++    const oldToken = await tokenOfGrant(kv, await onlyGrantKeyOf(kv, clientId));
++    await e.DB.prepare("delete from runtime_tokens where id = ?").bind(oldToken).run();
++    const logs = captureEvents();
++
++    codeOf(await consent(e, clientId));
++
++    expect(logs.events("mcp_oauth_superseded_tokens_checked")).toEqual([
++      { event: "mcp_oauth_superseded_tokens_checked", candidates: 1, revoked: 0 },
++    ]);
++  });
++});
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Sat, 21 Nov 2026 15:32:00 -0300
+Subject: [PATCH 2/2] fix(mcp-oauth): confirm superseded grants with a get and
+ bound the scan (#143, #145)
+
+---
+ src/server/cloudflare/mcp-oauth.ts | 59 ++++++++++++++++++++----------
+ 1 file changed, 39 insertions(+), 20 deletions(-)
+
+diff --git a/src/server/cloudflare/mcp-oauth.ts b/src/server/cloudflare/mcp-oauth.ts
+index 44dd30e7..07af7fb5 100644
+--- a/src/server/cloudflare/mcp-oauth.ts
++++ b/src/server/cloudflare/mcp-oauth.ts
+@@ -556,9 +556,13 @@ async function listAdministratorGrantKeys(kv: OAuthKVNamespaceBinding): Promise<
+   return keys;
+ }
+ 
++/** Most keys without key metadata (legacy grants) read per approve; the rest are skipped. */
++const maxFallbackReads = 50;
++
+ /**
+  * The grants of one client, with their backing token ids. Only matching grants are read: a key whose metadata names
+- * another client is skipped, and a key without metadata (written by an older library) is read and compared.
++ * another client is skipped, and a key without metadata (written by an older library) is read and compared, up to
++ * maxFallbackReads per call.
+  */
+ async function readClientGrants(
+   kv: OAuthKVNamespaceBinding,
+@@ -566,15 +570,26 @@ async function readClientGrants(
+   clientId: string,
+ ): Promise<AdministratorGrant[]> {
+   const grants: AdministratorGrant[] = [];
++  let fallbackReads = 0;
++  let skipped = 0;
+   for (const key of keys) {
+     const keyClientId = (key.metadata as { clientId?: unknown } | null | undefined)?.clientId;
+-    if (typeof keyClientId === "string" && keyClientId !== clientId) continue;
++    if (typeof keyClientId === "string") {
++      if (keyClientId !== clientId) continue;
++    } else {
++      if (fallbackReads >= maxFallbackReads) {
++        skipped += 1;
++        continue;
++      }
++      fallbackReads += 1;
++    }
+     const record = await kv.get<{ clientId?: unknown; metadata?: { runtimeTokenId?: unknown } }>(key.name, {
+       type: "json",
+     });
+     if (!record || record.clientId !== clientId) continue;
+     grants.push({ key: key.name, runtimeTokenId: record.metadata?.runtimeTokenId });
+   }
++  if (skipped > 0) console.warn({ event: "mcp_oauth_superseded_token_scan_capped", skipped });
+   return grants;
+ }
+ 
+@@ -595,38 +610,42 @@ async function listClientGrantsBestEffort(
+   }
+ }
+ 
+-/** This client's grants present before and absent after the library's own supersede step lose their backing token. Best effort. */
++/**
++ * Each of this client's grants seen before the library's supersede step is read again: only a grant that is now
++ * gone (get returns null) loses its backing token. A get is exact; a list could be stale. Best effort.
++ */
+ async function revokeSupersededTokens(
+   kv: OAuthKVNamespaceBinding,
+   tokens: ReturnType<typeof runtimeTokens>,
+   before: AdministratorGrant[] | null,
+ ): Promise<void> {
+-  if (!before) return;
+-  let remaining: Set<string>;
+-  try {
+-    remaining = new Set((await listAdministratorGrantKeys(kv)).map((key) => key.name));
+-  } catch (error) {
+-    console.warn({
+-      event: "mcp_oauth_superseded_token_revoke_failed",
+-      stage: "list_after",
+-      errorName: errorName(error),
+-    });
+-    return;
+-  }
+-  let count = 0;
++  if (!before || before.length === 0) return;
++  let revoked = 0;
+   for (const grant of before) {
+-    if (remaining.has(grant.key) || typeof grant.runtimeTokenId !== "string") continue;
++    const grantId = grant.key.slice(administratorGrantPrefix.length);
++    try {
++      if ((await kv.get(grant.key, { type: "json" })) !== null) continue;
++    } catch (error) {
++      console.warn({
++        event: "mcp_oauth_superseded_token_revoke_failed",
++        stage: "confirm",
++        grantId,
++        errorName: errorName(error),
++      });
++      continue;
++    }
++    if (typeof grant.runtimeTokenId !== "string") continue;
+     try {
+-      if (await tokens.revokeToken(grant.runtimeTokenId)) count += 1;
++      if (await tokens.revokeToken(grant.runtimeTokenId)) revoked += 1;
+     } catch (error) {
+       console.warn({
+         event: "mcp_oauth_superseded_token_revoke_failed",
+-        grantId: grant.key.slice(administratorGrantPrefix.length),
++        grantId,
+         errorName: errorName(error),
+       });
+     }
+   }
+-  if (count > 0) console.info({ event: "mcp_oauth_superseded_tokens_revoked", count });
++  console.info({ event: "mcp_oauth_superseded_tokens_checked", candidates: before.length, revoked });
+ }
+ 
+ function localError(message: string, status: number): Response {
+-- 
+2.34.1
+
