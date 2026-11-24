@@ -1,0 +1,1139 @@
+SplitMind patch 0030 for OpenConnector v1.9.2. Apply after 0029.
+Upstream issue: not filed yet. Read-only grants follow catalog labels at request time with an @read rule (#95).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 10:36:08 -0300
+Subject: [PATCH 1/3] 0030 tests: read-only grants follow catalog labels
+ (@read)
+
+---
+ src/core/action-policy.test.ts                | 185 +++++++++++++++
+ src/server/api/policy-input.test.ts           |  57 +++++
+ src/server/cloudflare/mcp-grant-scope.test.ts |  44 +++-
+ .../cloudflare/mcp-oauth-grant-flow.test.ts   | 215 +++++++++++++++++-
+ 4 files changed, 487 insertions(+), 14 deletions(-)
+
+diff --git a/src/core/action-policy.test.ts b/src/core/action-policy.test.ts
+index ceda8324..72722e79 100644
+--- a/src/core/action-policy.test.ts
++++ b/src/core/action-policy.test.ts
+@@ -410,3 +410,188 @@ describe("Trigger policy", () => {
+     expect(service.createSnapshot(rules, token).evaluateTrigger("gmail.on_message_received").allowed).toBe(true);
+   });
+ });
++
++// Patch 0030: "@read" is a label rule. It follows each action's operationType at request time, so a read-only grant
++// tracks the catalog instead of a frozen list of ids.
++describe("@read label rule", () => {
++  const emptyRules = { allowedActions: [], blockedActions: [], allowedProxies: [], blockedProxies: [] };
++  const withType = (id: string, operationType: unknown): ActionDefinition =>
++    ({ ...action, id, name: id.split(".")[1]!, operationType }) as ActionDefinition;
++  const tokenSnapshot = (allowedActions: string[], blockedActions: string[] = []) =>
++    new ActionPolicyService().createSnapshot(emptyRules, { allowedActions, blockedActions, allowedProxies: ["*"] });
++
++  it("P1: a token granting only @read allows read actions and refuses every other label", () => {
++    const snapshot = tokenSnapshot(["@read"]);
++    expect(snapshot.evaluate(withType("gmail.search_messages", "read"))).toEqual({
++      allowed: true,
++      checks: [{ source: "token", outcome: "allow_match", rule: "@read" }],
++    });
++    for (const operationType of ["write", "destructive", undefined, "READ", "Read", "read ", "", null, 1, ["read"]]) {
++      expect(snapshot.evaluate(withType("gmail.send_message", operationType)), String(operationType)).toEqual({
++        allowed: false,
++        code: "action_not_allowed",
++        message: "gmail.send_message is not included in the local action allowlist.",
++        checks: [{ source: "token", outcome: "allow_miss" }],
++      });
++    }
++  });
++
++  it("P1: an action with no operationType property at all is refused", () => {
++    const { operationType: _omitted, ...bare } = action;
++    expect(tokenSnapshot(["@read"]).evaluate(bare as ActionDefinition)).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
++  });
++
++  it("P2: relabelling an action from read to write refuses it under the same stored rule, and the reverse allows it", () => {
++    const stored = ["@read"]; // what a read-only consent stored once, never rewritten
++    const asRead = withType("notion.update_page", "read");
++    const asWrite = withType("notion.update_page", "write");
++    expect(tokenSnapshot(stored).evaluate(asRead).allowed).toBe(true);
++    expect(tokenSnapshot(stored).evaluate(asWrite)).toMatchObject({ allowed: false, code: "action_not_allowed" });
++    // A read action added to the catalog later was never in any list, yet is allowed.
++    expect(tokenSnapshot(stored).evaluate(withType("notion.brand_new_lookup", "read")).allowed).toBe(true);
++    // And a write action relabelled read becomes reachable.
++    expect(tokenSnapshot(stored).evaluate(withType("notion.send_digest", "write")).allowed).toBe(false);
++    expect(tokenSnapshot(stored).evaluate(withType("notion.send_digest", "read")).allowed).toBe(true);
++  });
++
++  it("P2: @read composes with an exact id and a provider prefix in the same list", () => {
++    const snapshot = tokenSnapshot(["@read", "github.create_issue"]);
++    expect(snapshot.evaluate(withType("github.create_issue", "write")).allowed).toBe(true);
++    expect(snapshot.evaluate(withType("github.delete_repository", "destructive")).allowed).toBe(false);
++    expect(snapshot.evaluate(withType("github.get_user", "read")).allowed).toBe(true);
++    const prefixed = tokenSnapshot(["@read", "slack.*"]);
++    expect(prefixed.evaluate(withType("slack.post_message", "write")).allowed).toBe(true);
++    expect(prefixed.evaluate(withType("gmail.send_message", "write")).allowed).toBe(false);
++  });
++
++  it("P2: @read is one layer of the intersection, so a deployment allowlist still narrows it", () => {
++    const snapshot = new ActionPolicyService({ allowedActions: ["gmail.*"] }).createSnapshot(emptyRules, {
++      allowedActions: ["@read"],
++      blockedActions: [],
++      allowedProxies: ["*"],
++    });
++    expect(snapshot.evaluate(withType("gmail.search_messages", "read")).allowed).toBe(true);
++    expect(snapshot.evaluate(withType("notion.search", "read"))).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++      checks: [{ source: "deployment", outcome: "allow_miss" }],
++    });
++  });
++
++  it("P2: @read works in a deployment or Runtime allowlist, not only in a token", () => {
++    const deployment = new ActionPolicyService({ allowedActions: ["@read"] }).createSnapshot();
++    expect(deployment.evaluate(withType("gmail.search_messages", "read")).allowed).toBe(true);
++    expect(deployment.evaluate(withType("gmail.send_message", "write")).allowed).toBe(false);
++    const runtime = new ActionPolicyService().createSnapshot({ ...emptyRules, allowedActions: ["@read"] });
++    expect(runtime.evaluate(withType("gmail.search_messages", "read")).allowed).toBe(true);
++    expect(runtime.evaluate(withType("gmail.send_message", "write")).allowed).toBe(false);
++  });
++
++  it("P3: @read in blockedActions blocks read actions only", () => {
++    const snapshot = tokenSnapshot([], ["@read"]);
++    expect(snapshot.evaluate(withType("gmail.search_messages", "read"))).toEqual({
++      allowed: false,
++      code: "action_blocked",
++      message: "gmail.search_messages is blocked by the local action policy.",
++      checks: [{ source: "token", outcome: "block_match", rule: "@read" }],
++    });
++    expect(snapshot.evaluate(withType("gmail.send_message", "write")).allowed).toBe(true);
++    expect(snapshot.evaluate(withType("notion.delete_block", "destructive")).allowed).toBe(true);
++    expect(snapshot.evaluate(withType("gmail.mystery", undefined)).allowed).toBe(true);
++  });
++
++  it("P3: @read in a deployment blockedActions blocks read actions even when another layer allows them", () => {
++    const snapshot = new ActionPolicyService({ blockedActions: ["@read"] }).createSnapshot(emptyRules, {
++      allowedActions: ["*"],
++      blockedActions: [],
++      allowedProxies: ["*"],
++    });
++    expect(snapshot.evaluate(withType("gmail.search_messages", "read"))).toMatchObject({
++      allowed: false,
++      code: "action_blocked",
++      checks: [{ source: "deployment", outcome: "block_match", rule: "@read" }],
++    });
++    expect(snapshot.evaluate(withType("gmail.send_message", "write")).allowed).toBe(true);
++  });
++
++  it("P3: a block on @read wins over an allow of the same read action", () => {
++    const snapshot = tokenSnapshot(["@read"], ["@read"]);
++    expect(snapshot.evaluate(withType("gmail.search_messages", "read"))).toMatchObject({
++      allowed: false,
++      code: "action_blocked",
++    });
++  });
++
++  it("P4: @read in Trigger rules matches nothing, so no Trigger is granted by it", () => {
++    const service = new ActionPolicyService();
++    const token = { ...emptyRules, allowedProxies: ["*"], allowedTriggers: ["@read"] };
++    expect(service.createSnapshot(emptyRules, token).evaluateTrigger("github.on_repo_event")).toMatchObject({
++      allowed: false,
++      code: "trigger_not_allowed",
++    });
++    expect(
++      new ActionPolicyService({ allowedTriggers: ["@read"] })
++        .createSnapshot(emptyRules, { ...token, allowedTriggers: ["*"] })
++        .evaluateTrigger("github.on_repo_event"),
++    ).toMatchObject({ allowed: false, code: "trigger_not_allowed" });
++    expect(
++      service.createSnapshot({ ...emptyRules, allowedTriggers: ["@read"] }).evaluateTrigger("github.on_repo_event"),
++    ).toMatchObject({ allowed: false, code: "trigger_not_allowed" });
++  });
++
++  it("P4: @read in Trigger block rules blocks nothing", () => {
++    const service = new ActionPolicyService();
++    const token = { ...emptyRules, allowedProxies: ["*"], allowedTriggers: ["*"] };
++    expect(
++      service
++        .createSnapshot({ ...emptyRules, blockedTriggers: ["@read"] }, token)
++        .evaluateTrigger("github.on_repo_event").allowed,
++    ).toBe(true);
++  });
++
++  it("P4: @read in proxy rules matches no service, so it grants no proxy", () => {
++    const service = new ActionPolicyService();
++    const token = { ...emptyRules, allowedActions: ["@read"], allowedProxies: ["@read"] };
++    expect(service.createSnapshot(emptyRules, token).evaluateProxy("github")).toMatchObject({
++      allowed: false,
++      code: "proxy_not_allowed",
++    });
++  });
++
++  it("P5: the other patterns behave as before, whatever the label", () => {
++    for (const operationType of ["read", "write", "destructive"] as const) {
++      const target = { ...action, operationType };
++      expect(tokenSnapshot(["*"]).evaluate(target).allowed).toBe(true);
++      expect(tokenSnapshot(["github.*"]).evaluate(target).allowed).toBe(true);
++      expect(tokenSnapshot(["gmail.*"]).evaluate(target).allowed).toBe(false);
++      expect(tokenSnapshot(["github.create_issue"]).evaluate(target).allowed).toBe(true);
++      expect(tokenSnapshot(["github.create_issues"]).evaluate(target).allowed).toBe(false);
++      expect(tokenSnapshot([], ["github.*"]).evaluate(target).allowed).toBe(false);
++      expect(tokenSnapshot([], ["*"]).evaluate(target).allowed).toBe(false);
++    }
++  });
++
++  it("P5: an action id that spells a label is just an id, and the pattern is not a prefix or glob", () => {
++    expect(tokenSnapshot(["@reads"]).evaluate(withType("gmail.search_messages", "read")).allowed).toBe(false);
++    expect(tokenSnapshot(["@read.*"]).evaluate(withType("gmail.search_messages", "read")).allowed).toBe(false);
++    expect(tokenSnapshot(["@write"]).evaluate(withType("gmail.send_message", "write")).allowed).toBe(false);
++    expect(tokenSnapshot(["@READ"]).evaluate(withType("gmail.search_messages", "read")).allowed).toBe(false);
++  });
++
++  it("P5: an id-only path never treats @read as allow-all, and evaluating the same action twice agrees", () => {
++    const snapshot = tokenSnapshot(["@read"]);
++    const readAction = withType("gmail.search_messages", "read");
++    expect(snapshot.evaluate(readAction)).toEqual(snapshot.evaluate(readAction));
++    // Trigger ids carry no definition, so they go through the id-only path and must stay refused.
++    const triggers = new ActionPolicyService().createSnapshot(emptyRules, {
++      allowedActions: ["@read"],
++      blockedActions: [],
++      allowedProxies: ["*"],
++      allowedTriggers: ["@read"],
++    });
++    expect(triggers.evaluateTrigger("gmail.search_messages").allowed).toBe(false);
++  });
++});
+diff --git a/src/server/api/policy-input.test.ts b/src/server/api/policy-input.test.ts
+index 8c601af4..0e9f7fd6 100644
+--- a/src/server/api/policy-input.test.ts
++++ b/src/server/api/policy-input.test.ts
+@@ -144,3 +144,60 @@ describe("policy input", () => {
+     ).toThrow(`${policyRuleMaxBytes} UTF-8 bytes`);
+   });
+ });
++
++// Patch 0030 (P8): "@read" is a label rule for action fields only.
++describe("policy input: the @read label rule", () => {
++  const none = { allowedActions: [], blockedActions: [], allowedProxies: [] };
++
++  it("P8: accepts @read in token allowedActions and blockedActions, alone or beside other rules", () => {
++    expect(readTokenPolicy({ ...none, allowedActions: ["@read"] }, true).allowedActions).toEqual(["@read"]);
++    expect(readTokenPolicy({ ...none, blockedActions: ["@read"] }, true).blockedActions).toEqual(["@read"]);
++    expect(
++      readTokenPolicy({ ...none, allowedActions: [" @read ", "github.create_issue", "@read"] }, true).allowedActions,
++    ).toEqual(["@read", "github.create_issue"]);
++  });
++
++  it("P8: accepts @read in Runtime allowedActions and blockedActions", () => {
++    expect(
++      readRuntimePolicyRules({ ...none, allowedActions: ["@read"], blockedActions: ["@read"], blockedProxies: [] }),
++    ).toMatchObject({ allowedActions: ["@read"], blockedActions: ["@read"] });
++  });
++
++  it.each(["@reads", "@Read", "@READ", "@", "@read.*", "@write", "@destructive", "@*", "read@", "@@read", "@read.x"])(
++    "P8: rejects %j as an action rule, so a typo cannot silently match nothing",
++    (rule) => {
++      expect(() => readTokenPolicy({ ...none, allowedActions: [rule] }, true)).toThrow("invalid action rule");
++      expect(() => readTokenPolicy({ ...none, blockedActions: [rule] }, true)).toThrow("invalid action rule");
++      expect(() => readRuntimePolicyRules({ ...none, allowedActions: [rule], blockedProxies: [] })).toThrow(
++        "invalid action rule",
++      );
++    },
++  );
++
++  it("P8: rejects @read for proxies, in tokens and in Runtime policy", () => {
++    expect(() => readTokenPolicy({ ...none, allowedProxies: ["@read"] }, true)).toThrow("invalid proxy rule");
++    expect(() => readRuntimePolicyRules({ ...none, allowedProxies: ["@read"], blockedProxies: [] })).toThrow(
++      "invalid proxy rule",
++    );
++    expect(() => readRuntimePolicyRules({ ...none, allowedProxies: [], blockedProxies: ["@read"] })).toThrow(
++      "invalid proxy rule",
++    );
++  });
++
++  it("P8: rejects @read for Triggers, which have no definition to read a label from", () => {
++    expect(() => readTokenPolicy({ ...none, allowedTriggers: ["@read"] }, true)).toThrow("@read");
++    expect(() => readRuntimePolicyRules({ ...none, allowedTriggers: ["@read"], blockedProxies: [] })).toThrow("@read");
++    expect(() => readRuntimePolicyRules({ ...none, blockedTriggers: ["@read"], blockedProxies: [] })).toThrow("@read");
++  });
++
++  it("P8: Trigger fields still accept their ordinary rules", () => {
++    expect(
++      readRuntimePolicyRules({
++        ...none,
++        allowedTriggers: ["*", "github.on_repo_event"],
++        blockedTriggers: ["gmail.*"],
++        blockedProxies: [],
++      }),
++    ).toMatchObject({ allowedTriggers: ["*", "github.on_repo_event"], blockedTriggers: ["gmail.*"] });
++  });
++});
+diff --git a/src/server/cloudflare/mcp-grant-scope.test.ts b/src/server/cloudflare/mcp-grant-scope.test.ts
+index f093f42d..3162a9bd 100644
+--- a/src/server/cloudflare/mcp-grant-scope.test.ts
++++ b/src/server/cloudflare/mcp-grant-scope.test.ts
+@@ -42,10 +42,30 @@ describe("MCP grant scope", () => {
+     });
+   });
+ 
+-  it("grants only read actions for read-only access", async () => {
++  it("P6: read-only access grants the @read label rule, not a list of ids", async () => {
+     const scope = await resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, runtime());
+-    expect(scope).toEqual({
+-      allowedActions: ["gmail.search_messages", "notion.search"],
++    expect(scope).toEqual({ allowedActions: ["@read"], allowedConnections: [] });
++  });
++
++  it("P6: read-only access makes no /api/actions request, with or without accounts", async () => {
++    const seen: string[] = [];
++    await resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, runtime(seen));
++    expect(seen).toEqual([]);
++    const withAccount = await resolveMcpGrantScope(
++      { access: "read", accounts: ["gmail:work"] },
++      origin,
++      env,
++      runtime(seen),
++    );
++    expect(seen).toEqual(["/v1/connections"]);
++    expect(withAccount).toEqual({ allowedActions: ["@read"], allowedConnections: ["c1"] });
++  });
++
++  it("P6: read-only access still resolves when the action catalog cannot be read", async () => {
++    const catalogDown = async (request: Request) =>
++      new URL(request.url).pathname === "/api/actions" ? new Response(null, { status: 500 }) : runtime()(request);
++    expect(await resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, catalogDown)).toEqual({
++      allowedActions: ["@read"],
+       allowedConnections: [],
+     });
+   });
+@@ -79,13 +99,23 @@ describe("MCP grant scope", () => {
+     await expect(pending).rejects.toThrow(new McpGrantScopeError("No connected account is named home, gmail:team."));
+   });
+ 
+-  it("refuses read-only access when no action is read-only, rather than granting everything", async () => {
++  it("P6: read-only access over a catalog with no read action still grants @read, which then allows nothing", async () => {
+     const writesOnly = async (request: Request) =>
+       new URL(request.url).pathname === "/api/actions"
+         ? Response.json([{ id: "gmail.send_message", operationType: "write" }])
+         : new Response(null, { status: 404 });
+-    await expect(resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, writesOnly)).rejects.toThrow(
+-      McpGrantScopeError,
+-    );
++    await expect(resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, writesOnly)).resolves.toEqual({
++      allowedActions: ["@read"],
++      allowedConnections: [],
++    });
++  });
++
++  it('P6: full access stays ["*"] and read access never returns a bare wildcard', async () => {
++    expect(
++      (await resolveMcpGrantScope({ access: "all", accounts: [] }, origin, env, runtime())).allowedActions,
++    ).toEqual(["*"]);
++    expect(
++      (await resolveMcpGrantScope({ access: "read", accounts: [] }, origin, env, runtime())).allowedActions,
++    ).not.toContain("*");
+   });
+ });
+diff --git a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+index b38fa34e..faa4e506 100644
+--- a/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
++++ b/src/server/cloudflare/mcp-oauth-grant-flow.test.ts
+@@ -249,8 +249,7 @@ describe("POST approve turns the consent form's choices into the backing runtime
+     expect(new URL(response.headers.get("location") ?? "").searchParams.get("code")).toBeTruthy();
+     const created = await createdSince(before);
+     expect(created).toHaveLength(1);
+-    expect([...created[0]!.allowedActions].sort()).toEqual(["17track.list_things", "17track.read_thing"]);
+-    expect(created[0]!.allowedActions).not.toContain("*");
++    expect(created[0]!.allowedActions).toEqual(["@read"]);
+     expect(created[0]!.allowedConnections).toEqual([ids.work]);
+   });
+ 
+@@ -268,9 +267,7 @@ describe("POST approve turns the consent form's choices into the backing runtime
+     expect((await approve(await registerClient(), {})).status).toBe(302);
+     const created = await createdSince(before);
+     expect(created).toHaveLength(1);
+-    expect(created[0]!.allowedActions).not.toContain("*");
+-    expect(created[0]!.allowedActions).not.toContain("17track.write_thing");
+-    expect(created[0]!.allowedActions).not.toContain("17track.delete_thing");
++    expect(created[0]!.allowedActions).toEqual(["@read"]);
+   });
+ 
+   it("refuses a nickname that matches no account with a local 400, and creates no token and no code", async () => {
+@@ -292,6 +289,211 @@ describe("POST approve turns the consent form's choices into the backing runtime
+   });
+ });
+ 
++// Patch 0030 (P7): a read-only grant is stored as the @read label rule, and the policy follows the catalog's labels at
++// request time. The expected behaviour is read from the MCP endpoint itself, with the access token the code exchange
++// returns. The MCP server exposes a fixed set of tools (search_actions, get_action_guide, execute_action), so "the
++// write tool is absent" is observed as: search_actions reports the write action's policy as not allowed, and
++// execute_action refuses it with action_not_allowed.
++const mcpVerifier = "m".repeat(64);
++
++async function exchangeForAccessToken(clientId: string, code: string): Promise<string> {
++  const response = await worker.fetch(
++    new Request(`${origin}/oauth/mcp/token`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded" },
++      body: new URLSearchParams({
++        grant_type: "authorization_code",
++        code,
++        client_id: clientId,
++        redirect_uri: claudeCallback,
++        code_verifier: mcpVerifier,
++        resource: `${origin}/mcp`,
++      }),
++    }),
++    env,
++    context(),
++  );
++  expect(response.status).toBe(200);
++  return (await response.json()).access_token;
++}
++
++/** Approve a consent with the given access field and return the access token an MCP client would hold. */
++async function readOnlyOrFullAccessToken(access: "read" | "all"): Promise<string> {
++  const clientId = await registerClient();
++  const query = new URLSearchParams({
++    response_type: "code",
++    client_id: clientId,
++    redirect_uri: claudeCallback,
++    scope: "mcp:access offline_access",
++    resource: `${origin}/mcp`,
++    state: "mcp-state",
++    code_challenge: createHash("sha256").update(mcpVerifier).digest("base64url"),
++    code_challenge_method: "S256",
++  });
++  const response = await worker.fetch(
++    new Request(`${origin}/oauth/mcp/authorize?${query}`, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded", origin },
++      body: new URLSearchParams({ decision: "approve", access, admin_token: adminToken }),
++    }),
++    env,
++    context(),
++  );
++  expect(response.status).toBe(302);
++  const code = new URL(response.headers.get("location") ?? "").searchParams.get("code");
++  expect(code).toBeTruthy();
++  return exchangeForAccessToken(clientId, code!);
++}
++
++let rpcId = 0;
++/** One stateless JSON-RPC request to /mcp. Returns the parsed result, or the error object. */
++async function mcpRpc(
++  accessToken: string,
++  method: string,
++  params: unknown,
++  target: typeof worker = worker,
++): Promise<any> {
++  const response = await target.fetch(
++    new Request(`${origin}/mcp`, {
++      method: "POST",
++      headers: {
++        authorization: `Bearer ${accessToken}`,
++        "content-type": "application/json",
++        accept: "application/json, text/event-stream",
++      },
++      body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, params }),
++    }),
++    env,
++    context(),
++  );
++  const text = await response.text();
++  expect([response.status, text.slice(0, 300)]).toEqual([200, expect.any(String)]);
++  const data =
++    text.startsWith("event:") || text.includes("\ndata:")
++      ? text
++          .split("\n")
++          .find((line) => line.startsWith("data:"))!
++          .slice(5)
++      : text;
++  const message = JSON.parse(data);
++  return message.error ?? message.result;
++}
++
++async function callTool(
++  accessToken: string,
++  name: string,
++  args: Record<string, unknown>,
++  target: typeof worker = worker,
++): Promise<any> {
++  const result = await mcpRpc(accessToken, "tools/call", { name, arguments: args }, target);
++  const content = result.content?.[0]?.text;
++  return content ? JSON.parse(content) : result;
++}
++
++describe("P7: a read-only grant follows the catalog's labels through the MCP endpoint", () => {
++  it("stores @read, lists the fixed tools, reports the write and destructive actions as refused and the read ones as allowed", async () => {
++    const accessToken = await readOnlyOrFullAccessToken("read");
++    const listed = await mcpRpc(accessToken, "tools/list", {});
++    expect((listed.tools as { name: string }[]).map((tool) => tool.name).sort()).toEqual([
++      "execute_action",
++      "get_action_guide",
++      "list_apps",
++      "list_connections",
++      "search_actions",
++    ]);
++
++    const found = await callTool(accessToken, "search_actions", { service: "17track", limit: 20 });
++    const rows = (found.data ?? found) as {
++      id: string;
++      operationType: string;
++      capability: { policy: { allowed: boolean; code?: string } };
++    }[];
++    const byId = new Map(rows.map((row) => [row.id, row]));
++    expect(byId.get("17track.read_thing")!.capability.policy.allowed).toBe(true);
++    expect(byId.get("17track.list_things")!.capability.policy.allowed).toBe(true);
++    expect(byId.get("17track.write_thing")!.capability.policy).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
++    expect(byId.get("17track.delete_thing")!.capability.policy).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
++  });
++
++  it("refuses execute_action for a write and a destructive action with action_not_allowed, and lets a read action past the policy", async () => {
++    const accessToken = await readOnlyOrFullAccessToken("read");
++    for (const name of ["write_thing", "delete_thing"]) {
++      const refused = await callTool(accessToken, "execute_action", { actionId: `17track.${name}`, input: {} });
++      expect(JSON.stringify(refused)).toContain("action_not_allowed");
++    }
++    // The read action may still fail later (no connection, made-up executor), but never at the policy.
++    const attempted = await callTool(accessToken, "execute_action", { actionId: "17track.read_thing", input: {} });
++    expect(JSON.stringify(attempted)).not.toContain("action_not_allowed");
++    expect(JSON.stringify(attempted)).not.toContain("action_blocked");
++  });
++
++  it("P2/P7 relabel: after a redeploy that relabels read_thing as write and adds a new read action, the same grant follows the new labels", async () => {
++    const accessToken = await readOnlyOrFullAccessToken("read");
++    const original = catalog["/catalog/apps-0000.json"];
++    const relabelled = [
++      {
++        ...(original as { actions: unknown[] }[])[0],
++        actions: [
++          action("read_thing", "write"),
++          action("write_thing", "write"),
++          action("delete_thing", "destructive"),
++          action("list_things", "read"),
++          action("fresh_lookup", "read"),
++        ],
++      },
++    ];
++    try {
++      catalog["/catalog/apps-0000.json"] = relabelled;
++      // The Worker caches the catalog per module instance, so a fresh module instance is a redeploy.
++      vi.resetModules();
++      const redeployed = (await import("../cloudflare.ts")).default;
++      const found = await callTool(accessToken, "search_actions", { service: "17track", limit: 20 }, redeployed);
++      const rows = (found.data ?? found) as {
++        id: string;
++        operationType: string;
++        capability: { policy: { allowed: boolean; code?: string } };
++      }[];
++      const byId = new Map(rows.map((row) => [row.id, row]));
++      expect(byId.get("17track.read_thing")!.operationType).toBe("write");
++      expect(byId.get("17track.read_thing")!.capability.policy).toMatchObject({
++        allowed: false,
++        code: "action_not_allowed",
++      });
++      expect(byId.get("17track.list_things")!.capability.policy.allowed).toBe(true);
++      expect(byId.get("17track.fresh_lookup")!.capability.policy.allowed).toBe(true);
++      const refused = await callTool(
++        accessToken,
++        "execute_action",
++        { actionId: "17track.read_thing", input: {} },
++        redeployed,
++      );
++      expect(JSON.stringify(refused)).toContain("action_not_allowed");
++      const attempted = await callTool(
++        accessToken,
++        "execute_action",
++        { actionId: "17track.fresh_lookup", input: {} },
++        redeployed,
++      );
++      expect(JSON.stringify(attempted)).not.toContain("action_not_allowed");
++    } finally {
++      catalog["/catalog/apps-0000.json"] = original;
++      vi.resetModules();
++    }
++  });
++
++  it("a full-access grant is not narrowed: the write action is allowed by the policy", async () => {
++    const accessToken = await readOnlyOrFullAccessToken("all");
++    const attempted = await callTool(accessToken, "execute_action", { actionId: "17track.write_thing", input: {} });
++    expect(JSON.stringify(attempted)).not.toContain("action_not_allowed");
++  });
++});
++
+ interface Control {
+   tag: string;
+   type: string;
+@@ -506,8 +708,7 @@ describe("the consent page's single form carries every field the approval needs
+     expect(response.status).toBe(302);
+     const created = await createdSince(before);
+     expect(created).toHaveLength(1);
+-    expect(created[0]!.allowedActions).not.toContain("*");
+-    expect(created[0]!.allowedActions).not.toContain("17track.write_thing");
++    expect(created[0]!.allowedActions).toEqual(["@read"]);
+     expect(created[0]!.allowedConnections).toEqual([]);
+   });
+ 
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 10:39:22 -0300
+Subject: [PATCH 2/3] 0030: @read token rule; read-only grants follow catalog
+ labels at request time (#95)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0129g9KnEZjFYCq8zqEw7dz6
+---
+ src/core/action-policy.ts                | 10 +++++++---
+ src/server/api/policy-input.ts           | 19 ++++++++++++++-----
+ src/server/cloudflare/mcp-grant-scope.ts | 16 +++-------------
+ 3 files changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/src/core/action-policy.ts b/src/core/action-policy.ts
+index 9c75d553..23b12663 100644
+--- a/src/core/action-policy.ts
++++ b/src/core/action-policy.ts
+@@ -60,7 +60,7 @@ export interface ActionPolicyConfig {
+ 
+ interface CompiledRule {
+   pattern: string;
+-  matches(value: string): boolean;
++  matches(value: string, action?: ActionDefinition): boolean;
+ }
+ 
+ interface CompiledLayer {
+@@ -107,7 +107,7 @@ export class ActionPolicySnapshot {
+ 
+   evaluate(action: ActionDefinition): ActionPolicyDecision {
+     for (const layer of this.layers) {
+-      const blocked = layer.blockedActions.find((rule) => rule.matches(action.id));
++      const blocked = layer.blockedActions.find((rule) => rule.matches(action.id, action));
+       if (blocked) {
+         return {
+           allowed: false,
+@@ -123,7 +123,7 @@ export class ActionPolicySnapshot {
+       if (layer.allowedActions.length === 0) {
+         continue;
+       }
+-      const allowed = layer.allowedActions.find((rule) => rule.matches(action.id));
++      const allowed = layer.allowedActions.find((rule) => rule.matches(action.id, action));
+       if (!allowed) {
+         return {
+           allowed: false,
+@@ -325,6 +325,10 @@ function compileLayer(source: PolicySource, rules: PolicyRules): CompiledLayer {
+ }
+ 
+ function compileActionRule(pattern: string): CompiledRule {
++  // Follows the catalog's operationType at request time. Id-only callers pass no action, so it fails closed.
++  if (pattern === "@read") {
++    return { pattern, matches: (_actionId, action) => action?.operationType === "read" };
++  }
+   if (pattern === "*") {
+     return { pattern, matches: () => true };
+   }
+diff --git a/src/server/api/policy-input.ts b/src/server/api/policy-input.ts
+index cd6283fe..fa128965 100644
+--- a/src/server/api/policy-input.ts
++++ b/src/server/api/policy-input.ts
+@@ -15,8 +15,8 @@ export function readRuntimePolicyRules(body: JsonRequestBody): PolicyRules {
+     blockedActions: readRules(body.blockedActions, "blockedActions", "action"),
+     allowedProxies: readRules(body.allowedProxies, "allowedProxies", "proxy"),
+     blockedProxies: readRules(body.blockedProxies, "blockedProxies", "proxy"),
+-    allowedTriggers: readRules(body.allowedTriggers, "allowedTriggers", "action", true),
+-    blockedTriggers: readRules(body.blockedTriggers, "blockedTriggers", "action", true),
++    allowedTriggers: readRules(body.allowedTriggers, "allowedTriggers", "trigger", true),
++    blockedTriggers: readRules(body.blockedTriggers, "blockedTriggers", "trigger", true),
+   };
+ }
+ 
+@@ -31,12 +31,14 @@ export function readTokenPolicy(body: JsonRequestBody, allowOmitted = false): To
+     allowedActions: readRules(body.allowedActions, "allowedActions", "action", allowOmitted),
+     blockedActions: readRules(body.blockedActions, "blockedActions", "action", allowOmitted),
+     allowedProxies: readRules(body.allowedProxies, "allowedProxies", "proxy", allowOmitted),
+-    allowedTriggers: readRules(body.allowedTriggers, "allowedTriggers", "action", true),
++    allowedTriggers: readRules(body.allowedTriggers, "allowedTriggers", "trigger", true),
+     allowedConnections: readConnectionIds(body.allowedConnections, "allowedConnections", allowOmitted),
+   };
+ }
+ 
+-function readRules(value: unknown, fieldName: string, kind: "action" | "proxy", allowOmitted = false): string[] {
++type RuleKind = "action" | "proxy" | "trigger";
++
++function readRules(value: unknown, fieldName: string, kind: RuleKind, allowOmitted = false): string[] {
+   if (value === undefined && allowOmitted) {
+     return [];
+   }
+@@ -89,10 +91,17 @@ function readConnectionIds(value: unknown, fieldName: string, allowOmitted = fal
+   return connectionIds;
+ }
+ 
+-function assertRuleSyntax(rule: string, fieldName: string, kind: "action" | "proxy"): void {
++function assertRuleSyntax(rule: string, fieldName: string, kind: RuleKind): void {
+   if (rule === "*") {
+     return;
+   }
++  // "@read" is the only token rule, and only for actions; any other "@" pattern is a typo that would match nothing.
++  if (rule.startsWith("@")) {
++    if (rule === "@read" && kind === "action") {
++      return;
++    }
++    throw invalidInput(`${fieldName} contains an invalid ${kind} rule: ${rule}.`);
++  }
+   if (kind === "proxy") {
+     if (rule.includes("*") || /\s/.test(rule)) {
+       throw invalidInput(`${fieldName} contains an invalid proxy rule: ${rule}.`);
+diff --git a/src/server/cloudflare/mcp-grant-scope.ts b/src/server/cloudflare/mcp-grant-scope.ts
+index c6a88fb8..05aaf5d5 100644
+--- a/src/server/cloudflare/mcp-grant-scope.ts
++++ b/src/server/cloudflare/mcp-grant-scope.ts
+@@ -2,7 +2,7 @@ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ 
+ /** What the consent form asked for: read-only or every action, and which accounts. */
+ export interface McpGrantRequest {
+-  /** "read" grants only actions whose operationType is read; "all" grants every action the deployment allows. */
++  /** "read" grants the @read rule (actions labelled read in the catalog at request time); "all" grants every action the deployment allows. */
+   access: "read" | "all";
+   /** Connection nicknames, as typed: "alias" (any service) or "service:alias". Empty grants every connection. */
+   accounts: readonly string[];
+@@ -49,18 +49,8 @@ export async function resolveMcpGrantScope(
+       env,
+     );
+ 
+-  let allowedActions = ["*"];
+-  if (grant.access === "read") {
+-    const response = await adminRequest("/api/actions");
+-    if (!response.ok) throw new Error(`Unable to read the action catalog (${response.status}).`);
+-    const actions = (await response.json()) as {
+-      id: string;
+-      operationType?: string;
+-    }[];
+-    allowedActions = actions.filter((action) => action.operationType === "read").map((action) => action.id);
+-    // An empty list would mean "every action" to the policy, the opposite of read-only.
+-    if (allowedActions.length === 0) throw new McpGrantScopeError("This gateway has no read-only actions to grant.");
+-  }
++  // "@read" follows the catalog's operationType labels at request time; an empty catalog allows nothing.
++  const allowedActions = grant.access === "read" ? ["@read"] : ["*"];
+ 
+   let allowedConnections: string[] = [];
+   if (grant.accounts.length > 0) {
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 10:40:50 -0300
+Subject: [PATCH 3/3] 0030 tests: the mail-watch read-only grant test expects
+ @read
+
+---
+ .../email-watch/mail-watch-provider.test.ts   | 253 ++++++++++++++----
+ 1 file changed, 208 insertions(+), 45 deletions(-)
+
+diff --git a/src/server/email-watch/mail-watch-provider.test.ts b/src/server/email-watch/mail-watch-provider.test.ts
+index 28a2061e..753353c1 100644
+--- a/src/server/email-watch/mail-watch-provider.test.ts
++++ b/src/server/email-watch/mail-watch-provider.test.ts
+@@ -15,17 +15,17 @@
+ //     }): ProviderExecutors
+ //   Both are bound at app creation: `new ProviderLoader({ ...executorModules, mail_watch: async () => ({ executors }) })`.
+ import type { ExecutionContext, ExecutionResult } from "../../core/types.ts";
++import type { CloudflareEnv } from "../cloudflare/cloudflare-env.ts";
+ 
+ import { afterEach, describe, expect, it } from "vitest";
+ import { ActionPolicyService } from "../../core/action-policy.ts";
+ import { assertProviderId } from "../../core/provider-id.ts";
+ import { validateActionInput } from "../../core/validation.ts";
++import { provider } from "../../providers/mail_watch/definition.ts";
++import { createMailWatchExecutors, executors as unboundExecutors } from "../../providers/mail_watch/executors.ts";
+ import { resolveMcpGrantScope } from "../cloudflare/mcp-grant-scope.ts";
+-import type { CloudflareEnv } from "../cloudflare/cloudflare-env.ts";
+ import { SqliteD1Database } from "../storage/d1/test-database.ts";
+ import { DAY, HOUR, T0, createLogCapture, insertItem, itemRow, selectAll } from "./test-support.ts";
+-import { provider } from "../../providers/mail_watch/definition.ts";
+-import { createMailWatchExecutors, executors as unboundExecutors } from "../../providers/mail_watch/executors.ts";
+ 
+ // R3.8(b): the executors deny by default without a predicate; ActionRunner always supplies one. These unit tests stand in
+ // for ActionRunner with an allow-all predicate (the scoping itself is tested in mail-watch-scope.test.ts).
+@@ -90,15 +90,30 @@ describe("mail_watch provider definition", () => {
+     const action = () => provider.actions.find((candidate) => candidate.id === "mail_watch.list_pending_mail")!;
+     const valid = (input: unknown) => validateActionInput(action(), input).valid;
+ 
+-    it.each([{}, { category: "github" }, { category: "deploy_failed" }, { category: "billing_quota" }, { category: "account_security" }, { category: "watch_gap" }, { connectionName: "work" }, { limit: 1 }, { limit: 100 }, { category: "github", connectionName: "work", limit: 10 }])(
+-      "accepts %j",
+-      (input) => expect(valid(input)).toBe(true),
+-    );
+-
+-    it.each([{ category: "newsletter" }, { category: "" }, { limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: "5" }, { connectionName: 3 }, { unknown: true }, { limit: -1 }])(
+-      "rejects %j",
+-      (input) => expect(valid(input)).toBe(false),
+-    );
++    it.each([
++      {},
++      { category: "github" },
++      { category: "deploy_failed" },
++      { category: "billing_quota" },
++      { category: "account_security" },
++      { category: "watch_gap" },
++      { connectionName: "work" },
++      { limit: 1 },
++      { limit: 100 },
++      { category: "github", connectionName: "work", limit: 10 },
++    ])("accepts %j", (input) => expect(valid(input)).toBe(true));
++
++    it.each([
++      { category: "newsletter" },
++      { category: "" },
++      { limit: 0 },
++      { limit: 101 },
++      { limit: 1.5 },
++      { limit: "5" },
++      { connectionName: 3 },
++      { unknown: true },
++      { limit: -1 },
++    ])("rejects %j", (input) => expect(valid(input)).toBe(false));
+   });
+ 
+   describe("acknowledge_mail input", () => {
+@@ -110,10 +125,15 @@ describe("mail_watch provider definition", () => {
+       expect(valid({ ids: Array.from({ length: 100 }, (_, index) => `id-${index}`) })).toBe(true);
+     });
+ 
+-    it.each([{}, { ids: [] }, { ids: "a" }, { ids: [1] }, { ids: [null] }, { ids: Array.from({ length: 101 }, (_, index) => `id-${index}`) }, { ids: ["a"], extra: 1 }])(
+-      "rejects %j",
+-      (input) => expect(valid(input)).toBe(false),
+-    );
++    it.each([
++      {},
++      { ids: [] },
++      { ids: "a" },
++      { ids: [1] },
++      { ids: [null] },
++      { ids: Array.from({ length: 101 }, (_, index) => `id-${index}`) },
++      { ids: ["a"], extra: 1 },
++    ])("rejects %j", (input) => expect(valid(input)).toBe(false));
+   });
+ 
+   it("has what the registry generator needs: a valid provider id equal to its directory, and an executors module", async () => {
+@@ -129,10 +149,65 @@ describe("mail_watch.list_pending_mail", () => {
+   async function seeded() {
+     const s = setup();
+     const at = (ms: number) => iso(T0 - ms);
+-    await insertItem(s.db, itemRow({ id: "i1", connection_name: "work", gmail_message_id: "gm1", category: "deploy_failed", sender_domain: "vercel.com", subject: "Deployment failed for a", rule_id: "r-deploy", received_at: at(5 * HOUR), created_at: at(5 * HOUR), occurrences: 3 }));
+-    await insertItem(s.db, itemRow({ id: "i2", connection_name: "ops", gmail_message_id: "gm2", category: "github", sender_domain: "github.com", subject: "Please review", rule_id: "r-gh", received_at: at(3 * HOUR), created_at: at(3 * HOUR) }));
+-    await insertItem(s.db, itemRow({ id: "i3", connection_name: "work", gmail_message_id: "gm3", category: "billing_quota", sender_domain: "anthropic.com", subject: "Usage limit", rule_id: "r-bill", received_at: at(HOUR), created_at: at(HOUR) }));
+-    await insertItem(s.db, itemRow({ id: "i4", connection_name: "work", gmail_message_id: "gm4", category: "account_security", sender_domain: "google.com", subject: "Security alert", rule_id: "r-sec", status: "acknowledged", acknowledged_at: at(30 * 60_000), received_at: at(2 * HOUR), created_at: at(2 * HOUR) }));
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "i1",
++        connection_name: "work",
++        gmail_message_id: "gm1",
++        category: "deploy_failed",
++        sender_domain: "vercel.com",
++        subject: "Deployment failed for a",
++        rule_id: "r-deploy",
++        received_at: at(5 * HOUR),
++        created_at: at(5 * HOUR),
++        occurrences: 3,
++      }),
++    );
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "i2",
++        connection_name: "ops",
++        gmail_message_id: "gm2",
++        category: "github",
++        sender_domain: "github.com",
++        subject: "Please review",
++        rule_id: "r-gh",
++        received_at: at(3 * HOUR),
++        created_at: at(3 * HOUR),
++      }),
++    );
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "i3",
++        connection_name: "work",
++        gmail_message_id: "gm3",
++        category: "billing_quota",
++        sender_domain: "anthropic.com",
++        subject: "Usage limit",
++        rule_id: "r-bill",
++        received_at: at(HOUR),
++        created_at: at(HOUR),
++      }),
++    );
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "i4",
++        connection_name: "work",
++        gmail_message_id: "gm4",
++        category: "account_security",
++        sender_domain: "google.com",
++        subject: "Security alert",
++        rule_id: "r-sec",
++        status: "acknowledged",
++        acknowledged_at: at(30 * 60_000),
++        received_at: at(2 * HOUR),
++        created_at: at(2 * HOUR),
++      }),
++    );
+     return s;
+   }
+ 
+@@ -162,23 +237,45 @@ describe("mail_watch.list_pending_mail", () => {
+ 
+   it("filters by category, by connection and by both", async () => {
+     const s = await seeded();
+-    expect(output<{ items: Item[] }>(await s.list({ category: "github" })).items.map((item) => item.id)).toEqual(["i2"]);
+-    expect(output<{ items: Item[] }>(await s.list({ connectionName: "work" })).items.map((item) => item.id)).toEqual(["i3", "i1"]);
+-    expect(output<{ items: Item[] }>(await s.list({ connectionName: "work", category: "deploy_failed" })).items.map((item) => item.id)).toEqual(["i1"]);
+-    expect(output<{ items: Item[] }>(await s.list({ connectionName: "ops", category: "deploy_failed" })).items).toEqual([]);
++    expect(output<{ items: Item[] }>(await s.list({ category: "github" })).items.map((item) => item.id)).toEqual([
++      "i2",
++    ]);
++    expect(output<{ items: Item[] }>(await s.list({ connectionName: "work" })).items.map((item) => item.id)).toEqual([
++      "i3",
++      "i1",
++    ]);
++    expect(
++      output<{ items: Item[] }>(await s.list({ connectionName: "work", category: "deploy_failed" })).items.map(
++        (item) => item.id,
++      ),
++    ).toEqual(["i1"]);
++    expect(output<{ items: Item[] }>(await s.list({ connectionName: "ops", category: "deploy_failed" })).items).toEqual(
++      [],
++    );
+     expect(output<{ items: Item[] }>(await s.list({ connectionName: "nobody" })).items).toEqual([]);
+   });
+ 
+   it("limits to 50 by default and honours limit", async () => {
+     const s = setup();
+     for (let index = 0; index < 60; index += 1) {
+-      await insertItem(s.db, itemRow({ id: `n${String(index).padStart(2, "0")}`, received_at: iso(T0 - (60 - index) * 60_000), created_at: iso(T0 - (60 - index) * 60_000) }));
++      await insertItem(
++        s.db,
++        itemRow({
++          id: `n${String(index).padStart(2, "0")}`,
++          received_at: iso(T0 - (60 - index) * 60_000),
++          created_at: iso(T0 - (60 - index) * 60_000),
++        }),
++      );
+     }
+     const all = output<{ items: Item[] }>(await s.list()).items;
+     expect(all).toHaveLength(50);
+     expect(all[0]!.id).toBe("n59");
+     expect(all[49]!.id).toBe("n10");
+-    expect(output<{ items: Item[] }>(await s.list({ limit: 3 })).items.map((item) => item.id)).toEqual(["n59", "n58", "n57"]);
++    expect(output<{ items: Item[] }>(await s.list({ limit: 3 })).items.map((item) => item.id)).toEqual([
++      "n59",
++      "n58",
++      "n57",
++    ]);
+     expect(output<{ items: Item[] }>(await s.list({ limit: 100 })).items).toHaveLength(60);
+   });
+ 
+@@ -196,12 +293,39 @@ describe("mail_watch.list_pending_mail", () => {
+ 
+   it("R3.5: a watch_gap item links to the inbox, not to a fake message id", async () => {
+     const s = await seeded();
+-    await insertItem(s.db, itemRow({ id: "gap1", connection_name: "work", category: "watch_gap", sender_domain: "", gmail_message_id: "gap-synthetic-123", gmail_thread_id: "", received_at: iso(T0), created_at: iso(T0) }));
+-    await insertItem(s.db, itemRow({ id: "gap2", connection_name: "nobody", category: "watch_gap", sender_domain: "", gmail_message_id: "gap-synthetic-456", gmail_thread_id: "", received_at: iso(T0 - 1000), created_at: iso(T0 - 1000) }));
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "gap1",
++        connection_name: "work",
++        category: "watch_gap",
++        sender_domain: "",
++        gmail_message_id: "gap-synthetic-123",
++        gmail_thread_id: "",
++        received_at: iso(T0),
++        created_at: iso(T0),
++      }),
++    );
++    await insertItem(
++      s.db,
++      itemRow({
++        id: "gap2",
++        connection_name: "nobody",
++        category: "watch_gap",
++        sender_domain: "",
++        gmail_message_id: "gap-synthetic-456",
++        gmail_thread_id: "",
++        received_at: iso(T0 - 1000),
++        created_at: iso(T0 - 1000),
++      }),
++    );
+     const out = output<{ items: Item[] }>(await s.list({ category: "watch_gap" }));
+     const byId = Object.fromEntries(out.items.map((item) => [item.id, item.link]));
+     const email = "owner@example.org";
+-    expect([`https://mail.google.com/mail/?authuser=${email}#inbox`, `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#inbox`]).toContain(byId.gap1);
++    expect([
++      `https://mail.google.com/mail/?authuser=${email}#inbox`,
++      `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#inbox`,
++    ]).toContain(byId.gap1);
+     expect(byId.gap2).toBe("https://mail.google.com/mail/u/0/#inbox");
+     expect(JSON.stringify(out)).not.toContain("gap-synthetic");
+   });
+@@ -236,11 +360,15 @@ describe("mail_watch.list_pending_mail", () => {
+ describe("mail_watch.acknowledge_mail", () => {
+   async function pending(ids = ["a", "b", "c"]) {
+     const s = setup();
+-    for (const id of ids) await insertItem(s.db, itemRow({ id, created_at: iso(T0 - DAY / 2), received_at: iso(T0 - DAY / 2) }));
++    for (const id of ids)
++      await insertItem(s.db, itemRow({ id, created_at: iso(T0 - DAY / 2), received_at: iso(T0 - DAY / 2) }));
+     return s;
+   }
+   const statuses = (s: ReturnType<typeof setup>) =>
+-    selectAll<{ id: string; status: string; acknowledged_at: string | null }>(s.db, "select id, status, acknowledged_at from email_watch_items order by id");
++    selectAll<{ id: string; status: string; acknowledged_at: string | null }>(
++      s.db,
++      "select id, status, acknowledged_at from email_watch_items order by id",
++    );
+ 
+   it("marks the named pending items acknowledged with the time and returns how many changed", async () => {
+     const s = await pending();
+@@ -275,10 +403,17 @@ describe("mail_watch.acknowledge_mail", () => {
+ 
+   it("writes only to email_watch_items", async () => {
+     const s = await pending();
+-    const tables = (await selectAll<{ name: string }>(s.db, "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name <> 'email_watch_items' order by name")).map((row) => row.name);
++    const tables = (
++      await selectAll<{ name: string }>(
++        s.db,
++        "select name from sqlite_master where type = 'table' and name not like 'sqlite_%' and name <> 'email_watch_items' order by name",
++      )
++    ).map((row) => row.name);
+     expect(tables.length).toBeGreaterThan(5);
+     const snapshot = async () =>
+-      JSON.stringify(await Promise.all(tables.map(async (table) => [table, await selectAll(s.db, `select * from ${table}`)])));
++      JSON.stringify(
++        await Promise.all(tables.map(async (table) => [table, await selectAll(s.db, `select * from ${table}`)])),
++      );
+     const before = await snapshot();
+     await s.acknowledge({ ids: ["a", "b"] });
+     expect(await snapshot()).toBe(before);
+@@ -296,27 +431,34 @@ describe("feature off", () => {
+   });
+ 
+   it("the unbound default executors behave the same way, so a build without the wiring is simply off", async () => {
+-    expect(output(await unboundExecutors["mail_watch.list_pending_mail"]!({}, context))).toEqual({ enabled: false, items: [] });
+-    expect(output(await unboundExecutors["mail_watch.acknowledge_mail"]!({ ids: ["a"] }, context))).toEqual({ acknowledged: 0 });
++    expect(output(await unboundExecutors["mail_watch.list_pending_mail"]!({}, context))).toEqual({
++      enabled: false,
++      items: [],
++    });
++    expect(output(await unboundExecutors["mail_watch.acknowledge_mail"]!({ ids: ["a"] }, context))).toEqual({
++      acknowledged: 0,
++    });
+   });
+ });
+ 
+ describe("read-only MCP grant (patch 0004)", () => {
+   it("includes list_pending_mail and excludes acknowledge_mail, and the policy enforces it", async () => {
+-    const actions = provider.actions.map((action) => ({ id: action.id, operationType: action.operationType }));
++    // Patch 0030 (#95): a read-only grant stores the @read rule, evaluated against each action's label per request.
+     const scope = await resolveMcpGrantScope(
+       { access: "read", accounts: [] },
+       "https://connect.example.com",
+       { OOMOL_CONNECT_ADMIN_TOKEN: "t" } as CloudflareEnv,
+-      async (request) =>
+-        new URL(request.url).pathname === "/api/actions" ? Response.json(actions) : new Response(null, { status: 404 }),
++      async () => new Response(null, { status: 404 }),
+     );
+-    expect(scope.allowedActions).toEqual(["mail_watch.list_pending_mail"]);
++    expect(scope.allowedActions).toEqual(["@read"]);
+ 
+     const policy = new ActionPolicyService({ allowedActions: scope.allowedActions }).createSnapshot();
+     const byId = Object.fromEntries(provider.actions.map((action) => [action.id, action]));
+     expect(policy.evaluate(byId["mail_watch.list_pending_mail"]!)).toMatchObject({ allowed: true });
+-    expect(policy.evaluate(byId["mail_watch.acknowledge_mail"]!)).toMatchObject({ allowed: false, code: "action_not_allowed" });
++    expect(policy.evaluate(byId["mail_watch.acknowledge_mail"]!)).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
+   });
+ });
+ 
+@@ -327,17 +469,34 @@ describe("the 90-connection cap on list_pending_mail (patch 0015, #102)", () =>
+     const s = setup();
+     for (let n = 0; n < count; n += 1) {
+       const name = `conn-${String(n).padStart(3, "0")}`;
+-      await insertItem(s.db, itemRow({ id: `item-${n}`, connection_name: name, received_at: iso(T0 - n * 1000), created_at: iso(T0 - n * 1000) }));
++      await insertItem(
++        s.db,
++        itemRow({
++          id: `item-${n}`,
++          connection_name: name,
++          received_at: iso(T0 - n * 1000),
++          created_at: iso(T0 - n * 1000),
++        }),
++      );
+     }
+     return s;
+   }
+ 
+   async function listWithLog(s: ReturnType<typeof setup>, allowed: (name: string) => boolean = () => true) {
+     const log = createLogCapture();
+-    const executors = createMailWatchExecutors({ database: s.db, enabled: true, profileEmail: async () => "owner@example.org", now: () => T0 });
++    const executors = createMailWatchExecutors({
++      database: s.db,
++      enabled: true,
++      profileEmail: async () => "owner@example.org",
++      now: () => T0,
++    });
+     const result = await executors["mail_watch.list_pending_mail"]!(
+       { limit: 100 },
+-      { getCredential: async () => undefined, isConnectionAllowed: async (name: string) => allowed(name), logger: log.logger },
++      {
++        getCredential: async () => undefined,
++        isConnectionAllowed: async (name: string) => allowed(name),
++        logger: log.logger,
++      },
+     );
+     return { result, log };
+   }
+@@ -366,7 +525,9 @@ describe("the 90-connection cap on list_pending_mail (patch 0015, #102)", () =>
+   it("with 91 connections the count is 1", async () => {
+     const s = await withConnections(91);
+     const { log } = await listWithLog(s);
+-    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([{ omitted: 1 }]);
++    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([
++      { omitted: 1 },
++    ]);
+   });
+ 
+   it("with exactly 90 connections, or fewer, it logs nothing", async () => {
+@@ -384,7 +545,9 @@ describe("the 90-connection cap on list_pending_mail (patch 0015, #102)", () =>
+     const s = await withConnections(100);
+     const { result, log } = await listWithLog(s, (name) => Number(name.slice(-3)) < 92);
+     expect(output<{ items: Item[] }>(result).items).toHaveLength(90);
+-    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([{ omitted: 2 }]);
++    expect(log.entries.filter((entry) => entry.level === "warn").map((entry) => entry.fields)).toEqual([
++      { omitted: 2 },
++    ]);
+   });
+ 
+   it("with a caller that may use only a few of the 100 connections, nothing is omitted and nothing is logged", async () => {
+-- 
+2.34.1
+

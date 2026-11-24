@@ -247,6 +247,12 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
      connections and read-only grants lose them. Existing read-only grants keep their consent-time action ids
      (#95), so reconnect again after 0020, or in the same step as 0019 if they deploy together. An executor-level
      gate that could return some of them to `read` is tracked in #137.
+   - **Patch 0030 (#95)** ends the reconnects above. A new read-only grant stores the rule `@read`, which allows
+     an action only while its catalog label is `read`, checked on every request. A later relabel to `write`
+     takes effect at once, and new read actions are included. **After deploying 0030,** revoke the runtime
+     tokens whose names start with "MCP OAuth" and reconnect claude.ai and Claude Code once; grants made
+     before 0030 keep their frozen ids. Hand-made tokens can use `@read` in `allowedActions` too (it is
+     accepted only for actions, not for proxies or triggers).
    - **Startup warnings:** an entry that can never match (an uppercase letter in the provider id, `*` in either
      part, or a provider that is not in the catalog) is kept but logged once, naming the entry. Malformed entries
      are ignored with a warning. Nothing throws. Valid entries log nothing. Each warning is logged once per isolate

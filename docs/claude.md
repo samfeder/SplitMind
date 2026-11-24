@@ -65,7 +65,7 @@ connections and actions, which suits a coding agent.
    ```
 
 - Omit `allowedConnections` (or pass `[]`) to allow every connection.
-- For a read-only token, list only read action ids; see [guardrails](guardrails.md#5-read-only-accounts-e64).
+- For a read-only token, set `allowedActions` to `["@read"]` (patch 0030), which follows each action's label; see [guardrails](guardrails.md#5-read-only-accounts-e64).
 - `claude mcp add` stores the header in Claude Code's config file (`~/.claude.json`) **in plain text**. Treat that
   file as a secret. To revoke, delete the token in the Web Console, then `claude mcp remove splitmind`.
 
