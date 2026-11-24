@@ -62,6 +62,8 @@ jobs:
         run: node scripts/check-vendor-dates.ts
       - name: OpenConnector typecheck (patched)
         run: cd vendor/open-connector && npm run -s typecheck
+      - name: Worker bundles (deploy dry run, no Cloudflare login)
+        run: npm run -s deploy -- --dry-run </dev/null
       - name: OpenConnector test suite (patched)
         run: cd vendor/open-connector && npx vitest run --reporter=dot --testTimeout=30000
       - name: Submodule is at the pinned commit
