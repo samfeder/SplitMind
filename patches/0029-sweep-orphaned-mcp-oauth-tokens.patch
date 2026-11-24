@@ -1,0 +1,1833 @@
+SplitMind patch 0029 for OpenConnector v1.9.2. Apply after 0028.
+Upstream issue: not filed yet. Sweep orphaned MCP OAuth runtime tokens hourly (#146).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 09:24:10 -0300
+Subject: [PATCH 1/5] 0029 tests: orphaned MCP OAuth token sweep
+
+---
+ .../cloudflare/mcp-oauth-orphan-sweep.test.ts | 864 ++++++++++++++++++
+ 1 file changed, 864 insertions(+)
+ create mode 100644 src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+
+diff --git a/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+new file mode 100644
+index 00000000..0c8fd38c
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+@@ -0,0 +1,864 @@
++// SplitMind patch 0029 (#146): the hourly sweep that revokes `MCP OAuth •` runtime tokens no grant references.
++//
++// Seams: the exported `sweepOrphanedMcpOAuthTokens({ kv, tokens, now, logger, minAgeMs?, maxGrants? })` over the
++// real RuntimeTokenService on a real (sqlite-backed) D1 store, plus an in-memory KV fake that records every call;
++// and `worker.scheduled` for the wiring. Assumptions the implementation must meet:
++//   - `now` is epoch milliseconds, like `event.scheduledTime ?? Date.now()`.
++//   - `logger` is pino-shaped: `info|warn|error(fields, message)`, where `message` is the event name
++//     (`mcp_oauth_orphan_sweep`, `mcp_oauth_orphan_sweep_skipped`, ...). The tests ignore the level.
++//   - `RuntimeTokenService.revokeToken` DELETES the row (D1RuntimeTokenStore.revoke), and `listTokens()` returns
++//     live rows only with `id`, `name` and `createdAt`. Nothing new is needed on the store or service (point 9):
++//     "not revoked" holds for every listed token, and an already-revoked token is simply absent.
++//   - `candidates` counts the old, `MCP OAuth • ` named, live tokens; `referenced` counts distinct ids that grants
++//     reference. Every fixture keeps these unambiguous (each referenced token is also an old candidate).
++import type { KVListPage, OAuthKVNamespaceBinding } from "./cloudflare-bindings.ts";
++import type { CloudflareEnv } from "./cloudflare-env.ts";
++
++import { afterEach, describe, expect, it, vi } from "vitest";
++import worker from "../cloudflare.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
++import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
++import { hashRuntimeToken, RuntimeTokenService } from "../storage/runtime-token-service.ts";
++import { sweepOrphanedMcpOAuthTokens } from "./mcp-oauth-orphan-sweep.ts";
++
++vi.mock("cloudflare:workers", () => ({
++  WorkerEntrypoint: class {},
++  DurableObject: class {
++    readonly ctx: unknown;
++    readonly env: unknown;
++    constructor(ctx: unknown, env: unknown) {
++      this.ctx = ctx;
++      this.env = env;
++    }
++  },
++}));
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++const minute = 60_000;
++const hour = 60 * minute;
++const PREFIX = "MCP OAuth • ";
++
++// ---- fakes -----------------------------------------------------------------------------------------------------
++
++/** In-memory KV that records every call, pages listings, and can be told to fail. */
++class RecordingKV implements OAuthKVNamespaceBinding {
++  readonly store = new Map<string, string>();
++  readonly listCalls: { prefix?: string; cursor?: string }[] = [];
++  readonly getCalls: string[] = [];
++  readonly writes: string[] = [];
++  pageSize = 1000;
++  failGet: (key: string) => Error | undefined = () => undefined;
++  failList: (cursor: string | undefined) => Error | undefined = () => undefined;
++  /** Keys that are listed but whose get() returns null, as after an expiry race. */
++  vanishOnGet = new Set<string>();
++
++  async put(key: string, value: unknown): Promise<void> {
++    this.writes.push(`put ${key}`);
++    this.store.set(key, typeof value === "string" ? value : "<binary>");
++  }
++  // oxlint-disable-next-line typescript/no-explicit-any -- KV's overloads return text, JSON or bytes by option.
++  async get(key: string, options?: unknown): Promise<any> {
++    this.getCalls.push(key);
++    const failure = this.failGet(key);
++    if (failure) throw failure;
++    if (this.vanishOnGet.has(key)) return null;
++    const value = this.store.get(key);
++    if (value === undefined) return null;
++    const type = typeof options === "string" ? options : (options as { type?: string } | undefined)?.type;
++    return type === "json" ? JSON.parse(value) : value;
++  }
++  async delete(key: string): Promise<void> {
++    this.writes.push(`delete ${key}`);
++    this.store.delete(key);
++  }
++  async list(options?: { prefix?: string; cursor?: string }): Promise<KVListPage> {
++    this.listCalls.push({ prefix: options?.prefix, cursor: options?.cursor });
++    const failure = this.failList(options?.cursor);
++    if (failure) throw failure;
++    const names = [...this.store.keys()].filter((key) => key.startsWith(options?.prefix ?? "")).sort();
++    const start = options?.cursor ? Number(options.cursor) : 0;
++    const page = names.slice(start, start + this.pageSize);
++    const next = start + this.pageSize;
++    return next < names.length
++      ? { keys: page.map((name) => ({ name })), list_complete: false, cursor: String(next) }
++      : { keys: page.map((name) => ({ name })), list_complete: true };
++  }
++}
++
++interface LogEntry {
++  level: string;
++  fields: Record<string, unknown>;
++  message: string;
++}
++
++function recordingLogger() {
++  const entries: LogEntry[] = [];
++  const at = (level: string) => (fields: Record<string, unknown>, message: string) => {
++    entries.push({ level, fields: fields ?? {}, message });
++  };
++  const logger = { info: at("info"), warn: at("warn"), error: at("error"), debug: at("debug") };
++  return {
++    logger: logger as unknown as Parameters<typeof sweepOrphanedMcpOAuthTokens>[0]["logger"],
++    entries,
++    named: (message: string) => entries.filter((entry) => entry.message === message),
++    /** Everything logged, as one string, with Error objects expanded so a leaked message cannot hide. */
++    dump: () =>
++      JSON.stringify(entries, (_key, value) =>
++        value instanceof Error ? { name: value.name, message: value.message, stack: value.stack } : value,
++      ),
++  };
++}
++
++/** A real token service whose revokeToken is observed and can be made to throw or answer false for chosen ids. */
++class ObservedTokens extends RuntimeTokenService {
++  readonly revokeCalls: string[] = [];
++  throwFor = new Map<string, Error>();
++  falseFor = new Set<string>();
++  override async revokeToken(id: string): Promise<boolean> {
++    this.revokeCalls.push(id);
++    const failure = this.throwFor.get(id);
++    if (failure) throw failure;
++    if (this.falseFor.has(id)) return false;
++    return super.revokeToken(id);
++  }
++}
++
++// ---- fixtures --------------------------------------------------------------------------------------------------
++
++function setup() {
++  const db = new SqliteD1Database();
++  const database = new D1RuntimeDatabase(db, {});
++  const tokens = new ObservedTokens(database.runtimeTokenStore);
++  const kv = new RecordingKV();
++  const log = recordingLogger();
++  return { db, database, tokens, kv, log, now: Date.now() };
++}
++type Setup = ReturnType<typeof setup>;
++
++let counter = 0;
++interface Seeded {
++  id: string;
++  secret: string;
++}
++
++/** Insert a live runtime token with an explicit name and age (createToken can neither backdate nor keep spaces). */
++async function seedToken(ctx: Setup, name: string, ageMs: number): Promise<Seeded> {
++  counter += 1;
++  const id = `tok-${counter}`;
++  const secret = `oct_secret-${counter}-${"x".repeat(32)}`;
++  await ctx.database.runtimeTokenStore.add({
++    id,
++    name,
++    tokenHash: hashRuntimeToken(secret),
++    allowedActions: [],
++    blockedActions: [],
++    allowedProxies: [],
++    allowedConnections: [],
++    allowedTriggers: [],
++    createdAt: new Date(ctx.now - ageMs).toISOString(),
++  });
++  return { id, secret };
++}
++
++const oldAge = 2 * hour;
++
++function orphan(ctx: Setup, client = "Claude", ageMs = oldAge): Promise<Seeded> {
++  return seedToken(ctx, `${PREFIX}${client}`, ageMs);
++}
++
++/** A grant record as the OAuth library stores it, carrying the backing token's id and (like props) its secret. */
++function putGrant(ctx: Setup, grantId: string, token: Seeded, body: Record<string, unknown> = {}): void {
++  ctx.kv.store.set(
++    `grant:administrator:${grantId}`,
++    JSON.stringify({
++      id: grantId,
++      userId: "administrator",
++      metadata: { runtimeTokenId: token.id },
++      props: { runtimeToken: token.secret, marker: "GRANT_BODY_MARKER" },
++      ...body,
++    }),
++  );
++}
++
++const liveIds = async (ctx: Setup) => (await ctx.tokens.listTokens()).map((token) => token.id).sort();
++const isLive = async (ctx: Setup, token: Seeded) => (await liveIds(ctx)).includes(token.id);
++
++function sweep(ctx: Setup, extra: { minAgeMs?: number; maxGrants?: number } = {}) {
++  return sweepOrphanedMcpOAuthTokens({
++    kv: ctx.kv,
++    tokens: ctx.tokens,
++    now: ctx.now,
++    logger: ctx.log.logger,
++    ...extra,
++  });
++}
++
++class NamedError extends Error {
++  constructor(name: string, message: string) {
++    super(message);
++    this.name = name;
++  }
++}
++
++// ---- S1 / S2 / S3: which tokens are touched --------------------------------------------------------------------
++
++describe("which runtime tokens the sweep revokes", () => {
++  it("S1: revokes an old orphan and keeps an old token a grant references, then reports the counts", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost client");
++    const kept = await orphan(ctx, "Kept client");
++    putGrant(ctx, "g1", kept);
++
++    await sweep(ctx);
++
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(await ctx.tokens.resolveToken(lost.secret)).toBeUndefined();
++    expect(await isLive(ctx, kept)).toBe(true);
++    expect(await ctx.tokens.resolveToken(kept.secret)).toMatchObject({ tokenId: kept.id });
++    expect(ctx.tokens.revokeCalls).toEqual([lost.id]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(1);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 2,
++      referenced: 1,
++      revoked: 1,
++    });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++  });
++
++  it("S1: with no orphans and no grants it revokes nothing and still reports", async () => {
++    const ctx = setup();
++    await sweep(ctx);
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 0,
++      referenced: 0,
++      revoked: 0,
++    });
++  });
++
++  it("S1: a grant whose runtimeTokenId is not a string, or is missing, protects nothing", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    const c = await orphan(ctx, "C");
++    ctx.kv.store.set("grant:administrator:n", JSON.stringify({ metadata: { runtimeTokenId: 42 } }));
++    ctx.kv.store.set("grant:administrator:m", JSON.stringify({ metadata: {} }));
++    ctx.kv.store.set("grant:administrator:z", JSON.stringify({ id: "z" }));
++    ctx.kv.store.set("grant:administrator:o", JSON.stringify({ metadata: { runtimeTokenId: { id: a.id } } }));
++
++    await sweep(ctx);
++
++    expect(await liveIds(ctx)).toEqual([]);
++    expect(ctx.tokens.revokeCalls.sort()).toEqual([a.id, b.id, c.id].sort());
++  });
++
++  it("S1: several grants may reference one token, and a grant for another client's token still protects it", async () => {
++    const ctx = setup();
++    const shared = await orphan(ctx, "Shared");
++    const other = await orphan(ctx, "Other");
++    const lost = await orphan(ctx, "Lost");
++    putGrant(ctx, "g1", shared);
++    putGrant(ctx, "g2", shared);
++    putGrant(ctx, "g3", other);
++
++    await sweep(ctx);
++
++    expect(await liveIds(ctx)).toEqual([shared.id, other.id].sort());
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 3,
++      referenced: 2,
++      revoked: 1,
++    });
++  });
++
++  it("S1: reads grants only under the grant: prefix, as JSON, and writes nothing to KV", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx);
++    ctx.kv.store.set("token:administrator:g:t", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
++    ctx.kv.store.set("client:abc", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
++
++    await sweep(ctx);
++
++    expect(ctx.kv.listCalls.length).toBeGreaterThan(0);
++    expect(ctx.kv.listCalls.every((call) => call.prefix === "grant:")).toBe(true);
++    expect(ctx.kv.getCalls.every((key) => key.startsWith("grant:"))).toBe(true);
++    expect(ctx.kv.writes).toEqual([]);
++    // Only a grant protects a token: a stray non-grant key naming the id does not.
++    expect(await isLive(ctx, lost)).toBe(false);
++  });
++
++  it("S2: never touches a token that is not named exactly `MCP OAuth • <client>`, even with no grant and old", async () => {
++    const ctx = setup();
++    const handMade = await seedToken(ctx, "my laptop", oldAge);
++    const noBullet = await seedToken(ctx, "MCP OAuth", oldAge);
++    const noSpace = await seedToken(ctx, "MCP OAuth •Claude", oldAge);
++    const lower = await seedToken(ctx, "mcp oauth • Claude", oldAge);
++    const leading = await seedToken(ctx, ` ${PREFIX}Claude`, oldAge);
++    const middle = await seedToken(ctx, `Backup of ${PREFIX}Claude`, oldAge);
++    const dash = await seedToken(ctx, "MCP OAuth - Claude", oldAge);
++    const real = await orphan(ctx, "Claude");
++
++    await sweep(ctx);
++
++    for (const token of [handMade, noBullet, noSpace, lower, leading, middle, dash]) {
++      expect(await isLive(ctx, token), token.id).toBe(true);
++    }
++    expect(await isLive(ctx, real)).toBe(false);
++    expect(ctx.tokens.revokeCalls).toEqual([real.id]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 1, revoked: 1 });
++  });
++
++  it("S2: a token named with only the prefix and an empty client is still an MCP OAuth token", async () => {
++    const ctx = setup();
++    const bare = await seedToken(ctx, PREFIX, oldAge);
++    await sweep(ctx);
++    expect(await isLive(ctx, bare)).toBe(false);
++  });
++
++  it("S3: an orphan younger than the default 15 minutes stays live; an older one goes", async () => {
++    const ctx = setup();
++    const fresh = await orphan(ctx, "Fresh", 14 * minute);
++    const justBefore = await orphan(ctx, "JustBefore", 15 * minute - 1);
++    const stale = await orphan(ctx, "Stale", 16 * minute);
++
++    await sweep(ctx);
++
++    expect(await isLive(ctx, fresh)).toBe(true);
++    expect(await isLive(ctx, justBefore)).toBe(true);
++    expect(await isLive(ctx, stale)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 1, revoked: 1 });
++  });
++
++  it("S3: the age edge is strict, older than minAgeMs: exactly minAgeMs old stays, one ms more goes", async () => {
++    const ctx = setup();
++    const exact = await orphan(ctx, "Exact", 5 * minute);
++    const over = await orphan(ctx, "Over", 5 * minute + 1);
++
++    await sweep(ctx, { minAgeMs: 5 * minute });
++
++    expect(await isLive(ctx, exact)).toBe(true);
++    expect(await isLive(ctx, over)).toBe(false);
++  });
++
++  it("S3: a custom minAgeMs replaces the default in both directions", async () => {
++    const ctx = setup();
++    const tenMinutes = await orphan(ctx, "Ten", 10 * minute);
++    const twoHours = await orphan(ctx, "TwoH", 2 * hour);
++
++    await sweep(ctx, { minAgeMs: 3 * hour });
++    expect(await liveIds(ctx)).toEqual([tenMinutes.id, twoHours.id].sort());
++
++    await sweep(ctx, { minAgeMs: 5 * minute });
++    expect(await liveIds(ctx)).toEqual([]);
++  });
++
++  it("S3: a token with a createdAt in the future (clock skew) is not old", async () => {
++    const ctx = setup();
++    const future = await orphan(ctx, "Future", -10 * minute);
++    await sweep(ctx);
++    expect(await isLive(ctx, future)).toBe(true);
++  });
++
++  it("running the sweep twice is idempotent: the second run revokes nothing", async () => {
++    const ctx = setup();
++    await orphan(ctx, "A");
++    await orphan(ctx, "B");
++    await sweep(ctx);
++    ctx.tokens.revokeCalls.length = 0;
++    ctx.log.entries.length = 0;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 0, revoked: 0 });
++  });
++});
++
++// ---- S4 / S5 / S6 / S7: fail closed and listing ----------------------------------------------------------------
++
++describe("failing closed on the grant listing", () => {
++  it("S4: a KV get that throws revokes nothing and logs kv_error with only the error name", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++    putGrant(ctx, "g2", kept);
++    ctx.kv.failGet = (key) =>
++      key.endsWith(":g2") ? new NamedError("KVBoomError", `secret detail ${kept.secret}`) : undefined;
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await liveIds(ctx)).toEqual([lost.id, kept.id].sort());
++    const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++    expect(skipped).toHaveLength(1);
++    expect(skipped[0].fields).toMatchObject({ reason: "kv_error", errorName: "KVBoomError" });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++    expect(ctx.log.dump()).not.toContain("secret detail");
++  });
++
++  it("S4: a KV list that throws revokes nothing and logs kv_error", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    ctx.kv.failList = () => new NamedError("KVListError", "list exploded with a private message");
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({
++      reason: "kv_error",
++      errorName: "KVListError",
++    });
++    expect(ctx.log.dump()).not.toContain("private message");
++  });
++
++  it("S4: a list that fails on page 2 revokes nothing", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 4; i += 1) putGrant(ctx, `g${i}`, kept);
++    ctx.kv.pageSize = 2;
++    ctx.kv.failList = (cursor) => (cursor ? new NamedError("Page2Error", "page two failed") : undefined);
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({ reason: "kv_error" });
++  });
++
++  it("S5: a listed grant whose get returns null revokes nothing and logs grant_vanished", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++    putGrant(ctx, "g2", kept);
++    ctx.kv.vanishOnGet.add("grant:administrator:g2");
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await liveIds(ctx)).toEqual([lost.id, kept.id].sort());
++    const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++    expect(skipped).toHaveLength(1);
++    expect(skipped[0].fields).toMatchObject({ reason: "grant_vanished" });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++  });
++
++  it("S6: more than maxGrants keys revokes nothing and logs too_many_grants with the key count", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 6; i += 1) putGrant(ctx, `g${i}`, kept);
++
++    await sweep(ctx, { maxGrants: 5 });
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++    expect(skipped).toHaveLength(1);
++    expect(skipped[0].fields).toMatchObject({ reason: "too_many_grants", grants: 6 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++  });
++
++  it("S6: exactly maxGrants keys is fine and the sweep runs", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 5; i += 1) putGrant(ctx, `g${i}`, kept);
++
++    await sweep(ctx, { maxGrants: 5 });
++
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(await isLive(ctx, kept)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++  });
++
++  it("S6: maxGrants defaults to 200: 200 keys run, 201 skip", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 200; i += 1) putGrant(ctx, `g${String(i).padStart(3, "0")}`, kept);
++
++    await sweep(ctx);
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++
++    const again = await orphan(ctx, "Again");
++    putGrant(ctx, "g200", kept);
++    ctx.log.entries.length = 0;
++    ctx.tokens.revokeCalls.length = 0;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, again)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({
++      reason: "too_many_grants",
++      grants: 201,
++    });
++  });
++
++  it("S6: the maxGrants limit counts keys across pages", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 7; i += 1) putGrant(ctx, `g${i}`, kept);
++    ctx.kv.pageSize = 3;
++
++    await sweep(ctx, { maxGrants: 6 });
++
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({ reason: "too_many_grants" });
++  });
++
++  it("S7: follows the list cursor across pages, and a grant on page 2 protects its token", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const onPage1 = await orphan(ctx, "OnPage1");
++    const onPage2 = await orphan(ctx, "OnPage2");
++    const onPage3 = await orphan(ctx, "OnPage3");
++    // Keys sort as a1 a2 | b1 b2 | c1: three pages of two.
++    putGrant(ctx, "a1", onPage1);
++    putGrant(ctx, "a2", onPage1);
++    putGrant(ctx, "b1", onPage2);
++    putGrant(ctx, "b2", onPage2);
++    putGrant(ctx, "c1", onPage3);
++    ctx.kv.pageSize = 2;
++
++    await sweep(ctx);
++
++    expect(ctx.kv.listCalls.length).toBeGreaterThanOrEqual(3);
++    expect(ctx.kv.listCalls[0].cursor).toBeUndefined();
++    expect(ctx.kv.listCalls[1].cursor).toBe("2");
++    expect(ctx.kv.listCalls[2].cursor).toBe("4");
++    expect(await liveIds(ctx)).toEqual([onPage1.id, onPage2.id, onPage3.id].sort());
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 4,
++      referenced: 3,
++      revoked: 1,
++    });
++  });
++
++  it("S7: a grant that only appears on a later page still protects when page 1 is full of other grants", async () => {
++    const ctx = setup();
++    const filler = await orphan(ctx, "Filler");
++    const late = await orphan(ctx, "Late");
++    putGrant(ctx, "a1", filler);
++    putGrant(ctx, "a2", filler);
++    putGrant(ctx, "z9", late);
++    ctx.kv.pageSize = 2;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await liveIds(ctx)).toEqual([filler.id, late.id].sort());
++  });
++});
++
++// ---- S8 / S9 / S10: revoking -----------------------------------------------------------------------------------
++
++describe("revoking orphans", () => {
++  it("S8: a revoke that throws is logged and the others are still revoked, with honest counts", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    const c = await orphan(ctx, "C");
++    ctx.tokens.throwFor.set(b.id, new NamedError("D1Error", `private d1 message ${b.secret}`));
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls.sort()).toEqual([a.id, b.id, c.id].sort());
++    expect(await liveIds(ctx)).toEqual([b.id]);
++    const failed = ctx.log.named("mcp_oauth_orphan_sweep_revoke_failed");
++    expect(failed).toHaveLength(1);
++    expect(failed[0].fields).toMatchObject({ tokenId: b.id, errorName: "D1Error" });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 3,
++      referenced: 0,
++      revoked: 2,
++    });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++    expect(ctx.log.dump()).not.toContain("private d1 message");
++  });
++
++  it("S8: the first revoke throwing does not stop the rest, and every revoke throwing reports revoked 0", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    ctx.tokens.throwFor.set(a.id, new NamedError("E1", "m1"));
++    ctx.tokens.throwFor.set(b.id, new NamedError("E2", "m2"));
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls.sort()).toEqual([a.id, b.id].sort());
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoke_failed")).toHaveLength(2);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 2, revoked: 0 });
++  });
++
++  it("S8: a revoke that returns false (row already gone) is not counted as revoked and is not a failure", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    ctx.tokens.falseFor.add(a.id);
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls.sort()).toEqual([a.id, b.id].sort());
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 2, revoked: 1 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoke_failed")).toHaveLength(0);
++  });
++
++  it("S9: revokes at most 50 orphans per run, the rest wait for the next run", async () => {
++    const ctx = setup();
++    const all: Seeded[] = [];
++    for (let i = 0; i < 60; i += 1) all.push(await orphan(ctx, `Client ${i}`));
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toHaveLength(50);
++    expect(new Set(ctx.tokens.revokeCalls).size).toBe(50);
++    expect((await liveIds(ctx)).length).toBe(10);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 60,
++      referenced: 0,
++      revoked: 50,
++    });
++
++    ctx.tokens.revokeCalls.length = 0;
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toHaveLength(10);
++    expect(await liveIds(ctx)).toEqual([]);
++  });
++
++  it("S9: exactly 50 orphans are all revoked in one run, and referenced tokens do not use up the cap", async () => {
++    const ctx = setup();
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++    for (let i = 0; i < 50; i += 1) await orphan(ctx, `Client ${i}`);
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toHaveLength(50);
++    expect(await liveIds(ctx)).toEqual([kept.id]);
++  });
++
++  it("S9: a revoke that throws still counts against the cap of 50 attempts", async () => {
++    const ctx = setup();
++    const seeded: Seeded[] = [];
++    for (let i = 0; i < 55; i += 1) seeded.push(await orphan(ctx, `Client ${i}`));
++    for (const token of seeded) ctx.tokens.throwFor.set(token.id, new NamedError("D1Error", "down"));
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls.length).toBeLessThanOrEqual(50);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ revoked: 0 });
++  });
++
++  it("S10: an already-revoked orphan is not a candidate and revokeToken is not called for it", async () => {
++    const ctx = setup();
++    const gone = await orphan(ctx, "Gone");
++    const lost = await orphan(ctx, "Lost");
++    expect(await ctx.tokens.revokeToken(gone.id)).toBe(true);
++    ctx.tokens.revokeCalls.length = 0;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([lost.id]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 1, revoked: 1 });
++  });
++
++  it("S10: only already-revoked orphans means zero candidates", async () => {
++    const ctx = setup();
++    const gone = await orphan(ctx, "Gone");
++    await ctx.tokens.revokeToken(gone.id);
++    ctx.tokens.revokeCalls.length = 0;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 0, revoked: 0 });
++  });
++});
++
++// ---- point 7: never throws -------------------------------------------------------------------------------------
++
++describe("best effort", () => {
++  it("never throws when listing tokens fails, and logs reason error with the error name only", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    vi.spyOn(ctx.tokens, "listTokens").mockRejectedValue(new NamedError("TokenListError", "hidden list message"));
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await ctx.database.runtimeTokenStore.list()).toHaveLength(1);
++    expect(lost.id).toBeTruthy();
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({
++      reason: "error",
++      errorName: "TokenListError",
++    });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++    expect(ctx.log.dump()).not.toContain("hidden list message");
++  });
++
++  it("never throws when a thrown value is not an Error", async () => {
++    const ctx = setup();
++    await orphan(ctx, "Lost");
++    ctx.kv.failGet = () => "plain string" as unknown as Error;
++    putGrant(ctx, "g1", await orphan(ctx, "Kept"));
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(1);
++    expect(ctx.log.dump()).not.toContain("plain string");
++  });
++});
++
++// ---- no secrets in logs ----------------------------------------------------------------------------------------
++
++describe("logging hygiene", () => {
++  const secretShape = /oc[t]?_[A-Za-z0-9_-]{16,}/;
++
++  it("logs no token secret and no grant body on a normal run, a revoke failure, or any skip", async () => {
++    const scenarios: { name: string; arrange: (ctx: Setup, secrets: string[]) => Promise<void> }[] = [
++      { name: "normal", arrange: async () => undefined },
++      {
++        name: "revoke failure",
++        arrange: async (ctx) => {
++          for (const token of await ctx.tokens.listTokens()) {
++            ctx.tokens.throwFor.set(token.id, new NamedError("D1Error", "oct_leak-from-message-xxxxxxxxxxxxxxxx"));
++          }
++        },
++      },
++      {
++        name: "kv get failure",
++        arrange: async (ctx) => {
++          ctx.kv.failGet = () => new NamedError("KVError", "GRANT_BODY_MARKER oct_leak-from-message-xxxxxxxxxxxxxxxx");
++        },
++      },
++      {
++        name: "grant vanished",
++        arrange: async (ctx) => {
++          ctx.kv.vanishOnGet.add("grant:administrator:g1");
++        },
++      },
++      { name: "too many grants", arrange: async () => undefined },
++    ];
++    for (const scenario of scenarios) {
++      const ctx = setup();
++      const lost = await orphan(ctx, "Lost");
++      const kept = await orphan(ctx, "Kept");
++      putGrant(ctx, "g1", kept);
++      putGrant(ctx, "g2", kept);
++      await scenario.arrange(ctx, [lost.secret, kept.secret]);
++
++      await sweep(ctx, scenario.name === "too many grants" ? { maxGrants: 1 } : {});
++
++      const dump = ctx.log.dump();
++      expect(ctx.log.entries.length, scenario.name).toBeGreaterThan(0);
++      expect(dump, scenario.name).not.toContain(lost.secret);
++      expect(dump, scenario.name).not.toContain(kept.secret);
++      expect(dump, scenario.name).not.toContain("GRANT_BODY_MARKER");
++      expect(dump, scenario.name).not.toContain("leak-from-message");
++      expect(dump, scenario.name).not.toMatch(secretShape);
++      expect(dump, scenario.name).not.toContain("runtimeToken");
++    }
++  });
++});
++
++// ---- S11: wiring through worker.scheduled ----------------------------------------------------------------------
++
++describe("worker.scheduled wiring", () => {
++  /** The latest instant at or before now whose UTC minute is `minuteOfHour`, with 12 s of seconds. */
++  function slot(minuteOfHour: number): number {
++    const base = Math.floor(Date.now() / hour) * hour + minuteOfHour * minute + 12_000;
++    return base > Date.now() ? base - hour : base;
++  }
++
++  async function runScheduled(scheduledTime: number, env: CloudflareEnv): Promise<void> {
++    const pending: Promise<unknown>[] = [];
++    await worker.scheduled({ scheduledTime, cron: "* * * * *" }, env, {
++      waitUntil(promise) {
++        pending.push(promise);
++      },
++      passThroughOnException() {},
++    });
++    await Promise.all(pending);
++  }
++
++  function wiringEnv(ctx: Setup, withKV: boolean, kv?: RecordingKV): CloudflareEnv {
++    return {
++      DB: ctx.db,
++      TRANSIT_FILES: new RecordingKV(),
++      ...(withKV ? { OAUTH_KV: kv ?? ctx.kv } : {}),
++      OOMOL_CONNECT_ENCRYPTION_KEY: "orphan-sweep-wiring-key",
++    };
++  }
++
++  it("slot helper sanity: minute 17 and minute 18 are what they say", () => {
++    expect(new Date(slot(17)).getUTCMinutes()).toBe(17);
++    expect(new Date(slot(18)).getUTCMinutes()).toBe(18);
++  });
++
++  it("S11: at UTC minute 17 the sweep runs and revokes an old orphan; a referenced token stays", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++
++    await runScheduled(slot(17), wiringEnv(ctx, true));
++
++    expect(await liveIds(ctx)).toEqual([kept.id]);
++    expect(await isLive(ctx, lost)).toBe(false);
++  });
++
++  it("S11: at UTC minute 18 (and the other off-slot minutes) the sweep does not run", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    for (const m of [0, 16, 18, 47]) {
++      await runScheduled(slot(m), wiringEnv(ctx, true));
++      expect(await isLive(ctx, lost), `minute ${m}`).toBe(true);
++    }
++    expect(ctx.kv.listCalls).toEqual([]);
++  });
++
++  it("S11: without OAUTH_KV the sweep does not run, even at minute 17", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++
++    await runScheduled(slot(17), wiringEnv(ctx, false));
++
++    expect(await isLive(ctx, lost)).toBe(true);
++  });
++
++  it("S11: a failing KV at minute 17 does not break scheduled, and revokes nothing", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    ctx.kv.failList = () => new NamedError("KVDown", "kv is down");
++
++    await expect(runScheduled(slot(17), wiringEnv(ctx, true))).resolves.toBeUndefined();
++
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.kv.listCalls.length).toBeGreaterThan(0);
++  });
++
++  it("S11: the sweep uses the default 15 minute age through the scheduled path", async () => {
++    const ctx = setup();
++    const fresh = await orphan(ctx, "Fresh", 5 * minute);
++    const stale = await orphan(ctx, "Stale", 2 * hour);
++
++    await runScheduled(slot(17), wiringEnv(ctx, true));
++
++    expect(await isLive(ctx, fresh)).toBe(true);
++    expect(await isLive(ctx, stale)).toBe(false);
++  });
++});
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 09:27:06 -0300
+Subject: [PATCH 2/5] 0029: sweep orphaned MCP OAuth runtime tokens hourly
+ (#146)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0129g9KnEZjFYCq8zqEw7dz6
+---
+ src/server/cloudflare.ts                      | 37 +++++++-
+ .../cloudflare/mcp-oauth-orphan-sweep.ts      | 94 +++++++++++++++++++
+ 2 files changed, 127 insertions(+), 4 deletions(-)
+ create mode 100644 src/server/cloudflare/mcp-oauth-orphan-sweep.ts
+
+diff --git a/src/server/cloudflare.ts b/src/server/cloudflare.ts
+index 60781ffd..50670ff2 100644
+--- a/src/server/cloudflare.ts
++++ b/src/server/cloudflare.ts
+@@ -1,10 +1,15 @@
+ import type { CatalogStore } from "../catalog-store.ts";
+-import type { AssetsBinding, KVNamespaceBinding, R2BucketBinding } from "./cloudflare/cloudflare-bindings.ts";
++import type { ReadOnlyConnections } from "../core/read-only-connections.ts";
++import type { ActionRunner } from "./actions/action-runner.ts";
++import type {
++  AssetsBinding,
++  KVNamespaceBinding,
++  OAuthKVNamespaceBinding,
++  R2BucketBinding,
++} from "./cloudflare/cloudflare-bindings.ts";
+ import type { CloudflareEnv } from "./cloudflare/cloudflare-env.ts";
+ import type { McpOAuthHandler, McpOAuthSettings } from "./cloudflare/mcp-oauth.ts";
+-import type { ActionRunner } from "./actions/action-runner.ts";
+ import type { ConnectApp } from "./connect-app.ts";
+-import type { ReadOnlyConnections } from "../core/read-only-connections.ts";
+ import type { Logger } from "./logger.ts";
+ import type { ISecretCodec } from "./secrets/secret-codec-core.ts";
+ 
+@@ -25,6 +30,7 @@ import { isConsoleShellPath } from "./api/console-paths.ts";
+ import { DEFAULT_OAUTH_CLOSE_DELAY_SECONDS } from "./api/oauth-completion-page.ts";
+ import { loadCatalogFromAssets } from "./cloudflare/catalog-assets.ts";
+ import { readNonNegativeInteger, readPositiveInteger, resolvePublicOrigin } from "./cloudflare/cloudflare-env.ts";
++import { sweepOrphanedMcpOAuthTokens } from "./cloudflare/mcp-oauth-orphan-sweep.ts";
+ import { createConnectApp } from "./connect-app.ts";
+ import { preloadOptionalServerModules } from "./connect-server.ts";
+ import { isWatchDue, parseEmailWatchConfig } from "./email-watch/config.ts";
+@@ -35,6 +41,7 @@ import { R2TransitFileService } from "./files/r2-transit-files.ts";
+ import { createWorkerSecretCodec } from "./secrets/worker-secret-codec.ts";
+ import { D1RuntimeDatabase } from "./storage/d1/runtime-store.ts";
+ import { DEFAULT_RUN_LIMIT } from "./storage/runtime-store.ts";
++import { RuntimeTokenService } from "./storage/runtime-token-service.ts";
+ 
+ interface ScheduledEventLike {
+   scheduledTime?: number;
+@@ -76,7 +83,13 @@ export default {
+       await triggerMaintenance.run();
+     };
+     ctx.waitUntil(
+-      Promise.all([cleanup.run(), triggerCleanup(), runEmailWatchSweep(event, env), runEmailWatch(event, env)]).then(() => undefined),
++      Promise.all([
++        cleanup.run(),
++        triggerCleanup(),
++        runEmailWatchSweep(event, env),
++        runEmailWatch(event, env),
++        runOrphanSweep(event, env, database),
++      ]).then(() => undefined),
+     );
+   },
+   async fetch(request: Request, env: CloudflareEnv, ctx: CloudflareExecutionContext): Promise<Response> {
+@@ -155,6 +168,22 @@ async function runEmailWatchSweep(event: ScheduledEventLike, env: CloudflareEnv)
+   await sweepEmailWatchRetention(env.DB, settings.connections, workerLogger, now);
+ }
+ 
++/** Hourly (minute 17 UTC) sweep of MCP OAuth runtime tokens no grant references. Only when OAUTH_KV is bound. */
++async function runOrphanSweep(
++  event: ScheduledEventLike,
++  env: CloudflareEnv,
++  database: D1RuntimeDatabase,
++): Promise<void> {
++  const now = event.scheduledTime ?? Date.now();
++  if (!env.OAUTH_KV || new Date(now).getUTCMinutes() !== 17) return;
++  await sweepOrphanedMcpOAuthTokens({
++    kv: env.OAUTH_KV as OAuthKVNamespaceBinding,
++    tokens: new RuntimeTokenService(database.runtimeTokenStore),
++    now,
++    logger: workerLogger,
++  });
++}
++
+ /**
+  * The email watch rides on the existing every-minute cron. It does nothing, with no D1 query and no Gmail call,
+  * unless OOMOL_CONNECT_EMAIL_WATCH_CONNECTIONS names a connection. Its failures are logged by error name only and
+diff --git a/src/server/cloudflare/mcp-oauth-orphan-sweep.ts b/src/server/cloudflare/mcp-oauth-orphan-sweep.ts
+new file mode 100644
+index 00000000..bbfe725e
+--- /dev/null
++++ b/src/server/cloudflare/mcp-oauth-orphan-sweep.ts
+@@ -0,0 +1,94 @@
++import type { RuntimeLogger } from "../../core/types.ts";
++import type { RuntimeTokenService } from "../storage/runtime-token-service.ts";
++import type { OAuthKVNamespaceBinding } from "./cloudflare-bindings.ts";
++
++const TOKEN_NAME_PREFIX = "MCP OAuth • ";
++const GRANT_KEY_PREFIX = "grant:";
++const DEFAULT_MIN_AGE_MS = 15 * 60_000;
++const DEFAULT_MAX_GRANTS = 200;
++const MAX_REVOKES_PER_RUN = 50;
++
++export interface OrphanSweepOptions {
++  kv: OAuthKVNamespaceBinding;
++  tokens: RuntimeTokenService;
++  /** Epoch milliseconds. */
++  now: number;
++  logger: RuntimeLogger;
++  minAgeMs?: number;
++  maxGrants?: number;
++}
++
++type SkipReason = "kv_error" | "grant_vanished" | "too_many_grants";
++
++type ReferencedIds =
++  | { ok: true; ids: Set<string> }
++  | { ok: false; reason: SkipReason; errorName?: string; grants?: number };
++
++/**
++ * Revokes `MCP OAuth •` runtime tokens that no grant in OAUTH_KV references. Best effort and fail closed: if the grant
++ * set cannot be read completely, nothing is revoked. Never throws. Logs error names only, never messages or secrets.
++ */
++export async function sweepOrphanedMcpOAuthTokens(options: OrphanSweepOptions): Promise<void> {
++  const { kv, tokens, now, logger } = options;
++  try {
++    const minAgeMs = options.minAgeMs ?? DEFAULT_MIN_AGE_MS;
++    const maxGrants = options.maxGrants ?? DEFAULT_MAX_GRANTS;
++
++    const referenced = await readReferencedTokenIds(kv, maxGrants);
++    if (!referenced.ok) {
++      const { ok: _ok, ...fields } = referenced;
++      logger.warn(fields, "mcp_oauth_orphan_sweep_skipped");
++      return;
++    }
++
++    const candidates = (await tokens.listTokens()).filter(
++      (token) => token.name.startsWith(TOKEN_NAME_PREFIX) && now - Date.parse(token.createdAt) > minAgeMs,
++    );
++    const orphans = candidates.filter((token) => !referenced.ids.has(token.id));
++
++    let revoked = 0;
++    for (const orphan of orphans.slice(0, MAX_REVOKES_PER_RUN)) {
++      try {
++        if (await tokens.revokeToken(orphan.id)) revoked += 1;
++      } catch (error) {
++        logger.warn({ tokenId: orphan.id, errorName: errorName(error) }, "mcp_oauth_orphan_sweep_revoke_failed");
++      }
++    }
++    logger.info({ candidates: candidates.length, referenced: referenced.ids.size, revoked }, "mcp_oauth_orphan_sweep");
++  } catch (error) {
++    logger.warn({ reason: "error", errorName: errorName(error) }, "mcp_oauth_orphan_sweep_skipped");
++  }
++}
++
++async function readReferencedTokenIds(kv: OAuthKVNamespaceBinding, maxGrants: number): Promise<ReferencedIds> {
++  const keys: string[] = [];
++  try {
++    let cursor: string | undefined;
++    do {
++      const page = await kv.list({ prefix: GRANT_KEY_PREFIX, cursor });
++      for (const key of page.keys) keys.push(key.name);
++      if (keys.length > maxGrants) return { ok: false, reason: "too_many_grants", grants: keys.length };
++      cursor = page.list_complete ? undefined : page.cursor;
++    } while (cursor);
++  } catch (error) {
++    return { ok: false, reason: "kv_error", errorName: errorName(error) };
++  }
++
++  const ids = new Set<string>();
++  for (const key of keys) {
++    let grant: { metadata?: { runtimeTokenId?: unknown } } | null;
++    try {
++      grant = await kv.get(key, { type: "json" });
++    } catch (error) {
++      return { ok: false, reason: "kv_error", errorName: errorName(error) };
++    }
++    if (grant === null) return { ok: false, reason: "grant_vanished" };
++    const id = grant.metadata?.runtimeTokenId;
++    if (typeof id === "string") ids.add(id);
++  }
++  return { ok: true, ids };
++}
++
++function errorName(error: unknown): string {
++  return error instanceof Error ? error.name : "UnknownError";
++}
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 09:37:19 -0300
+Subject: [PATCH 3/5] 0029 tests: format
+
+---
+ src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+index 0c8fd38c..66beee98 100644
+--- a/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
++++ b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+@@ -16,8 +16,8 @@ import type { CloudflareEnv } from "./cloudflare-env.ts";
+ 
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import worker from "../cloudflare.ts";
+-import { SqliteD1Database } from "../storage/d1/test-database.ts";
+ import { D1RuntimeDatabase } from "../storage/d1/runtime-store.ts";
++import { SqliteD1Database } from "../storage/d1/test-database.ts";
+ import { hashRuntimeToken, RuntimeTokenService } from "../storage/runtime-token-service.ts";
+ import { sweepOrphanedMcpOAuthTokens } from "./mcp-oauth-orphan-sweep.ts";
+ 
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 10:00:43 -0300
+Subject: [PATCH 4/5] =?UTF-8?q?0029=20tests:=20hardening=20from=20review?=
+ =?UTF-8?q?=20(H1=E2=80=93H5)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0129g9KnEZjFYCq8zqEw7dz6
+---
+ .../cloudflare/mcp-oauth-orphan-sweep.test.ts | 378 ++++++++++++++++--
+ 1 file changed, 343 insertions(+), 35 deletions(-)
+
+diff --git a/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+index 66beee98..50a05810 100644
+--- a/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
++++ b/src/server/cloudflare/mcp-oauth-orphan-sweep.test.ts
+@@ -9,6 +9,11 @@
+ //   - `RuntimeTokenService.revokeToken` DELETES the row (D1RuntimeTokenStore.revoke), and `listTokens()` returns
+ //     live rows only with `id`, `name` and `createdAt`. Nothing new is needed on the store or service (point 9):
+ //     "not revoked" holds for every listed token, and an already-revoked token is simply absent.
++//   - Revision 1 (H1-H5): at most 25 revokes per run; a list page with `list_complete: false` and no cursor, an
++//     unreadable grant (no string `metadata.runtimeTokenId`), or zero grants with at least one candidate each revoke
++//     nothing and log a skip (`kv_error`/`MissingCursor`, `grant_unreadable`, `no_grants`); every successful revoke
++//     logs `mcp_oauth_orphan_sweep_revoked { tokenId }`. Scenarios that expect revokes therefore keep one unrelated,
++//     readable grant in KV (`anchorGrant`) so the no-grants guard does not fire.
+ //   - `candidates` counts the old, `MCP OAuth • ` named, live tokens; `referenced` counts distinct ids that grants
+ //     reference. Every fixture keeps these unambiguous (each referenced token is also an old candidate).
+ import type { KVListPage, OAuthKVNamespaceBinding } from "./cloudflare-bindings.ts";
+@@ -54,6 +59,8 @@ class RecordingKV implements OAuthKVNamespaceBinding {
+   failList: (cursor: string | undefined) => Error | undefined = () => undefined;
+   /** Keys that are listed but whose get() returns null, as after an expiry race. */
+   vanishOnGet = new Set<string>();
++  /** When set, an incomplete page is returned with `list_complete: false` but no cursor (a misbehaving list). */
++  omitCursor = false;
+ 
+   async put(key: string, value: unknown): Promise<void> {
+     this.writes.push(`put ${key}`);
+@@ -82,6 +89,7 @@ class RecordingKV implements OAuthKVNamespaceBinding {
+     const start = options?.cursor ? Number(options.cursor) : 0;
+     const page = names.slice(start, start + this.pageSize);
+     const next = start + this.pageSize;
++    if (next < names.length && this.omitCursor) return { keys: page.map((name) => ({ name })), list_complete: false };
+     return next < names.length
+       ? { keys: page.map((name) => ({ name })), list_complete: false, cursor: String(next) }
+       : { keys: page.map((name) => ({ name })), list_complete: true };
+@@ -183,6 +191,19 @@ function putGrant(ctx: Setup, grantId: string, token: Seeded, body: Record<strin
+   );
+ }
+ 
++/** A readable grant for some other, unrelated token id: keeps the no-grants guard (H4) from firing. */
++function anchorGrant(ctx: Setup): void {
++  ctx.kv.store.set(
++    "grant:administrator:anchor",
++    JSON.stringify({
++      id: "anchor",
++      userId: "administrator",
++      metadata: { runtimeTokenId: "tok-unrelated-anchor" },
++      props: { marker: "GRANT_BODY_MARKER" },
++    }),
++  );
++}
++
+ const liveIds = async (ctx: Setup) => (await ctx.tokens.listTokens()).map((token) => token.id).sort();
+ const isLive = async (ctx: Setup, token: Seeded) => (await liveIds(ctx)).includes(token.id);
+ 
+@@ -239,22 +260,6 @@ describe("which runtime tokens the sweep revokes", () => {
+     });
+   });
+ 
+-  it("S1: a grant whose runtimeTokenId is not a string, or is missing, protects nothing", async () => {
+-    const ctx = setup();
+-    const a = await orphan(ctx, "A");
+-    const b = await orphan(ctx, "B");
+-    const c = await orphan(ctx, "C");
+-    ctx.kv.store.set("grant:administrator:n", JSON.stringify({ metadata: { runtimeTokenId: 42 } }));
+-    ctx.kv.store.set("grant:administrator:m", JSON.stringify({ metadata: {} }));
+-    ctx.kv.store.set("grant:administrator:z", JSON.stringify({ id: "z" }));
+-    ctx.kv.store.set("grant:administrator:o", JSON.stringify({ metadata: { runtimeTokenId: { id: a.id } } }));
+-
+-    await sweep(ctx);
+-
+-    expect(await liveIds(ctx)).toEqual([]);
+-    expect(ctx.tokens.revokeCalls.sort()).toEqual([a.id, b.id, c.id].sort());
+-  });
+-
+   it("S1: several grants may reference one token, and a grant for another client's token still protects it", async () => {
+     const ctx = setup();
+     const shared = await orphan(ctx, "Shared");
+@@ -278,6 +283,7 @@ describe("which runtime tokens the sweep revokes", () => {
+   it("S1: reads grants only under the grant: prefix, as JSON, and writes nothing to KV", async () => {
+     const ctx = setup();
+     const lost = await orphan(ctx);
++    anchorGrant(ctx);
+     ctx.kv.store.set("token:administrator:g:t", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
+     ctx.kv.store.set("client:abc", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
+ 
+@@ -301,6 +307,7 @@ describe("which runtime tokens the sweep revokes", () => {
+     const middle = await seedToken(ctx, `Backup of ${PREFIX}Claude`, oldAge);
+     const dash = await seedToken(ctx, "MCP OAuth - Claude", oldAge);
+     const real = await orphan(ctx, "Claude");
++    anchorGrant(ctx);
+ 
+     await sweep(ctx);
+ 
+@@ -315,6 +322,7 @@ describe("which runtime tokens the sweep revokes", () => {
+   it("S2: a token named with only the prefix and an empty client is still an MCP OAuth token", async () => {
+     const ctx = setup();
+     const bare = await seedToken(ctx, PREFIX, oldAge);
++    anchorGrant(ctx);
+     await sweep(ctx);
+     expect(await isLive(ctx, bare)).toBe(false);
+   });
+@@ -324,6 +332,7 @@ describe("which runtime tokens the sweep revokes", () => {
+     const fresh = await orphan(ctx, "Fresh", 14 * minute);
+     const justBefore = await orphan(ctx, "JustBefore", 15 * minute - 1);
+     const stale = await orphan(ctx, "Stale", 16 * minute);
++    anchorGrant(ctx);
+ 
+     await sweep(ctx);
+ 
+@@ -337,6 +346,7 @@ describe("which runtime tokens the sweep revokes", () => {
+     const ctx = setup();
+     const exact = await orphan(ctx, "Exact", 5 * minute);
+     const over = await orphan(ctx, "Over", 5 * minute + 1);
++    anchorGrant(ctx);
+ 
+     await sweep(ctx, { minAgeMs: 5 * minute });
+ 
+@@ -348,6 +358,7 @@ describe("which runtime tokens the sweep revokes", () => {
+     const ctx = setup();
+     const tenMinutes = await orphan(ctx, "Ten", 10 * minute);
+     const twoHours = await orphan(ctx, "TwoH", 2 * hour);
++    anchorGrant(ctx);
+ 
+     await sweep(ctx, { minAgeMs: 3 * hour });
+     expect(await liveIds(ctx)).toEqual([tenMinutes.id, twoHours.id].sort());
+@@ -359,6 +370,7 @@ describe("which runtime tokens the sweep revokes", () => {
+   it("S3: a token with a createdAt in the future (clock skew) is not old", async () => {
+     const ctx = setup();
+     const future = await orphan(ctx, "Future", -10 * minute);
++    anchorGrant(ctx);
+     await sweep(ctx);
+     expect(await isLive(ctx, future)).toBe(true);
+   });
+@@ -367,6 +379,7 @@ describe("which runtime tokens the sweep revokes", () => {
+     const ctx = setup();
+     await orphan(ctx, "A");
+     await orphan(ctx, "B");
++    anchorGrant(ctx);
+     await sweep(ctx);
+     ctx.tokens.revokeCalls.length = 0;
+     ctx.log.entries.length = 0;
+@@ -570,6 +583,7 @@ describe("revoking orphans", () => {
+     const a = await orphan(ctx, "A");
+     const b = await orphan(ctx, "B");
+     const c = await orphan(ctx, "C");
++    anchorGrant(ctx);
+     ctx.tokens.throwFor.set(b.id, new NamedError("D1Error", `private d1 message ${b.secret}`));
+ 
+     await expect(sweep(ctx)).resolves.toBeUndefined();
+@@ -581,7 +595,6 @@ describe("revoking orphans", () => {
+     expect(failed[0].fields).toMatchObject({ tokenId: b.id, errorName: "D1Error" });
+     expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
+       candidates: 3,
+-      referenced: 0,
+       revoked: 2,
+     });
+     expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
+@@ -592,6 +605,7 @@ describe("revoking orphans", () => {
+     const ctx = setup();
+     const a = await orphan(ctx, "A");
+     const b = await orphan(ctx, "B");
++    anchorGrant(ctx);
+     ctx.tokens.throwFor.set(a.id, new NamedError("E1", "m1"));
+     ctx.tokens.throwFor.set(b.id, new NamedError("E2", "m2"));
+ 
+@@ -606,6 +620,7 @@ describe("revoking orphans", () => {
+     const ctx = setup();
+     const a = await orphan(ctx, "A");
+     const b = await orphan(ctx, "B");
++    anchorGrant(ctx);
+     ctx.tokens.falseFor.add(a.id);
+ 
+     await sweep(ctx);
+@@ -615,57 +630,78 @@ describe("revoking orphans", () => {
+     expect(ctx.log.named("mcp_oauth_orphan_sweep_revoke_failed")).toHaveLength(0);
+   });
+ 
+-  it("S9: revokes at most 50 orphans per run, the rest wait for the next run", async () => {
++  it("S9/H1: revokes at most 25 orphans per run, the rest wait for the next runs", async () => {
+     const ctx = setup();
+-    const all: Seeded[] = [];
+-    for (let i = 0; i < 60; i += 1) all.push(await orphan(ctx, `Client ${i}`));
++    for (let i = 0; i < 60; i += 1) await orphan(ctx, `Client ${i}`);
++    anchorGrant(ctx);
+ 
+     await sweep(ctx);
+ 
+-    expect(ctx.tokens.revokeCalls).toHaveLength(50);
+-    expect(new Set(ctx.tokens.revokeCalls).size).toBe(50);
+-    expect((await liveIds(ctx)).length).toBe(10);
+-    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
+-      candidates: 60,
+-      referenced: 0,
+-      revoked: 50,
+-    });
++    expect(ctx.tokens.revokeCalls).toHaveLength(25);
++    expect(new Set(ctx.tokens.revokeCalls).size).toBe(25);
++    expect((await liveIds(ctx)).length).toBe(35);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ candidates: 60, revoked: 25 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(25);
+ 
+     ctx.tokens.revokeCalls.length = 0;
+     await sweep(ctx);
++    expect(ctx.tokens.revokeCalls).toHaveLength(25);
++    expect((await liveIds(ctx)).length).toBe(10);
+ 
++    ctx.tokens.revokeCalls.length = 0;
++    await sweep(ctx);
+     expect(ctx.tokens.revokeCalls).toHaveLength(10);
+     expect(await liveIds(ctx)).toEqual([]);
+   });
+ 
+-  it("S9: exactly 50 orphans are all revoked in one run, and referenced tokens do not use up the cap", async () => {
++  it("H1: 26 orphans revoke 25 and leave exactly one; 25 are all revoked in one run", async () => {
++    const ctx = setup();
++    for (let i = 0; i < 26; i += 1) await orphan(ctx, `Client ${i}`);
++    anchorGrant(ctx);
++
++    await sweep(ctx);
++    expect(ctx.tokens.revokeCalls).toHaveLength(25);
++    expect((await liveIds(ctx)).length).toBe(1);
++
++    const exact = setup();
++    for (let i = 0; i < 25; i += 1) await orphan(exact, `Client ${i}`);
++    anchorGrant(exact);
++    await sweep(exact);
++    expect(exact.tokens.revokeCalls).toHaveLength(25);
++    expect(await liveIds(exact)).toEqual([]);
++  });
++
++  it("S9: exactly 25 orphans are all revoked in one run, and referenced tokens do not use up the cap", async () => {
+     const ctx = setup();
+     const kept = await orphan(ctx, "Kept");
+     putGrant(ctx, "g1", kept);
+-    for (let i = 0; i < 50; i += 1) await orphan(ctx, `Client ${i}`);
++    for (let i = 0; i < 25; i += 1) await orphan(ctx, `Client ${i}`);
+ 
+     await sweep(ctx);
+ 
+-    expect(ctx.tokens.revokeCalls).toHaveLength(50);
++    expect(ctx.tokens.revokeCalls).toHaveLength(25);
+     expect(await liveIds(ctx)).toEqual([kept.id]);
+   });
+ 
+-  it("S9: a revoke that throws still counts against the cap of 50 attempts", async () => {
++  it("S9/H1: a revoke that throws still counts against the cap of 25 attempts", async () => {
+     const ctx = setup();
+     const seeded: Seeded[] = [];
+     for (let i = 0; i < 55; i += 1) seeded.push(await orphan(ctx, `Client ${i}`));
++    anchorGrant(ctx);
+     for (const token of seeded) ctx.tokens.throwFor.set(token.id, new NamedError("D1Error", "down"));
+ 
+     await sweep(ctx);
+ 
+-    expect(ctx.tokens.revokeCalls.length).toBeLessThanOrEqual(50);
++    expect(ctx.tokens.revokeCalls.length).toBeLessThanOrEqual(25);
+     expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ revoked: 0 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(0);
+   });
+ 
+   it("S10: an already-revoked orphan is not a candidate and revokeToken is not called for it", async () => {
+     const ctx = setup();
+     const gone = await orphan(ctx, "Gone");
+     const lost = await orphan(ctx, "Lost");
++    anchorGrant(ctx);
+     expect(await ctx.tokens.revokeToken(gone.id)).toBe(true);
+     ctx.tokens.revokeCalls.length = 0;
+ 
+@@ -688,6 +724,230 @@ describe("revoking orphans", () => {
+   });
+ });
+ 
++// ---- H2 / H3 / H4: more ways to fail closed ----------------------------------------------------------------------
++
++describe("H2: a list page that claims more but gives no cursor", () => {
++  it("revokes nothing and logs kv_error with errorName MissingCursor, without looping", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 4; i += 1) putGrant(ctx, `g${i}`, kept);
++    ctx.kv.pageSize = 2;
++    ctx.kv.omitCursor = true;
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await liveIds(ctx)).toEqual([lost.id, kept.id].sort());
++    const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++    expect(skipped).toHaveLength(1);
++    expect(skipped[0].fields).toMatchObject({ reason: "kv_error", errorName: "MissingCursor" });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(0);
++    expect(ctx.kv.listCalls.length).toBeLessThanOrEqual(2);
++  });
++
++  it("also fails closed when the cursor is missing on a later page", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    for (let i = 0; i < 5; i += 1) putGrant(ctx, `g${i}`, kept);
++    ctx.kv.pageSize = 2;
++    const realList = ctx.kv.list.bind(ctx.kv);
++    ctx.kv.list = async (options) => {
++      const page = await realList(options);
++      return options?.cursor && !page.list_complete ? { keys: page.keys, list_complete: false } : page;
++    };
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({
++      reason: "kv_error",
++      errorName: "MissingCursor",
++    });
++  });
++
++  it("a complete last page without a cursor is normal and does not skip", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++    putGrant(ctx, "g2", kept);
++    putGrant(ctx, "g3", kept);
++    ctx.kv.pageSize = 2;
++
++    await sweep(ctx);
++
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++  });
++});
++
++describe("H3: a listed grant that does not name its runtime token", () => {
++  const unreadable: { name: string; body: string }[] = [
++    { name: "a numeric runtimeTokenId", body: JSON.stringify({ id: "x", metadata: { runtimeTokenId: 42 } }) },
++    { name: "an object runtimeTokenId", body: JSON.stringify({ id: "x", metadata: { runtimeTokenId: { id: "t" } } }) },
++    { name: "a null runtimeTokenId", body: JSON.stringify({ id: "x", metadata: { runtimeTokenId: null } }) },
++    { name: "empty metadata", body: JSON.stringify({ id: "x", metadata: {} }) },
++    { name: "null metadata", body: JSON.stringify({ id: "x", metadata: null }) },
++    { name: "no metadata", body: JSON.stringify({ id: "x" }) },
++    { name: "an array body", body: JSON.stringify([]) },
++    { name: "a string body", body: JSON.stringify("just text") },
++  ];
++
++  for (const { name, body } of unreadable) {
++    it(`revokes nothing and logs grant_unreadable for ${name}, even next to a readable grant`, async () => {
++      const ctx = setup();
++      const lost = await orphan(ctx, "Lost");
++      const kept = await orphan(ctx, "Kept");
++      putGrant(ctx, "g1", kept);
++      ctx.kv.store.set("grant:administrator:bad", body);
++
++      await expect(sweep(ctx)).resolves.toBeUndefined();
++
++      expect(ctx.tokens.revokeCalls).toEqual([]);
++      expect(await liveIds(ctx)).toEqual([lost.id, kept.id].sort());
++      const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++      expect(skipped).toHaveLength(1);
++      expect(skipped[0].fields).toMatchObject({ reason: "grant_unreadable" });
++      expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++      expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(0);
++    });
++  }
++
++  it("an unreadable grant on page 2 still stops the sweep", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "a1", kept);
++    putGrant(ctx, "a2", kept);
++    ctx.kv.store.set("grant:administrator:z9", JSON.stringify({ id: "z9", metadata: {} }));
++    ctx.kv.pageSize = 2;
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({ reason: "grant_unreadable" });
++  });
++
++  it("an unreadable grant alone (no other grants) also revokes nothing", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    ctx.kv.store.set("grant:administrator:bad", JSON.stringify({ id: "bad" }));
++
++    await sweep(ctx);
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({ reason: "grant_unreadable" });
++  });
++});
++
++describe("H4: no grants at all while candidates exist", () => {
++  it("revokes nothing and logs no_grants with the candidate count", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    const c = await orphan(ctx, "C");
++    await seedToken(ctx, "hand made", oldAge);
++    await orphan(ctx, "Young", 5 * minute);
++
++    await expect(sweep(ctx)).resolves.toBeUndefined();
++
++    expect(ctx.tokens.revokeCalls).toEqual([]);
++    expect(await liveIds(ctx)).toHaveLength(5);
++    expect(await isLive(ctx, a)).toBe(true);
++    expect(await isLive(ctx, b)).toBe(true);
++    expect(await isLive(ctx, c)).toBe(true);
++    const skipped = ctx.log.named("mcp_oauth_orphan_sweep_skipped");
++    expect(skipped).toHaveLength(1);
++    expect(skipped[0].fields).toMatchObject({ reason: "no_grants", candidates: 3 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")).toHaveLength(0);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(0);
++  });
++
++  it("a namespace holding only non-grant keys counts as no grants", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    ctx.kv.store.set("client:abc", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
++    ctx.kv.store.set("token:administrator:g:t", JSON.stringify({ metadata: { runtimeTokenId: lost.id } }));
++
++    await sweep(ctx);
++
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0].fields).toMatchObject({
++      reason: "no_grants",
++      candidates: 1,
++    });
++  });
++
++  it("zero grants and zero candidates is not a skip: the sweep reports zeros", async () => {
++    const ctx = setup();
++    await seedToken(ctx, "hand made", oldAge);
++    await orphan(ctx, "Young", 5 * minute);
++
++    await sweep(ctx);
++
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({
++      candidates: 0,
++      referenced: 0,
++      revoked: 0,
++    });
++  });
++
++  it("one grant for an unrelated token is enough for the sweep to proceed", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++    anchorGrant(ctx);
++
++    await sweep(ctx);
++
++    expect(await isLive(ctx, lost)).toBe(false);
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")).toHaveLength(0);
++  });
++});
++
++// ---- H5: a trace of every revoke -------------------------------------------------------------------------------
++
++describe("H5: logging each successful revoke", () => {
++  it("logs mcp_oauth_orphan_sweep_revoked with the token id for each revoke that returned true, and only those", async () => {
++    const ctx = setup();
++    const a = await orphan(ctx, "A");
++    const b = await orphan(ctx, "B");
++    const thrown = await orphan(ctx, "Thrown");
++    const gone = await orphan(ctx, "Gone");
++    const kept = await orphan(ctx, "Kept");
++    putGrant(ctx, "g1", kept);
++    ctx.tokens.throwFor.set(thrown.id, new NamedError("D1Error", "boom"));
++    ctx.tokens.falseFor.add(gone.id);
++
++    await sweep(ctx);
++
++    const revoked = ctx.log.named("mcp_oauth_orphan_sweep_revoked");
++    expect(revoked.map((entry) => entry.fields.tokenId).sort()).toEqual([a.id, b.id].sort());
++    expect(ctx.log.named("mcp_oauth_orphan_sweep")[0].fields).toMatchObject({ revoked: 2 });
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoke_failed")).toHaveLength(1);
++    const dump = JSON.stringify(revoked);
++    for (const token of [a, b, thrown, gone, kept]) expect(dump).not.toContain(token.secret);
++    expect(dump).not.toContain("GRANT_BODY_MARKER");
++  });
++
++  it("logs no per-revoke line for a skipped run", async () => {
++    const ctx = setup();
++    await orphan(ctx, "Lost");
++    putGrant(ctx, "g1", await orphan(ctx, "Kept"));
++    ctx.kv.vanishOnGet.add("grant:administrator:g1");
++
++    await sweep(ctx);
++
++    expect(ctx.log.named("mcp_oauth_orphan_sweep_revoked")).toHaveLength(0);
++  });
++});
++
+ // ---- point 7: never throws -------------------------------------------------------------------------------------
+ 
+ describe("best effort", () => {
+@@ -729,7 +989,7 @@ describe("logging hygiene", () => {
+   const secretShape = /oc[t]?_[A-Za-z0-9_-]{16,}/;
+ 
+   it("logs no token secret and no grant body on a normal run, a revoke failure, or any skip", async () => {
+-    const scenarios: { name: string; arrange: (ctx: Setup, secrets: string[]) => Promise<void> }[] = [
++    const scenarios: { name: string; skip?: string; arrange: (ctx: Setup, secrets: string[]) => Promise<void> }[] = [
+       { name: "normal", arrange: async () => undefined },
+       {
+         name: "revoke failure",
+@@ -741,17 +1001,48 @@ describe("logging hygiene", () => {
+       },
+       {
+         name: "kv get failure",
++        skip: "kv_error",
+         arrange: async (ctx) => {
+           ctx.kv.failGet = () => new NamedError("KVError", "GRANT_BODY_MARKER oct_leak-from-message-xxxxxxxxxxxxxxxx");
+         },
+       },
+       {
+         name: "grant vanished",
++        skip: "grant_vanished",
+         arrange: async (ctx) => {
+           ctx.kv.vanishOnGet.add("grant:administrator:g1");
+         },
+       },
+-      { name: "too many grants", arrange: async () => undefined },
++      { name: "too many grants", skip: "too_many_grants", arrange: async () => undefined },
++      {
++        name: "grant unreadable",
++        skip: "grant_unreadable",
++        arrange: async (ctx) => {
++          ctx.kv.store.set(
++            "grant:administrator:bad",
++            JSON.stringify({
++              id: "bad",
++              metadata: {},
++              props: { runtimeToken: "oct_leak-from-grant-xxxxxxxxxxxxxxxx" },
++            }),
++          );
++        },
++      },
++      {
++        name: "no grants",
++        skip: "no_grants",
++        arrange: async (ctx) => {
++          ctx.kv.store.clear();
++        },
++      },
++      {
++        name: "missing cursor",
++        skip: "kv_error",
++        arrange: async (ctx) => {
++          ctx.kv.pageSize = 1;
++          ctx.kv.omitCursor = true;
++        },
++      },
+     ];
+     for (const scenario of scenarios) {
+       const ctx = setup();
+@@ -765,10 +1056,16 @@ describe("logging hygiene", () => {
+ 
+       const dump = ctx.log.dump();
+       expect(ctx.log.entries.length, scenario.name).toBeGreaterThan(0);
++      if (scenario.skip) {
++        expect(ctx.log.named("mcp_oauth_orphan_sweep_skipped")[0]?.fields, scenario.name).toMatchObject({
++          reason: scenario.skip,
++        });
++      }
+       expect(dump, scenario.name).not.toContain(lost.secret);
+       expect(dump, scenario.name).not.toContain(kept.secret);
+       expect(dump, scenario.name).not.toContain("GRANT_BODY_MARKER");
+       expect(dump, scenario.name).not.toContain("leak-from-message");
++      expect(dump, scenario.name).not.toContain("leak-from-grant");
+       expect(dump, scenario.name).not.toMatch(secretShape);
+       expect(dump, scenario.name).not.toContain("runtimeToken");
+     }
+@@ -851,10 +1148,21 @@ describe("worker.scheduled wiring", () => {
+     expect(ctx.kv.listCalls.length).toBeGreaterThan(0);
+   });
+ 
++  it("H4/S11: an empty OAUTH_KV at minute 17 revokes nothing through the scheduled path", async () => {
++    const ctx = setup();
++    const lost = await orphan(ctx, "Lost");
++
++    await runScheduled(slot(17), wiringEnv(ctx, true));
++
++    expect(await isLive(ctx, lost)).toBe(true);
++    expect(ctx.kv.listCalls.length).toBeGreaterThan(0);
++  });
++
+   it("S11: the sweep uses the default 15 minute age through the scheduled path", async () => {
+     const ctx = setup();
+     const fresh = await orphan(ctx, "Fresh", 5 * minute);
+     const stale = await orphan(ctx, "Stale", 2 * hour);
++    anchorGrant(ctx);
+ 
+     await runScheduled(slot(17), wiringEnv(ctx, true));
+ 
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 10:03:16 -0300
+Subject: [PATCH 5/5] 0029: harden the orphan sweep (cap 25, fail closed on
+ missing cursor, unreadable grants, empty listing; log revoked ids)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0129g9KnEZjFYCq8zqEw7dz6
+---
+ .../cloudflare/mcp-oauth-orphan-sweep.ts      | 41 +++++++++++++++----
+ 1 file changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/src/server/cloudflare/mcp-oauth-orphan-sweep.ts b/src/server/cloudflare/mcp-oauth-orphan-sweep.ts
+index bbfe725e..9a2bb2b5 100644
+--- a/src/server/cloudflare/mcp-oauth-orphan-sweep.ts
++++ b/src/server/cloudflare/mcp-oauth-orphan-sweep.ts
+@@ -6,7 +6,7 @@ const TOKEN_NAME_PREFIX = "MCP OAuth • ";
+ const GRANT_KEY_PREFIX = "grant:";
+ const DEFAULT_MIN_AGE_MS = 15 * 60_000;
+ const DEFAULT_MAX_GRANTS = 200;
+-const MAX_REVOKES_PER_RUN = 50;
++const MAX_REVOKES_PER_RUN = 25;
+ 
+ export interface OrphanSweepOptions {
+   kv: OAuthKVNamespaceBinding;
+@@ -18,10 +18,10 @@ export interface OrphanSweepOptions {
+   maxGrants?: number;
+ }
+ 
+-type SkipReason = "kv_error" | "grant_vanished" | "too_many_grants";
++type SkipReason = "kv_error" | "grant_vanished" | "too_many_grants" | "grant_unreadable";
+ 
+ type ReferencedIds =
+-  | { ok: true; ids: Set<string> }
++  | { ok: true; ids: Set<string>; grants: number }
+   | { ok: false; reason: SkipReason; errorName?: string; grants?: number };
+ 
+ /**
+@@ -44,12 +44,20 @@ export async function sweepOrphanedMcpOAuthTokens(options: OrphanSweepOptions):
+     const candidates = (await tokens.listTokens()).filter(
+       (token) => token.name.startsWith(TOKEN_NAME_PREFIX) && now - Date.parse(token.createdAt) > minAgeMs,
+     );
++    // An empty listing next to live candidates suggests OAUTH_KV is bound to the wrong or an empty namespace.
++    if (referenced.grants === 0 && candidates.length > 0) {
++      logger.warn({ reason: "no_grants", candidates: candidates.length }, "mcp_oauth_orphan_sweep_skipped");
++      return;
++    }
+     const orphans = candidates.filter((token) => !referenced.ids.has(token.id));
+ 
+     let revoked = 0;
+     for (const orphan of orphans.slice(0, MAX_REVOKES_PER_RUN)) {
+       try {
+-        if (await tokens.revokeToken(orphan.id)) revoked += 1;
++        if (await tokens.revokeToken(orphan.id)) {
++          revoked += 1;
++          logger.info({ tokenId: orphan.id }, "mcp_oauth_orphan_sweep_revoked");
++        }
+       } catch (error) {
+         logger.warn({ tokenId: orphan.id, errorName: errorName(error) }, "mcp_oauth_orphan_sweep_revoke_failed");
+       }
+@@ -68,7 +76,13 @@ async function readReferencedTokenIds(kv: OAuthKVNamespaceBinding, maxGrants: nu
+       const page = await kv.list({ prefix: GRANT_KEY_PREFIX, cursor });
+       for (const key of page.keys) keys.push(key.name);
+       if (keys.length > maxGrants) return { ok: false, reason: "too_many_grants", grants: keys.length };
+-      cursor = page.list_complete ? undefined : page.cursor;
++      if (page.list_complete) {
++        cursor = undefined;
++      } else if (page.cursor) {
++        cursor = page.cursor;
++      } else {
++        return { ok: false, reason: "kv_error", errorName: "MissingCursor" };
++      }
+     } while (cursor);
+   } catch (error) {
+     return { ok: false, reason: "kv_error", errorName: errorName(error) };
+@@ -76,17 +90,26 @@ async function readReferencedTokenIds(kv: OAuthKVNamespaceBinding, maxGrants: nu
+ 
+   const ids = new Set<string>();
+   for (const key of keys) {
+-    let grant: { metadata?: { runtimeTokenId?: unknown } } | null;
++    let grant: unknown;
+     try {
+       grant = await kv.get(key, { type: "json" });
+     } catch (error) {
+       return { ok: false, reason: "kv_error", errorName: errorName(error) };
+     }
+     if (grant === null) return { ok: false, reason: "grant_vanished" };
+-    const id = grant.metadata?.runtimeTokenId;
+-    if (typeof id === "string") ids.add(id);
++    const id = runtimeTokenIdOf(grant);
++    if (id === undefined) return { ok: false, reason: "grant_unreadable" };
++    ids.add(id);
+   }
+-  return { ok: true, ids };
++  return { ok: true, ids, grants: keys.length };
++}
++
++function runtimeTokenIdOf(grant: unknown): string | undefined {
++  if (typeof grant !== "object" || grant === null) return undefined;
++  const metadata = (grant as { metadata?: unknown }).metadata;
++  if (typeof metadata !== "object" || metadata === null) return undefined;
++  const id = (metadata as { runtimeTokenId?: unknown }).runtimeTokenId;
++  return typeof id === "string" ? id : undefined;
+ }
+ 
+ function errorName(error: unknown): string {
+-- 
+2.34.1
+
