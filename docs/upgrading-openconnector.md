@@ -23,6 +23,13 @@ explains how to move that pin.
 
 ## Upgrade steps
 
+To pick up a SplitMind update, run `git pull`, then `scripts/bootstrap.sh`, then
+`npm run deploy`. Bootstrap installs the dependencies a new patch brings. If
+you skip it, deploy stops before it touches Cloudflare and says the vendor
+dependencies are out of date; run bootstrap and deploy again.
+
+To move the OpenConnector pin itself, follow these steps.
+
 1. **Pick the release.** Read the upstream
    [releases](https://github.com/oomol-lab/open-connector/releases) between the
    current tag and the new one. Note anything about migrations, environment
@@ -83,3 +90,13 @@ Move the gitlink back to the previous tag the same way (step 3), run
 `scripts/bootstrap.sh`, and redeploy. D1 migrations are not rolled back
 automatically; check the upstream release notes before rolling back across a
 migration.
+
+To roll back a patch (you deleted or reverted a file in `patches/`), note that
+deploy never un-applies a removed patch: the change stays in the submodule's
+working tree. Reset the submodule, then run bootstrap and deploy:
+
+```sh
+git -C vendor/open-connector checkout -- . && git -C vendor/open-connector clean -fd
+scripts/bootstrap.sh
+npm run deploy
+```

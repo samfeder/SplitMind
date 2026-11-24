@@ -267,6 +267,45 @@ export function applyPatches(repoRoot: string, engineDir: string): void {
   }
 }
 
+function readJson<T>(path: string): T | undefined {
+  try {
+    return JSON.parse(readFileSync(path, "utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Direct dependencies of the engine whose installed version is missing or differs from package-lock.json. Patches
+ * can change the manifests, so run this after applyPatches. Returns [] when there is no readable lockfile, and skips
+ * dependencies the lockfile does not list and optional ones that are not installed (platform-specific binaries).
+ */
+export function staleDependencies(engineDir: string): string[] {
+  const lock = readJson<{ packages?: Record<string, { version?: string; optional?: boolean } | undefined> }>(
+    join(engineDir, "package-lock.json"),
+  );
+  const manifest = readJson<Record<string, Record<string, string> | undefined>>(join(engineDir, "package.json"));
+  if (!lock?.packages || !manifest) return [];
+  const names = new Set(
+    ["dependencies", "devDependencies", "optionalDependencies"].flatMap((key) => Object.keys(manifest[key] ?? {})),
+  );
+  const stale: string[] = [];
+  for (const name of names) {
+    const locked = lock.packages[`node_modules/${name}`];
+    if (!locked) continue;
+    const installed = readJson<{ version?: string }>(join(engineDir, "node_modules", name, "package.json"));
+    if (!installed && locked.optional) continue;
+    if (installed?.version !== locked.version) stale.push(name);
+  }
+  return stale.sort();
+}
+
+export function staleDependenciesMessage(names: string[]): string {
+  const shown = names.slice(0, 5).join(", ");
+  const more = names.length > 5 ? ` and ${names.length - 5} more` : "";
+  return `vendor/open-connector dependencies are out of date (${shown}${more}); run scripts/bootstrap.sh, then deploy again`;
+}
+
 // Runs before any wrangler call or file write, so a broken engine stops the deploy before it touches the account.
 function preparePatchedEngine(): void {
   if (!existsSync(join(engine, "node_modules"))) {
@@ -274,6 +313,8 @@ function preparePatchedEngine(): void {
   }
   console.log("==> Patches");
   applyPatches(root, engine);
+  const stale = staleDependencies(engine);
+  if (stale.length > 0) throw new Error(staleDependenciesMessage(stale));
 }
 
 function build(template: string): void {

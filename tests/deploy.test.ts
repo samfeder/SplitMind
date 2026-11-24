@@ -3,6 +3,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { staleDependencies, staleDependenciesMessage } from "../scripts/deploy.ts";
 
 // Runs the real scripts/deploy.ts in a throwaway checkout. Cloudflare is replaced by a stand-in `wrangler` that
 // keeps a fake account in a JSON file, and the engine by a stand-in whose build steps write a tiny catalog.
@@ -492,6 +493,122 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
       untouched(result);
     });
 
+    describe("stale vendor dependencies (#150)", () => {
+      // The engine's manifests are what patches change; node_modules is what bootstrap installs.
+      const lock = (versions: Record<string, string>) =>
+        writeFileSync(
+          join(engine, "package-lock.json"),
+          JSON.stringify({
+            lockfileVersion: 3,
+            packages: { "": {}, ...Object.fromEntries(Object.entries(versions).map(([name, version]) => [`node_modules/${name}`, { version }])) },
+          }),
+        );
+      const manifest = (dependencies: Record<string, string>) =>
+        writeFileSync(
+          join(engine, "package.json"),
+          JSON.stringify({ type: "module", dependencies, scripts: { "generate:catalog": GENERATE, "build:web": 'node -e ""' } }),
+        );
+      const install = (name: string, version: string) => {
+        mkdirSync(join(engine, "node_modules", name), { recursive: true });
+        writeFileSync(join(engine, "node_modules", name, "package.json"), JSON.stringify({ name, version }));
+      };
+      const message = "vendor/open-connector dependencies are out of date (graphql); run scripts/bootstrap.sh, then deploy again";
+
+      it("a locked dependency that is not installed: exit 1 with the message and no wrangler call, no saved state, no rendered config", () => {
+        manifest({ graphql: "^16.0.0" });
+        lock({ graphql: "16.9.0" });
+
+        const result = deploy();
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(message);
+        untouched(result);
+      });
+
+      it("--dry-run stops the same way, before the build", () => {
+        manifest({ graphql: "^16.0.0" });
+        lock({ graphql: "16.9.0" });
+
+        const result = deploy("--dry-run");
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(message);
+        expect(readAccount().calls).toEqual([]);
+        expect(result.stdout).not.toContain("==> Building");
+      });
+
+      it("an installed version that differs from the lockfile also stops the deploy", () => {
+        manifest({ graphql: "^16.0.0" });
+        lock({ graphql: "16.9.0" });
+        install("graphql", "16.8.0");
+
+        const result = deploy();
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(message);
+        untouched(result);
+      });
+
+      it("a re-run after a pulled patch added a dependency leaves the account and the saved state alone", () => {
+        deploy();
+        const savedBefore = readFileSync(join(checkout, "splitmind.local.json"), "utf8");
+        setAccount({ ...readAccount(), calls: [], deployedOrigins: [] });
+        manifest({ graphql: "^16.0.0" });
+        lock({ graphql: "16.9.0" });
+
+        const result = deploy();
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(message);
+        expect(readAccount().calls).toEqual([]);
+        expect(readFileSync(join(checkout, "splitmind.local.json"), "utf8")).toBe(savedBefore);
+      });
+
+      it("checks after the patches apply: a patch that adds a dependency to the manifests is what makes it stale", () => {
+        // Build the patch with git itself, from a scratch repo holding the manifests before and after.
+        const scratch = join(dir, "scratch");
+        mkdirSync(scratch);
+        const git = (...args: string[]) =>
+          spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], { cwd: scratch, encoding: "utf8" });
+        const write = (dependencies: Record<string, string>, packages: Record<string, { version: string }>) => {
+          writeFileSync(join(scratch, "package.json"), JSON.stringify({ name: "engine", dependencies }, null, 2) + "\n");
+          writeFileSync(
+            join(scratch, "package-lock.json"),
+            JSON.stringify({ name: "engine", lockfileVersion: 3, packages: { "": { name: "engine", dependencies }, ...packages } }, null, 2) + "\n",
+          );
+        };
+        git("init", "-q");
+        write({}, {});
+        git("add", "-A");
+        git("commit", "-q", "-m", "before");
+        // The engine starts exactly as the scratch repo did, with the dependency list empty and nothing missing.
+        copyFileSync(join(scratch, "package.json"), join(engine, "package.json"));
+        copyFileSync(join(scratch, "package-lock.json"), join(engine, "package-lock.json"));
+        write({ graphql: "^16.0.0" }, { "node_modules/graphql": { version: "16.9.0" } });
+        const patch = git("diff").stdout;
+        expect(patch).toContain("graphql");
+        writeFileSync(join(patchesDir(), "0001-graphql.patch"), patch);
+
+        const result = deploy();
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(message);
+        expect(readFileSync(join(engine, "package.json"), "utf8")).toContain("graphql");
+        untouched(result);
+      });
+
+      it("everything installed at the locked versions deploys as before", () => {
+        manifest({ graphql: "^16.0.0" });
+        lock({ graphql: "16.9.0" });
+        install("graphql", "16.9.0");
+
+        const result = deploy();
+
+        expect(result.stderr).not.toContain("dependencies are out of date");
+        expect(readAccount().calls).toContain("whoami");
+      });
+    });
+
     it("a re-run with a new patch that does not apply leaves the account and the saved state alone", () => {
       deploy();
       const savedBefore = readFileSync(join(checkout, "splitmind.local.json"), "utf8");
@@ -626,6 +743,223 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
 
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('splitmind.local.json is for Worker "splitmind"');
+  });
+});
+
+describe("staleDependencies (#150)", () => {
+  let engineDir: string;
+
+  beforeEach(() => {
+    engineDir = mkdtempSync(join(tmpdir(), "splitmind-stale-deps-"));
+  });
+  afterEach(() => {
+    rmSync(engineDir, { recursive: true, force: true });
+  });
+
+  interface Manifest {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+  }
+  const writeManifest = (manifest: Manifest) => writeFileSync(join(engineDir, "package.json"), JSON.stringify({ name: "engine", ...manifest }));
+  const writeLock = (packages: Record<string, { version: string; optional?: boolean }>) =>
+    writeFileSync(
+      join(engineDir, "package-lock.json"),
+      JSON.stringify({ name: "engine", lockfileVersion: 3, packages: { "": { name: "engine" }, ...packages } }),
+    );
+  const installed = (name: string, version: string) => {
+    mkdirSync(join(engineDir, "node_modules", name), { recursive: true });
+    writeFileSync(join(engineDir, "node_modules", name, "package.json"), JSON.stringify({ name, version }));
+  };
+
+  it("D1: returns [] when every direct dependency is installed at its lockfile version", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0", zod: "^3.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" }, "node_modules/zod": { version: "3.23.8" } });
+    installed("hono", "4.6.3");
+    installed("zod", "3.23.8");
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D1: a transitive package that is not installed is not reported (only direct dependencies count)", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" }, "node_modules/left-pad": { version: "1.3.0" } });
+    installed("hono", "4.6.3");
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D2: a locked dependency that is not installed is reported by name", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0", graphql: "^16.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" }, "node_modules/graphql": { version: "16.9.0" } });
+    installed("hono", "4.6.3");
+
+    expect(staleDependencies(engineDir)).toEqual(["graphql"]);
+  });
+
+  it("D2: a node_modules directory that does not exist at all reports every locked direct dependency", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0", graphql: "^16.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" }, "node_modules/graphql": { version: "16.9.0" } });
+
+    expect(staleDependencies(engineDir)).toEqual(["graphql", "hono"]);
+  });
+
+  it("D2: a package directory with no package.json counts as not installed", () => {
+    writeManifest({ dependencies: { graphql: "^16.0.0" } });
+    writeLock({ "node_modules/graphql": { version: "16.9.0" } });
+    mkdirSync(join(engineDir, "node_modules/graphql"), { recursive: true });
+
+    expect(staleDependencies(engineDir)).toEqual(["graphql"]);
+  });
+
+  it("D3: an installed version that differs from the lockfile is reported, older or newer", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0", zod: "^3.0.0", ok: "^1.0.0" } });
+    writeLock({
+      "node_modules/hono": { version: "4.6.3" },
+      "node_modules/zod": { version: "3.23.8" },
+      "node_modules/ok": { version: "1.0.0" },
+    });
+    installed("hono", "4.5.0");
+    installed("zod", "3.24.0");
+    installed("ok", "1.0.0");
+
+    expect(staleDependencies(engineDir)).toEqual(["hono", "zod"]);
+  });
+
+  it("D3: versions are compared exactly, not by prefix", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" } });
+    installed("hono", "4.6.30");
+
+    expect(staleDependencies(engineDir)).toEqual(["hono"]);
+  });
+
+  it("D4: a scoped dependency is looked up under node_modules/@scope/name", () => {
+    writeManifest({ dependencies: { "@scope/x": "^1.0.0", "@scope/y": "^2.0.0" } });
+    writeLock({ "node_modules/@scope/x": { version: "1.2.3" }, "node_modules/@scope/y": { version: "2.0.0" } });
+    installed("@scope/x", "1.2.3");
+
+    expect(staleDependencies(engineDir)).toEqual(["@scope/y"]);
+
+    installed("@scope/y", "2.0.0");
+    expect(staleDependencies(engineDir)).toEqual([]);
+
+    installed("@scope/x", "1.0.0");
+    expect(staleDependencies(engineDir)).toEqual(["@scope/x"]);
+  });
+
+  it("D5: an optional dependency that is not installed is not reported", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" }, optionalDependencies: { "@rollup/rollup-darwin-arm64": "^4.0.0" } });
+    writeLock({
+      "node_modules/hono": { version: "4.6.3" },
+      "node_modules/@rollup/rollup-darwin-arm64": { version: "4.24.0", optional: true },
+    });
+    installed("hono", "4.6.3");
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D5: an optional dependency that is installed at a different version is still reported", () => {
+    writeManifest({ optionalDependencies: { fsevents: "^2.0.0" } });
+    writeLock({ "node_modules/fsevents": { version: "2.3.3", optional: true } });
+    installed("fsevents", "2.3.0");
+
+    expect(staleDependencies(engineDir)).toEqual(["fsevents"]);
+  });
+
+  it("D5: a missing dependency whose lockfile entry is not optional is reported even if another is optional", () => {
+    writeManifest({ dependencies: { graphql: "^16.0.0" }, optionalDependencies: { fsevents: "^2.0.0" } });
+    writeLock({ "node_modules/graphql": { version: "16.9.0" }, "node_modules/fsevents": { version: "2.3.3", optional: true } });
+
+    expect(staleDependencies(engineDir)).toEqual(["graphql"]);
+  });
+
+  it("D5: a direct dependency with no lockfile entry is skipped", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0", unlocked: "^1.0.0" } });
+    writeLock({ "node_modules/hono": { version: "4.6.3" } });
+    installed("hono", "4.6.3");
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D6: no package-lock.json returns [] and does not block", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" } });
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D6: an unreadable package-lock.json (not JSON) returns []", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" } });
+    writeFileSync(join(engineDir, "package-lock.json"), "{ not json");
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D6: a package-lock.json that is a directory (unreadable) returns []", () => {
+    writeManifest({ dependencies: { hono: "^4.0.0" } });
+    mkdirSync(join(engineDir, "package-lock.json"));
+
+    expect(staleDependencies(engineDir)).toEqual([]);
+  });
+
+  it("D7: names come back sorted, whatever order the manifest and lockfile list them in", () => {
+    writeManifest({ dependencies: { zeta: "^1.0.0", alpha: "^1.0.0", "@scope/mid": "^1.0.0", mu: "^1.0.0" } });
+    writeLock({
+      "node_modules/zeta": { version: "1.0.0" },
+      "node_modules/alpha": { version: "1.0.0" },
+      "node_modules/@scope/mid": { version: "1.0.0" },
+      "node_modules/mu": { version: "1.0.0" },
+    });
+
+    const names = staleDependencies(engineDir);
+    expect(names).toEqual(["@scope/mid", "alpha", "mu", "zeta"]);
+    expect(names).toEqual([...names].sort());
+  });
+
+  it("D7: devDependencies are included, and a name in more than one group is reported once", () => {
+    writeManifest({
+      dependencies: { hono: "^4.0.0" },
+      devDependencies: { vitest: "^2.0.0", hono: "^4.0.0" },
+    });
+    writeLock({ "node_modules/hono": { version: "4.6.3" }, "node_modules/vitest": { version: "2.1.0" } });
+    installed("hono", "4.6.3");
+
+    expect(staleDependencies(engineDir)).toEqual(["vitest"]);
+  });
+
+  it("D7: a stale dependency in each of the three groups is reported", () => {
+    writeManifest({
+      dependencies: { d: "^1.0.0" },
+      devDependencies: { a: "^1.0.0" },
+      optionalDependencies: { o: "^1.0.0" },
+    });
+    writeLock({ "node_modules/d": { version: "1.0.0" }, "node_modules/a": { version: "1.0.0" }, "node_modules/o": { version: "1.0.0" } });
+    installed("o", "0.9.0");
+
+    expect(staleDependencies(engineDir)).toEqual(["a", "d", "o"]);
+  });
+});
+
+describe("staleDependenciesMessage (#150)", () => {
+  const prefix = "vendor/open-connector dependencies are out of date";
+  const suffix = "run scripts/bootstrap.sh, then deploy again";
+
+  it("D8: names up to five are all listed, with no 'more'", () => {
+    expect(staleDependenciesMessage(["graphql"])).toBe(`${prefix} (graphql); ${suffix}`);
+    expect(staleDependenciesMessage(["a", "b", "c", "d", "e"])).toBe(`${prefix} (a, b, c, d, e); ${suffix}`);
+  });
+
+  it("D8: six names list the first five and say 'and 1 more'", () => {
+    expect(staleDependenciesMessage(["a", "b", "c", "d", "e", "f"])).toBe(`${prefix} (a, b, c, d, e and 1 more); ${suffix}`);
+  });
+
+  it("D8: many names list the first five and count the rest", () => {
+    const names = Array.from({ length: 12 }, (_, index) => `pkg${index}`);
+    expect(staleDependenciesMessage(names)).toBe(`${prefix} (pkg0, pkg1, pkg2, pkg3, pkg4 and 7 more); ${suffix}`);
+  });
+
+  it("D8: scoped names are printed as they are", () => {
+    expect(staleDependenciesMessage(["@scope/x", "graphql"])).toBe(`${prefix} (@scope/x, graphql); ${suffix}`);
   });
 });
 
