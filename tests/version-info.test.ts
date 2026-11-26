@@ -88,6 +88,16 @@ describe("buildVersionInfo (#83)", () => {
     expect(buildVersionInfo(root, NOW).openconnector.version).toBe("2.0.0-rc.1");
   });
 
+  it("V1: openconnector.version prefers the newest patch header over upstream's 0.0.0-development package.json", () => {
+    write(join(engine, "package.json"), JSON.stringify({ name: "open-connector", version: "0.0.0-development" }));
+    write(join(root, "patches/0001-first.patch"), "SplitMind patch 0001 for OpenConnector v1.9.1.\nbody\n");
+    write(join(root, "patches/0010-late.patch"), "SplitMind patch 0010 for OpenConnector v1.9.2. Apply after 0001.\nbody\n");
+    expect(buildVersionInfo(root, NOW).openconnector.version).toBe("1.9.2");
+
+    write(join(root, "patches/0010-late.patch"), "no header\n");
+    expect(buildVersionInfo(root, NOW).openconnector.version).toBe("1.9.1");
+  });
+
   it("V1: patches lists every patches/*.patch sorted by name, each with the sha256 of the file's bytes", () => {
     const info = buildVersionInfo(root, NOW);
 

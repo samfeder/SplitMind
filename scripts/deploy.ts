@@ -1,12 +1,13 @@
 // Deploys SplitMind's OpenConnector Worker to the Cloudflare account wrangler is logged in to. Safe to re-run: it
 // finds the D1 database and KV namespaces it created before, and only asks for secrets that are not set yet.
 //
-// Usage: node scripts/deploy.ts [--name <worker-name>] [--origin <url>] [--render-only] [--dry-run]
+// Usage: node scripts/deploy.ts [--name <worker-name>] [--origin <url>] [--render-only] [--dry-run] [--allow-dirty]
 //
 //   --name         Worker name (default: splitmind). Resource names derive from it.
 //   --origin       Public origin, e.g. a custom domain. Default: the workers.dev URL wrangler prints.
 //   --render-only  Write vendor/open-connector/wrangler.local.jsonc from the saved state and stop.
 //   --dry-run      Build and bundle with placeholder resource ids; needs no Cloudflare login and changes nothing.
+//   --allow-dirty  Deploy even though the SplitMind tree has uncommitted changes (version.json then says dirty).
 //
 // Steps: check wrangler login -> create or find D1 + two KV namespaces -> render wrangler.local.jsonc -> apply D1
 // migrations -> apply any new patches -> build with the trimmed catalog -> deploy -> set missing secrets (you paste
@@ -14,6 +15,7 @@
 // Account-specific state (resource ids, origin) is saved to splitmind.local.json, which git ignores. Secrets are
 // never read, printed or stored by this script: wrangler prompts for them directly.
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -319,6 +321,96 @@ function preparePatchedEngine(): void {
   if (stale.length > 0) throw new Error(staleDependenciesMessage(stale));
 }
 
+// --- version record -------------------------------------------------------------------------------------------------
+
+export interface VersionInfo {
+  splitmind: { commit: string; dirty: boolean };
+  openconnector: { version: string; commit: string };
+  patches: { name: string; sha256: string }[];
+  builtAt: string;
+}
+
+/** Runs git in `cwd`; undefined if git is missing or the command fails. */
+function gitOutput(cwd: string, args: string[]): string | undefined {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  return result.error || result.status !== 0 ? undefined : result.stdout;
+}
+
+// Paths that never make the tree dirty: the engine submodule (bootstrap patches it), agent spec notes and deploy state.
+function ignoredForDirty(path: string): boolean {
+  const name = path.split("/").pop()!;
+  return path === "vendor/open-connector" || path === "splitmind.local.json" || /^\.spec-.*\.md$/.test(name);
+}
+
+/** Paths with uncommitted changes in the SplitMind repo, or undefined when git can't say (no git, not a repo). */
+export function dirtyPaths(repoRoot: string): string[] | undefined {
+  const out = gitOutput(repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (out === undefined) return undefined;
+  const entries = out.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    paths.push(entry.slice(3));
+    // A rename or copy is followed by its source path as a separate entry.
+    if (entry[0] === "R" || entry[0] === "C") i++;
+  }
+  return paths.filter((path) => !ignoredForDirty(path));
+}
+
+/** What is being built, for <origin>/version.json. Synchronous and never throws. */
+export function buildVersionInfo(repoRoot: string, now: Date = new Date()): VersionInfo {
+  const head = gitOutput(repoRoot, ["rev-parse", "HEAD"])?.trim();
+  const dirty = dirtyPaths(repoRoot);
+  const pin = gitOutput(repoRoot, ["ls-tree", "HEAD", "vendor/open-connector"])?.match(/^160000 commit ([0-9a-f]{40})\t/)?.[1];
+  const manifest = readJson<{ version?: string }>(join(repoRoot, "vendor/open-connector/package.json"));
+  const patchDir = join(repoRoot, "patches");
+  let names: string[] = [];
+  try {
+    names = readdirSync(patchDir).filter((file) => file.endsWith(".patch")).sort();
+  } catch {
+    // No patches directory.
+  }
+  const patches = names.flatMap((name) => {
+    try {
+      return [{ name, sha256: createHash("sha256").update(readFileSync(join(patchDir, name))).digest("hex") }];
+    } catch {
+      return [];
+    }
+  });
+  // Upstream's package.json says 0.0.0-development, so the patch headers ("SplitMind patch 0001 for OpenConnector
+  // v1.9.2.") are the record of which release the stack targets. The newest patch wins.
+  let headerVersion: string | undefined;
+  for (const name of [...names].reverse()) {
+    try {
+      const first = readFileSync(join(patchDir, name), "utf8").split("\n", 1)[0] ?? "";
+      headerVersion = first.match(/\bfor OpenConnector v(\d+\.\d+\.\d+(?:-[\w.]+)?)/)?.[1];
+    } catch {
+      // Unreadable patch: try the next one.
+    }
+    if (headerVersion) break;
+  }
+  return {
+    splitmind: head && dirty ? { commit: head, dirty: dirty.length > 0 } : { commit: head ?? "unknown", dirty: true },
+    openconnector: { version: headerVersion ?? manifest?.version ?? "unknown", commit: pin ?? "unknown" },
+    patches,
+    builtAt: now.toISOString(),
+  };
+}
+
+/** Writes <webDist>/version.json, served as a static asset at <origin>/version.json. */
+export function writeVersionFile(repoRoot: string, webDist: string, info: VersionInfo = buildVersionInfo(repoRoot)): void {
+  mkdirSync(webDist, { recursive: true });
+  writeFileSync(join(webDist, "version.json"), `${JSON.stringify(info, null, 2)}\n`);
+  console.log("    version: /version.json");
+}
+
+/** The refusal message for a dirty tree, naming the first few paths. */
+export function dirtyTreeMessage(paths: string[] | undefined): string {
+  const shown = paths ? paths.slice(0, 5).join(", ") + (paths.length > 5 ? ` and ${paths.length - 5} more` : "") : "";
+  const what = paths ? `uncommitted changes in the SplitMind tree (${shown})` : "cannot read the SplitMind git state (is this a git checkout?)";
+  return `${what}; commit or stash them, or pass --allow-dirty`;
+}
+
 function build(template: string): void {
   console.log("==> Building (catalog, Web Console, trimmed catalog assets)");
   run("npm", ["run", "generate:catalog"], engine);
@@ -327,6 +419,7 @@ function build(template: string): void {
   installSetupPage(root, join(engine, "dist/web"));
   installPrivacyPage(root, join(engine, "dist/web"));
   installSecurityHeaders(root, join(engine, "dist/web"));
+  writeVersionFile(root, join(engine, "dist/web"));
 }
 
 const headersBegin = "# --- SplitMind security headers (web/_headers) ---";
@@ -459,11 +552,12 @@ async function main(): Promise<number> {
       origin: { type: "string" },
       "render-only": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
+      "allow-dirty": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
-    console.log("Usage: node scripts/deploy.ts [--name <worker-name>] [--origin <url>] [--render-only] [--dry-run]");
+    console.log("Usage: node scripts/deploy.ts [--name <worker-name>] [--origin <url>] [--render-only] [--dry-run] [--allow-dirty]");
     return 0;
   }
   if (values.origin !== undefined && !/^https:\/\/[^/\s]+$/.test(values.origin)) {
@@ -510,6 +604,12 @@ async function main(): Promise<number> {
     }
     render({ ...saved, ...(values.origin ? { origin: values.origin } : {}) });
     return 0;
+  }
+
+  // Before any wrangler call, so a refused deploy touches nothing.
+  if (!values["allow-dirty"] && buildVersionInfo(root).splitmind.dirty) {
+    console.error(`deploy: ${dirtyTreeMessage(dirtyPaths(root))}`);
+    return 1;
   }
 
   preparePatchedEngine();

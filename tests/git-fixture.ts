@@ -34,6 +34,17 @@ export function commitAll(repoDir: string, message = "fixture"): string {
 }
 
 /**
+ * Commits the superproject's own changes before a deploy run, as a developer would: everything except the engine
+ * gitlink (whose pin only moves on purpose), and no commit at all when nothing changed, so HEAD stays stable across runs.
+ */
+export function commitSuperproject(repoDir: string, message = "fixture"): string {
+  git(repoDir, "add", "-A", "--", ".", ":(exclude)vendor/open-connector");
+  const staged = git(repoDir, "diff", "--cached", "--name-only");
+  if (staged) git(repoDir, "commit", "-q", "-m", message);
+  return git(repoDir, "rev-parse", "HEAD");
+}
+
+/**
  * Turns `root` into a git repo with everything currently in it committed, and `root/vendor/open-connector` into its
  * own repo recorded as a gitlink. Returns the commit the superproject pins for the engine.
  */

@@ -497,7 +497,42 @@ async function start() {
   if (session.authenticated) await refresh();
 }
 
+const COMMIT_URL = "https://github.com/samfeder/SplitMind/commit/";
+
+/**
+ * Fills `target` with "SplitMind <short7>[ (dirty)] · OpenConnector <version> · <N> patches" from a /version.json
+ * body. The short commit links to GitHub unless it is "unknown". DOM APIs and textContent only. Does nothing if the
+ * body is not the expected shape.
+ */
+export function renderVersion(target, info) {
+  const commit = info?.splitmind?.commit;
+  const version = info?.openconnector?.version;
+  if (typeof commit !== "string" || typeof version !== "string" || !Array.isArray(info.patches)) return;
+  const short = commit.slice(0, 7);
+  const rest = `${info.splitmind.dirty ? " (dirty)" : ""} · OpenConnector ${version} · ${info.patches.length} patches`;
+  target.textContent = "SplitMind ";
+  if (!/^[0-9a-f]{40}$/.test(commit)) {
+    target.append(short);
+  } else {
+    const link = document.createElement("a");
+    link.href = `${COMMIT_URL}${commit}`;
+    link.textContent = short;
+    target.append(link);
+  }
+  target.append(rest);
+}
+
+async function showVersion() {
+  try {
+    const response = await fetch("/version.json", { cache: "no-store" });
+    if (response.ok) renderVersion($("#version"), await response.json());
+  } catch {
+    // The line is a nicety; stay quiet.
+  }
+}
+
 export function main() {
+  showVersion();
   $("#signin form").addEventListener("submit", (event) =>
     signIn(event).catch((error) => ($("#signin-status").textContent = error.message)),
   );

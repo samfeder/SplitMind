@@ -5,7 +5,7 @@ import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { staleDependencies, staleDependenciesMessage } from "../scripts/deploy.ts";
-import { commitAll, git, initFixtureRepo } from "./git-fixture.ts";
+import { commitSuperproject, git, initFixtureRepo } from "./git-fixture.ts";
 
 // Runs the real scripts/deploy.ts in a throwaway checkout. Cloudflare is replaced by a stand-in `wrangler` that
 // keeps a fake account in a JSON file, and the engine by a stand-in whose build steps write a tiny catalog.
@@ -150,7 +150,7 @@ function runDeploy(env: NodeJS.ProcessEnv, args: string[]) {
 // Most tests are not about cleanliness: whatever they wrote into the checkout (patches, notes) is committed first, so
 // the tree is clean when the script runs. Changes inside vendor/open-connector never count, so those stay as written.
 function deployWith(env: NodeJS.ProcessEnv, ...args: string[]) {
-  if (existsSync(join(checkout, ".git"))) commitAll(checkout, "test setup");
+  if (existsSync(join(checkout, ".git"))) commitSuperproject(checkout, "test setup");
   return runDeploy(env, args);
 }
 
@@ -1111,7 +1111,7 @@ describe("version.json and the clean-tree check (#83)", { timeout: 30_000 }, () 
     [`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`, "@@ -1 +1 @@", `-${from}`, `+${to}`, ""].join("\n");
   const hint = "commit or stash them, or pass --allow-dirty";
   const dirtyTree = () => writeFileSync(join(checkout, "notes.txt"), "scratch\n");
-  const settle = () => commitAll(checkout, "settle");
+  const settle = () => commitSuperproject(checkout, "settle");
   const keys = (value: object) => Object.keys(value).sort();
 
   describe("V3: the file is written into the web build output on every build path", () => {
