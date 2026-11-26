@@ -6,6 +6,7 @@ import { installPrivacyPage, installSecurityHeaders, installSetupPage } from "..
 import {
   accountsOf,
   apiError,
+  callbackError,
   explainError,
   nicknameProblem,
   renderSlackManifest,
@@ -515,5 +516,148 @@ describe("setup page error rendering (E6, static)", () => {
   it("adds no new API call (the hint is static)", () => {
     // api() is called 9 times on main: configs, connections x2, authorizations, delete, save config, token connect, session x2.
     expect([...script.matchAll(/\bapi\(\s*"(GET|POST|PUT|DELETE)"/g)]).toHaveLength(9);
+  });
+});
+
+// Reading the OAuth popup (no server change). The popup ends on our own /oauth/callback, which answers
+// { error: { code, message } } as JSON on failure (jsonError in the vendored server/api/http-utils.ts) and an HTML
+// completion page on success.
+describe("callbackError (P1)", () => {
+  it("returns code and message from a JSON error body", () => {
+    const body = JSON.stringify({ error: { code: "credential_verification_failed", message: "Precondition check failed." } });
+    expect(callbackError(body)).toEqual({ code: "credential_verification_failed", message: "Precondition check failed." });
+  });
+
+  it("copes with the whitespace and pretty-printing a browser's JSON view adds", () => {
+    const body = `\n  ${JSON.stringify({ error: { code: "invalid_oauth_callback", message: "OAuth callback requires state and code." } }, null, 2)}\n`;
+    expect(callbackError(body)).toEqual({ code: "invalid_oauth_callback", message: "OAuth callback requires state and code." });
+  });
+
+  it("reads the provider-error shape the callback really emits", () => {
+    const message = 'OAuth provider returned error "access_denied": admin_policy_enforced';
+    expect(callbackError(JSON.stringify({ error: { code: "oauth_provider_error", message } }))).toEqual({
+      code: "oauth_provider_error",
+      message,
+    });
+  });
+
+  it.each([
+    ["an empty string", ""],
+    ["whitespace", "  \n "],
+    ["plain text", "Connected. You can close this tab."],
+    ["an HTML completion page", "<!doctype html><html><body><h1>Gmail connected</h1></body></html>"],
+    ["truncated JSON", '{"error":{"code":"x","message":'],
+    ["JSON null", "null"],
+    ["a JSON number", "42"],
+    ["a JSON string", '"boom"'],
+    ["a JSON array", '[{"error":{"code":"x","message":"y"}}]'],
+    ["JSON without error", '{"ok":true}'],
+    ["a success body", '{"service":"gmail","connectionName":"home","status":"connected"}'],
+    ["an error that is a string", '{"error":"boom"}'],
+    ["an error that is null", '{"error":null}'],
+    ["an error without a message", '{"error":{"code":"x"}}'],
+    ["an error whose message is not a string", '{"error":{"code":"x","message":{"a":1}}}'],
+  ])("returns undefined for %s", (_name, body) => {
+    expect(callbackError(body)).toBeUndefined();
+  });
+
+  it("never throws, whatever it is given", () => {
+    for (const input of [undefined, null, 0, {}, [], "{", "\u0000", "{".repeat(100_000)]) {
+      expect(() => callbackError(input as never)).not.toThrow();
+    }
+  });
+});
+
+describe("callback body to plain English (P3, end to end on the pure parts)", () => {
+  it("turns the Gmail no-inbox callback body into the no-inbox text", () => {
+    const body = JSON.stringify({ error: { code: "credential_verification_failed", message: "Precondition check failed." } });
+    expect(explainError({ service: "gmail", ...callbackError(body) })?.text).toMatch(/no Gmail inbox/i);
+  });
+
+  it("turns a Workspace-blocked callback body into the admin text with its doc link", () => {
+    const body = JSON.stringify({
+      error: { code: "oauth_provider_error", message: 'OAuth provider returned error "access_denied": admin_policy_enforced' },
+    });
+    const found = explainError({ service: "gmail", ...callbackError(body) });
+    expect(found?.text).toMatch(/Workspace admin/i);
+    expect(found?.docHref).toMatch(/docs\/providers\/gmail\.md#a-google-workspace-account$/);
+  });
+
+  it("turns a Slack approval-pending callback body into the approval text", () => {
+    const body = JSON.stringify({
+      error: { code: "oauth_provider_error", message: 'OAuth provider returned error "access_denied": app approval pending' },
+    });
+    expect(explainError({ service: "slack", ...callbackError(body) })?.text).toMatch(/Slack workspace admin/i);
+  });
+
+  it("leaves an unrecognised callback error to the raw message", () => {
+    const body = JSON.stringify({ error: { code: "invalid_oauth_callback", message: "OAuth callback requires state and code." } });
+    expect(explainError({ service: "gmail", ...callbackError(body) })).toBeUndefined();
+  });
+});
+
+describe("popup polling reads the callback (P2, static)", () => {
+  const bodyOf = (source: string, open: RegExp): { name: string; body: string }[] =>
+    [...source.matchAll(open)].map((match) => {
+      let depth = 1;
+      let index = match.index! + match[0].length;
+      const start = index;
+      while (depth > 0 && index < source.length) {
+        const char = source[index++];
+        if (char === "{") depth++;
+        else if (char === "}") depth--;
+      }
+      return { name: match[1] ?? "", body: source.slice(start, index) };
+    });
+  const functions = new Map(
+    bodyOf(script, /(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{/g).map(({ name, body }) => [name, body]),
+  );
+  /** pollUntilConnected plus every file-local function reachable from it. */
+  const reachable = (): string => {
+    const seen = new Set<string>();
+    const queue = ["pollUntilConnected"];
+    let text = "";
+    while (queue.length > 0) {
+      const name = queue.pop()!;
+      if (seen.has(name) || !functions.has(name) || name === "explainError" || name === "callbackError") continue;
+      seen.add(name);
+      const body = functions.get(name)!;
+      text += `\n${body}`;
+      for (const other of functions.keys()) if (new RegExp(`\\b${other}\\(`).test(body)) queue.push(other);
+    }
+    return text;
+  };
+  const explainHelpers = [...functions].filter(([name, body]) => name !== "explainError" && /\bexplainError\(/.test(body)).map(([name]) => name);
+
+  it("exports callbackError", () => {
+    expect(script).toMatch(/export function callbackError\(/);
+  });
+
+  it("polling reaches callbackError and the /oauth/callback path", () => {
+    expect(functions.has("pollUntilConnected")).toBe(true);
+    const text = reachable();
+    expect(text).toMatch(/\bcallbackError\(/);
+    expect(text).toContain("/oauth/callback");
+  });
+
+  it("reads the popup's location and body inside a try block, because that throws on the provider's origin", () => {
+    const tries = bodyOf(reachable(), /\btry\s*\{/g).map(({ body }) => body);
+    expect(tries.some((block) => /\.pathname/.test(block) && /textContent/.test(block))).toBe(true);
+  });
+
+  it("shows what it read through explainError, directly or via a helper", () => {
+    const text = reachable();
+    const routed = /\bexplainError\(/.test(text) || explainHelpers.some((name) => new RegExp(`\\b${name}\\(`).test(text));
+    expect(routed).toBe(true);
+  });
+
+  it("stops polling and closes the popup once it has an error", () => {
+    const text = reachable();
+    expect(text).toMatch(/clearInterval\(/);
+    expect(text).toMatch(/\.close\(\)/);
+  });
+
+  it("still never uses innerHTML for the callback text", () => {
+    expect(script).not.toMatch(/innerHTML/);
   });
 });
