@@ -297,7 +297,10 @@ switch; options 1 to 4 are workarounds that still apply and stack with it.
    may use (patch 0004, #76). This applies to the whole connector, not one account: claude.ai cannot add a second
    connector with the same URL, so "read-only on `<alias-a>`, writes on `<alias-b>`" still needs option 1.
 4. **Deployment-wide:** put explicit read action ids in `OOMOL_CONNECT_ALLOWED_ACTIONS` instead of `slack.*`.
-   That makes the provider read-only for every account.
+   That makes the provider read-only for every account. Alternatively put `@read` in the list: it follows the
+   catalog's `read` labels instead of fixed ids, so new read actions are included on upgrade (patch 0030). Patch
+   0032 warns at startup about a misspelled `@…` entry. Because the list follows labels, audit new or changed `read`
+   labels on every upstream bump (`docs/upgrading-openconnector.md`, step 6).
 
 ## 6. Email watch (patches 0009, 0011 and 0012, #126, #104 to #107, #110, #111)
 

@@ -281,7 +281,7 @@ function readJson<T>(path: string): T | undefined {
  * dependencies the lockfile does not list and optional ones that are not installed (platform-specific binaries).
  */
 export function staleDependencies(engineDir: string): string[] {
-  const lock = readJson<{ packages?: Record<string, { version?: string; optional?: boolean } | undefined> }>(
+  const lock = readJson<{ packages?: Record<string, { version?: string; optional?: boolean; link?: boolean } | undefined> }>(
     join(engineDir, "package-lock.json"),
   );
   const manifest = readJson<Record<string, Record<string, string> | undefined>>(join(engineDir, "package.json"));
@@ -292,7 +292,9 @@ export function staleDependencies(engineDir: string): string[] {
   const stale: string[] = [];
   for (const name of names) {
     const locked = lock.packages[`node_modules/${name}`];
-    if (!locked) continue;
+    // `link:` dependencies have no version in the lockfile; skip them. `npm:` aliases work as-is: the lockfile and
+    // the installed package.json both carry the target's version. peerDependencies are not checked.
+    if (!locked || locked.link || locked.version === undefined) continue;
     const installed = readJson<{ version?: string }>(join(engineDir, "node_modules", name, "package.json"));
     if (!installed && locked.optional) continue;
     if (installed?.version !== locked.version) stale.push(name);

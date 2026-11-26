@@ -671,6 +671,22 @@ describe("scripts/deploy.ts", { timeout: 30_000 }, () => {
       expect(calls[0]).toMatch(/^deploy .*--dry-run/);
     });
 
+    it("--dry-run stays offline: the only wrangler call is deploy --dry-run, with no whoami, d1, kv or secret call (#161)", () => {
+      const result = deploy("--dry-run");
+
+      expect(result.status).toBe(0);
+      const calls = readAccount().calls;
+      const offending = calls.filter((call) => !/^deploy( |$)/.test(call) || !call.split(" ").includes("--dry-run"));
+      expect(offending).toEqual([]);
+      expect(calls).toHaveLength(1);
+      for (const online of ["whoami", "d1 ", "kv ", "secret "]) {
+        expect(calls.some((call) => call.startsWith(online))).toBe(false);
+      }
+      expect(result.stdout).not.toContain("==> Checking Cloudflare login");
+      expect(result.stdout).not.toContain("==> Cloudflare resources");
+      expect(existsSync(join(checkout, "splitmind.local.json"))).toBe(false);
+    });
+
     it("--render-only needs no patches, no node_modules and no wrangler call", () => {
       deploy();
       rmSync(join(engine, "node_modules"), { recursive: true });
@@ -937,6 +953,79 @@ describe("staleDependencies (#150)", () => {
     installed("o", "0.9.0");
 
     expect(staleDependencies(engineDir)).toEqual(["a", "d", "o"]);
+  });
+
+  describe("entries that are not registry installs (#158)", () => {
+    const writeRawLock = (packages: Record<string, unknown>) =>
+      writeFileSync(
+        join(engineDir, "package-lock.json"),
+        JSON.stringify({ name: "engine", lockfileVersion: 3, packages: { "": { name: "engine" }, ...packages } }),
+      );
+
+    it("R1: a link: dependency (lockfile entry has link: true and no version) is not reported, even though node_modules holds the target's version", () => {
+      writeManifest({ dependencies: { "local-lib": "link:../local-lib", hono: "^4.0.0" } });
+      writeRawLock({
+        "node_modules/local-lib": { resolved: "../local-lib", link: true },
+        "node_modules/hono": { version: "4.6.3" },
+      });
+      installed("local-lib", "0.0.1");
+      installed("hono", "4.6.3");
+
+      expect(staleDependencies(engineDir)).toEqual([]);
+    });
+
+    it("R1: an entry with link: true is skipped even if it carries a version that differs from the installed one", () => {
+      writeManifest({ dependencies: { "local-lib": "file:../local-lib" } });
+      writeRawLock({ "node_modules/local-lib": { resolved: "../local-lib", link: true, version: "9.9.9" } });
+      installed("local-lib", "0.0.1");
+
+      expect(staleDependencies(engineDir)).toEqual([]);
+    });
+
+    it("R1: a link: dependency that is not installed at all is not reported either", () => {
+      writeManifest({ dependencies: { "local-lib": "link:../local-lib" } });
+      writeRawLock({ "node_modules/local-lib": { resolved: "../local-lib", link: true } });
+
+      expect(staleDependencies(engineDir)).toEqual([]);
+    });
+
+    it("R1: an entry with no version (and no link flag) is skipped", () => {
+      writeManifest({ dependencies: { "ws-pkg": "workspace:*" } });
+      writeRawLock({ "node_modules/ws-pkg": { resolved: "packages/ws-pkg" } });
+      installed("ws-pkg", "1.0.0");
+
+      expect(staleDependencies(engineDir)).toEqual([]);
+    });
+
+    it("R1: skipping link entries does not hide a genuinely stale registry dependency next to them", () => {
+      writeManifest({ dependencies: { "local-lib": "link:../local-lib", hono: "^4.0.0" } });
+      writeRawLock({
+        "node_modules/local-lib": { resolved: "../local-lib", link: true },
+        "node_modules/hono": { version: "4.6.3" },
+      });
+      installed("local-lib", "0.0.1");
+      installed("hono", "4.5.0");
+
+      expect(staleDependencies(engineDir)).toEqual(["hono"]);
+    });
+
+    it("R1: an npm: alias dependency whose installed version matches the lockfile is not reported", () => {
+      writeManifest({ dependencies: { aliased: "npm:real-package@^2.0.0" } });
+      writeRawLock({ "node_modules/aliased": { name: "real-package", version: "2.3.4" } });
+      mkdirSync(join(engineDir, "node_modules/aliased"), { recursive: true });
+      writeFileSync(join(engineDir, "node_modules/aliased/package.json"), JSON.stringify({ name: "real-package", version: "2.3.4" }));
+
+      expect(staleDependencies(engineDir)).toEqual([]);
+    });
+
+    it("R1: an npm: alias dependency whose installed version differs is still reported under the alias name", () => {
+      writeManifest({ dependencies: { aliased: "npm:real-package@^2.0.0" } });
+      writeRawLock({ "node_modules/aliased": { name: "real-package", version: "2.3.4" } });
+      mkdirSync(join(engineDir, "node_modules/aliased"), { recursive: true });
+      writeFileSync(join(engineDir, "node_modules/aliased/package.json"), JSON.stringify({ name: "real-package", version: "2.0.0" }));
+
+      expect(staleDependencies(engineDir)).toEqual(["aliased"]);
+    });
   });
 });
 
