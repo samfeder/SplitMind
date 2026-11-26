@@ -8,9 +8,11 @@ import {
   apiError,
   callbackError,
   explainError,
+  nicknameMismatch,
   nicknameProblem,
   renderSlackManifest,
   PROVIDERS,
+  sameAccountAs,
   slackCredentials,
   TOKEN_PROVIDERS,
   tokenConnectionBody,
@@ -659,5 +661,173 @@ describe("popup polling reads the callback (P2, static)", () => {
 
   it("still never uses innerHTML for the callback text", () => {
     expect(script).not.toMatch(/innerHTML/);
+  });
+});
+
+// --- #60: catch "connected the wrong account" at connect time -------------------------------------------------------
+//
+// Identity rule, pinned to scripts/verify-deployment.ts ("each <svc> connection is a different account"): two
+// connections of one service are the same account iff both have a non-empty `profile.accountId` and the ids are
+// strictly equal (===). `profile.displayName` is NOT an identity: Notion's OAuth displayName is the owner's name and
+// Slack's is the workspace name, so equal names do not mean one account.
+
+type Row = { service: string; connectionName: string; configured: boolean; profile?: { accountId?: string; displayName?: string } };
+const row = (service: string, connectionName: string, accountId?: string, displayName?: string): Row => ({
+  service,
+  connectionName,
+  configured: true,
+  profile: accountId === undefined && displayName === undefined ? undefined : { accountId, displayName },
+});
+
+describe("sameAccountAs (#60)", () => {
+  it("returns the other connection's name when the accountId is equal", () => {
+    const rows = [row("notion", "work", "user-1", "Sam"), row("notion", "home", "user-1", "Sam")];
+    expect(sameAccountAs(rows, "notion", "home")).toBe("work");
+    expect(sameAccountAs(rows, "notion", "work")).toBe("home");
+  });
+
+  it("finds a duplicate by accountId even when the displayNames differ", () => {
+    const rows = [row("gmail", "a", "sam@example.com", "Sam F."), row("gmail", "b", "sam@example.com", "Other label")];
+    expect(sameAccountAs(rows, "gmail", "b")).toBe("a");
+  });
+
+  it("does not treat the same displayName as a duplicate when the accountIds differ", () => {
+    const rows = [row("notion", "work", "user-1", "Sam"), row("notion", "home", "user-2", "Sam")];
+    expect(sameAccountAs(rows, "notion", "home")).toBeUndefined();
+  });
+
+  it("compares accountId exactly, as verify does: no trimming or case folding", () => {
+    expect(sameAccountAs([row("slack", "a", "U0ABC"), row("slack", "b", "u0abc")], "slack", "b")).toBeUndefined();
+    expect(sameAccountAs([row("slack", "a", "U0ABC"), row("slack", "b", " U0ABC ")], "slack", "b")).toBeUndefined();
+  });
+
+  it("returns undefined for a single connection (it never matches itself)", () => {
+    expect(sameAccountAs([row("gmail", "home", "x@y.z")], "gmail", "home")).toBeUndefined();
+  });
+
+  it("ignores other services with the same accountId", () => {
+    const rows = [row("slack", "work", "id-1"), row("notion", "home", "id-1")];
+    expect(sameAccountAs(rows, "notion", "home")).toBeUndefined();
+  });
+
+  it("ignores connections with no identity, including two with equal displayNames", () => {
+    const rows = [
+      row("notion", "a"),
+      row("notion", "b", undefined, "Sam"),
+      row("notion", "c", undefined, "Sam"),
+      row("notion", "d", "", "Sam"),
+      row("notion", "e", "", "Sam"),
+    ];
+    for (const name of ["a", "b", "c", "d", "e"]) expect(sameAccountAs(rows, "notion", name)).toBeUndefined();
+  });
+
+  it("returns undefined when the new nickname is not in the list yet", () => {
+    expect(sameAccountAs([row("notion", "work", "u1")], "notion", "home")).toBeUndefined();
+  });
+
+  it("names the first duplicate in list order when several match", () => {
+    const rows = [row("notion", "first", "u1"), row("notion", "second", "u1"), row("notion", "third", "u1")];
+    expect(sameAccountAs(rows, "notion", "third")).toBe("first");
+  });
+
+  it("is pure: does not modify its input", () => {
+    const rows = [row("notion", "work", "u1"), row("notion", "home", "u1")];
+    const before = JSON.stringify(rows);
+    sameAccountAs(rows, "notion", "home");
+    expect(JSON.stringify(rows)).toBe(before);
+  });
+});
+
+describe("nicknameMismatch (#60)", () => {
+  it("returns the other connection when the nickname equals its email local part", () => {
+    // "bob" was typed, but another connection ("work") already holds bob@example.com: the picker may have been wrong.
+    const rows = [row("gmail", "work", "bob@example.com", "bob@example.com"), row("gmail", "bob", "x@example.com", "x@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBe("work");
+  });
+
+  it("matches the local part of the displayName when the accountId is not an email", () => {
+    const rows = [row("gmail", "work", "g-123", "bob@example.com"), row("gmail", "bob", "g-456", "x@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBe("work");
+  });
+
+  it("matches the local part of an email-shaped accountId when the displayName is not an email", () => {
+    const rows = [row("gmail", "work", "bob@example.com", "Bob B."), row("gmail", "bob", "g-456", "x@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBe("work");
+  });
+
+  it("returns the other connection when the nickname equals its displayName", () => {
+    const rows = [row("slack", "ops", "U1", "acme"), row("slack", "acme", "U2", "other-team")];
+    expect(nicknameMismatch(rows, "slack", "acme")).toBe("ops");
+  });
+
+  it("is case-insensitive", () => {
+    const rows = [row("gmail", "work", "Bob@Example.com", "Bob@Example.com"), row("gmail", "BOB", "x@example.com", "x@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "BOB")).toBe("work");
+    const named = [row("slack", "ops", "U1", "Acme"), row("slack", "acme", "U2", "other-team")];
+    expect(nicknameMismatch(named, "slack", "acme")).toBe("ops");
+  });
+
+  it("returns undefined for an ordinary nickname", () => {
+    const rows = [row("gmail", "work", "bob@example.com", "bob@example.com"), row("gmail", "home", "alice@example.com", "alice@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "home")).toBeUndefined();
+    expect(nicknameMismatch(rows, "gmail", "personal")).toBeUndefined();
+  });
+
+  it("never matches the new connection's own identity", () => {
+    // The only account whose local part is "bob" is the new connection itself.
+    const rows = [row("gmail", "bob", "bob@example.com", "bob@example.com"), row("gmail", "work", "carol@example.com", "carol@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBeUndefined();
+  });
+
+  it("ignores other services and connections without a profile", () => {
+    const rows = [row("slack", "ops", "U1", "bob"), row("gmail", "plain"), row("gmail", "bob", "x@example.com", "x@example.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBeUndefined();
+  });
+
+  it("does not match a partial local part or a domain", () => {
+    const rows = [row("gmail", "work", "bobby@example.com", "bobby@example.com"), row("gmail", "bob", "x@y.com", "x@y.com")];
+    expect(nicknameMismatch(rows, "gmail", "bob")).toBeUndefined();
+    expect(nicknameMismatch([row("gmail", "work", "z@example.com", "z@example.com"), row("gmail", "example", "x@y.com")], "gmail", "example")).toBeUndefined();
+  });
+});
+
+describe("setup page connect-time account check (#60, static)", () => {
+  const start = script.indexOf("function pollUntilConnected");
+  const end = script.indexOf("function openPopup");
+  const poll = script.slice(start, end);
+
+  it("locates pollUntilConnected", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+  });
+
+  it("checks sameAccountAs first, then nicknameMismatch, in the success branch", () => {
+    const same = poll.indexOf("sameAccountAs(");
+    const mismatch = poll.indexOf("nicknameMismatch(");
+    expect(same).toBeGreaterThan(-1);
+    expect(mismatch).toBeGreaterThan(same);
+  });
+
+  it("keeps the plain ok status and adds warn statuses", () => {
+    expect(poll).toMatch(/"ok"/);
+    expect(poll.match(/"warn"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+
+  it("offers Undo and Keep buttons, and Undo reuses the existing disconnect function", () => {
+    expect(poll).toContain("Undo");
+    expect(poll).toContain("Keep");
+    expect(poll).toMatch(/\bdisconnect\(/);
+  });
+
+  it("adds no api( call: the page's call sites are unchanged", () => {
+    expect(script.match(/(?<![\w.])api\(/g)?.length).toBe(10);
+  });
+
+  it("uses no innerHTML, anywhere on the page", () => {
+    expect(script).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML/);
+  });
+
+  it("styles the warn status kind", () => {
+    expect(html).toMatch(/\.status\[data-kind="warn"\]/);
   });
 });
