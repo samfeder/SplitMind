@@ -1,5 +1,8 @@
 # SplitMind
 
+[![CI](https://github.com/samfeder/SplitMind/actions/workflows/ci.yml/badge.svg)](https://github.com/samfeder/SplitMind/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/samfeder/SplitMind/badge)](https://scorecard.dev/viewer/?uri=github.com/samfeder/SplitMind)
+
 **One Claude connector, many accounts.** Self-hosted on Cloudflare, built on
 [OpenConnector](https://github.com/oomol-lab/open-connector).
 
