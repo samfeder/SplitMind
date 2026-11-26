@@ -103,6 +103,53 @@ export function accountsOf(connections, service) {
   return connections.filter((c) => c.service === service && c.configured && !c.virtual && !c.marketplace);
 }
 
+const GMAIL_WORKSPACE_DOC = "https://github.com/samfeder/SplitMind/blob/main/docs/providers/gmail.md#a-google-workspace-account";
+
+/** The Error the console API's failure payload describes; carries the API's code and the HTTP status. */
+export function apiError(payload, status) {
+  const message = payload?.error?.message ?? payload?.message ?? `Request failed (${status})`;
+  return Object.assign(new Error(message), { code: payload?.error?.code, status });
+}
+
+/** { code, message } from the JSON error body of /oauth/callback, or undefined for anything else. Never throws. */
+export function callbackError(bodyText) {
+  try {
+    const error = JSON.parse(bodyText)?.error;
+    if (error && typeof error === "object" && typeof error.message === "string") return { code: error.code, message: error.message };
+  } catch {
+    // Not JSON: the success page, or a page still loading.
+  }
+  return undefined;
+}
+
+/**
+ * Plain English for the failures people actually hit, matched on service and error code (never the message alone).
+ * Returns { text, next?, docHref? }, or undefined for an unknown error so the raw message shows. Never throws.
+ */
+export function explainError({ service, code, message } = {}) {
+  const text = typeof message === "string" ? message.toLowerCase() : "";
+  if (service === "gmail" && code === "credential_verification_failed" && text.includes("precondition check failed")) {
+    return {
+      text: "This Google account has no Gmail inbox.",
+      next: "Connect the mailbox its mail is forwarded to instead.",
+    };
+  }
+  if (service === "gmail" && code === "oauth_provider_error" && (text.includes("admin_policy_enforced") || text.includes("access blocked"))) {
+    return {
+      text: "Your Google Workspace admin blocks this app.",
+      next: "Ask them to trust the SplitMind OAuth client, or connect a personal Gmail account.",
+      docHref: GMAIL_WORKSPACE_DOC,
+    };
+  }
+  if (service === "slack" && (code === "app_approval_pending" || (code === "oauth_provider_error" && text.includes("approval")))) {
+    return {
+      text: "Your Slack workspace admin has to approve SplitMind first.",
+      next: "Ask them to approve it, then press Connect again.",
+    };
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Browser-only code below.
 
@@ -116,8 +163,7 @@ async function api(method, path, body, headers = {}) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : undefined;
   if (!response.ok) {
-    const message = payload?.error?.message ?? payload?.message ?? `Request failed (${response.status})`;
-    throw Object.assign(new Error(message), { status: response.status });
+    throw apiError(payload, response.status);
   }
   return payload;
 }
@@ -145,15 +191,50 @@ async function refresh() {
   render();
 }
 
+/** `message` is a string or a DOM node. */
 function setStatus(card, message, kind = "info") {
   const status = $(".status", card);
-  status.textContent = message ?? "";
+  status.replaceChildren(message ?? "");
   status.dataset.kind = kind;
 }
 
-function pollUntilConnected(card, service, nickname) {
+/** What to show for a failure: the plain-English sentence with the raw text behind Details, or the raw text if unknown. */
+function errorContent(service, error) {
+  const raw = error?.message ?? String(error);
+  const found = explainError({ service, code: error?.code, message: raw, status: error?.status });
+  if (!found) return raw;
+  return el(
+    "span",
+    {},
+    found.text,
+    found.next ? ` ${found.next}` : null,
+    found.docHref ? " " : null,
+    found.docHref ? el("a", { href: found.docHref, target: "_blank", rel: "noopener" }, "How to fix this") : null,
+    el("details", {}, el("summary", {}, "Details"), el("div", {}, raw)),
+  );
+}
+
+/** If the sign-in tab has landed on our /oauth/callback with a JSON error, its { code, message }. */
+function popupError(popup) {
+  try {
+    if (!popup || popup.closed || popup.location.pathname !== "/oauth/callback") return undefined;
+    return callbackError(popup.document.body.textContent);
+  } catch {
+    // Still on the provider's origin: reading it throws.
+    return undefined;
+  }
+}
+
+function pollUntilConnected(card, service, nickname, popup) {
   const started = Date.now();
   const timer = setInterval(async () => {
+    const failure = popupError(popup);
+    if (failure) {
+      clearInterval(timer);
+      popup.close();
+      setStatus(card, errorContent(service, failure), "error");
+      return;
+    }
     try {
       const connections = await api("GET", "/api/connections");
       const found = accountsOf(connections, service).find((c) => c.connectionName === nickname);
@@ -190,10 +271,10 @@ async function startOAuth(card, service, nickname, clientConfig, popup = openPop
     if (popup) popup.location.href = url;
     else window.location.href = url;
     setStatus(card, `Finish signing in to ${nickname} in the tab that opened. This page updates by itself.`);
-    pollUntilConnected(card, service, nickname);
+    pollUntilConnected(card, service, nickname, popup);
   } catch (error) {
     popup?.close();
-    setStatus(card, error.message, "error");
+    setStatus(card, errorContent(service, error), "error");
   }
 }
 
@@ -203,7 +284,7 @@ async function disconnect(card, service, nickname) {
     await api("DELETE", `/api/connections/${service}`, { connectionName: nickname, revoke: true });
     await refresh();
   } catch (error) {
-    setStatus(card, error.message, "error");
+    setStatus(card, errorContent(service, error), "error");
   }
 }
 
@@ -314,7 +395,7 @@ function appForm(card, service, info) {
           await refresh();
           setStatus($(`[data-service="${service}"]`), "Saved. Now connect your first account below.", "ok");
         } catch (error) {
-          setStatus(card, error.message, "error");
+          setStatus(card, errorContent(service, error), "error");
         }
       },
     },
@@ -403,7 +484,7 @@ async function connectToken(card, service, nickname, form) {
     await refresh();
     setStatus($(`[data-service="${service}"]`), `Connected ${nickname}.`, "ok");
   } catch (error) {
-    setStatus(card, error.message, "error");
+    setStatus(card, errorContent(service, error), "error");
   }
 }
 
@@ -428,11 +509,11 @@ async function connectSlack(card, nickname, form) {
     await startOAuth(card, "slack", nickname, { clientId: credentials.clientId, clientSecret: credentials.clientSecret }, popup);
   } catch (error) {
     popup?.close();
-    const message =
+    const reason =
       error instanceof TypeError
-        ? "Your browser couldn't reach Slack's API from this page. Use the credentials box below instead (steps in docs/providers/slack.md)."
-        : error.message;
-    setStatus(card, message, "error");
+        ? new Error("Your browser couldn't reach Slack's API from this page. Use the credentials box below instead (steps in docs/providers/slack.md).")
+        : error;
+    setStatus(card, errorContent("slack", reason), "error");
   }
 }
 
@@ -446,7 +527,7 @@ const TITLES = {
 };
 const HINTS = {
   gmail: "Google shows an account chooser each time, so pick the mailbox you mean. On the unverified-app screen click Advanced → Go to SplitMind: it's your own app.",
-  notion: "Notion asks which workspace and which pages to share. Pick only the pages Claude should see; you can add more later from a page's ••• → Connections.",
+  notion: "Notion asks which workspace and which pages to share. Pick only the pages Claude should see; you can add more later from a page's ••• → Connections. In Notion's consent screen, tick the pages SplitMind may see; with none ticked it sees nothing. Notion only lets workspace members connect apps. If you're a guest, ask an owner to make you a member or connect SplitMind for you.",
   netlify:
     "Netlify → User settings → Applications → Personal access tokens → New access token. It reaches every team that Netlify login can see, so use one nickname per login.",
   cloudflare_dns:
