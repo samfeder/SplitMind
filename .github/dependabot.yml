@@ -1,0 +1,20 @@
+# Dependabot keeps the root toolchain and the SHA-pinned GitHub Actions current (#84).
+# vendor/open-connector is deliberately not tracked here: the upstream pin moves only through
+# docs/upgrading-openconnector.md, with the patch stack re-applied and re-reviewed.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
