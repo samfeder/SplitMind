@@ -1,0 +1,382 @@
+SplitMind patch 0031 for OpenConnector v1.9.2. Apply after 0030.
+Upstream issue: not filed yet. The Web Console understands the @read rule (#162).
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 11:01:13 -0300
+Subject: [PATCH 1/2] 0031 tests: console understands @read
+
+---
+ web/src/policy.test.ts | 203 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 202 insertions(+), 1 deletion(-)
+
+diff --git a/web/src/policy.test.ts b/web/src/policy.test.ts
+index 72e19357..8a6b26d2 100644
+--- a/web/src/policy.test.ts
++++ b/web/src/policy.test.ts
+@@ -1,4 +1,4 @@
+-import type { ProviderDefinition, RuntimePolicyState } from "./model";
++import type { PolicyRules, ProviderDefinition, RuntimePolicyState, RuntimeTokenSummary } from "./model";
+ 
+ import { describe, expect, it } from "vitest";
+ import {
+@@ -6,8 +6,10 @@ import {
+   createPolicyEditorDraft,
+   evaluatePolicy,
+   filterPolicyRuleCandidates,
++  isKnownPolicyRule,
+   policyLayers,
+   policyRuleCandidates,
++  policyRuleIssue,
+   policyRulesFromEditorDraft,
+   validatePolicyEditorDraft,
+ } from "./policy";
+@@ -132,6 +134,205 @@ describe("web policy evaluation", () => {
+   });
+ });
+ 
++describe("web policy @read rule", () => {
++  const readActionId = "x.read_a";
++
++  it("C1: accepts @read as an action rule and rejects every other @ rule", () => {
++    expect(policyRuleIssue("@read", "action")).toBeUndefined();
++    for (const rule of ["@read.*", "@read.x", "@reads", "@Read", "@", "@write", "@read ", " @read"]) {
++      expect(policyRuleIssue(rule, "action"), rule).toBe("invalid");
++    }
++  });
++
++  it("C1: rejects @read as a proxy rule", () => {
++    expect(policyRuleIssue("@read", "proxy")).toBe("invalid");
++  });
++
++  it("C1: the structured editor draft accepts @read for actions and flags it for proxies", () => {
++    const draft = createPolicyEditorDraft({ ...emptyRules, allowedActions: ["@read"], blockedActions: ["@read"] });
++    expect(validatePolicyEditorDraft(draft, true)).toEqual([]);
++
++    const proxyDraft = createPolicyEditorDraft({ ...emptyRules, allowedProxies: ["@read"] });
++    expect(validatePolicyEditorDraft(proxyDraft, true)).toEqual([
++      { field: "allowedProxies", code: "invalid", rule: "@read" },
++    ]);
++  });
++
++  it("C2: a token @read allowlist allows an action only when its operationType is read", () => {
++    const layers = tokenLayers({ allowedActions: ["@read"] });
++
++    const allowed = evaluatePolicy(readActionId, "action", layers, "read");
++    expect(allowed).toMatchObject({ allowed: true });
++    expect(allowed.trace).toEqual([
++      { source: "deployment", outcome: "unrestricted" },
++      { source: "runtime", outcome: "unrestricted" },
++      { source: "token", outcome: "allow_match", rule: "@read" },
++    ]);
++
++    for (const operationType of ["write", "destructive", undefined] as const) {
++      const denied = evaluatePolicy(readActionId, "action", layers, operationType);
++      expect(denied, String(operationType)).toMatchObject({ allowed: false, code: "action_not_allowed" });
++      expect(denied.trace[2], String(operationType)).toEqual({ source: "token", outcome: "allow_miss" });
++    }
++  });
++
++  it("C2: @read does not match by action id text and sits beside other rules in the same list", () => {
++    const layers = tokenLayers({ allowedActions: ["@read", "github.create_issue"] });
++
++    expect(evaluatePolicy("github.create_issue", "action", layers, "write")).toMatchObject({
++      allowed: true,
++      trace: expect.arrayContaining([{ source: "token", outcome: "allow_match", rule: "github.create_issue" }]),
++    });
++    expect(evaluatePolicy("@read", "action", tokenLayers({ allowedActions: ["@read"] }), "write")).toMatchObject({
++      allowed: false,
++    });
++  });
++
++  it("C2: @read in a token intersects with the other layers", () => {
++    const policy: RuntimePolicyState = {
++      deployment: { ...emptyRules, allowedActions: ["github.*"] },
++      runtime: emptyRules,
++    };
++    const layers = policyLayers(policy, tokenSummary({ allowedActions: ["@read"] }));
++
++    expect(evaluatePolicy("github.get_issue", "action", layers, "read")).toMatchObject({ allowed: true });
++    expect(evaluatePolicy("slack.read_channel", "action", layers, "read")).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
++    expect(evaluatePolicy("github.create_issue", "action", layers, "write")).toMatchObject({
++      allowed: false,
++      code: "action_not_allowed",
++    });
++  });
++
++  it("C2: @read works in the deployment and Runtime layers too", () => {
++    const layers = policyLayers({
++      deployment: { ...emptyRules, allowedActions: ["@read"] },
++      runtime: { ...emptyRules, allowedActions: ["@read"] },
++    });
++
++    expect(evaluatePolicy(readActionId, "action", layers, "read")).toMatchObject({ allowed: true });
++    expect(evaluatePolicy(readActionId, "action", layers, "write")).toMatchObject({ allowed: false });
++  });
++
++  it("C3: @read in blockedActions blocks read actions only", () => {
++    const layers = tokenLayers({ blockedActions: ["@read"] });
++
++    const blocked = evaluatePolicy(readActionId, "action", layers, "read");
++    expect(blocked).toMatchObject({ allowed: false, code: "action_blocked" });
++    expect(blocked.trace[2]).toEqual({ source: "token", outcome: "block_match", rule: "@read" });
++
++    for (const operationType of ["write", "destructive", undefined] as const) {
++      expect(evaluatePolicy(readActionId, "action", layers, operationType), String(operationType)).toMatchObject({
++        allowed: true,
++      });
++    }
++  });
++
++  it("C3: a Runtime @read block overrides a token @read allow", () => {
++    const policy: RuntimePolicyState = {
++      deployment: emptyRules,
++      runtime: { ...emptyRules, blockedActions: ["@read"] },
++    };
++    const layers = policyLayers(policy, tokenSummary({ allowedActions: ["@read"] }));
++
++    expect(evaluatePolicy(readActionId, "action", layers, "read")).toMatchObject({
++      allowed: false,
++      code: "action_blocked",
++    });
++  });
++
++  it("C4: counts a token @read grant over the read actions of the catalog", () => {
++    const provider = providerWithOperations([
++      ["list_things", "read"],
++      ["get_thing", "read"],
++      ["create_thing", "write"],
++    ]);
++
++    expect(countAllowedActions([provider], tokenLayers({ allowedActions: ["@read"] }))).toEqual({
++      allowed: 2,
++      total: 3,
++    });
++    expect(countAllowedActions([provider], tokenLayers({ blockedActions: ["@read"] }))).toEqual({
++      allowed: 1,
++      total: 3,
++    });
++  });
++
++  it("C4: destructive actions and actions without an operationType are not read", () => {
++    const provider = providerWithOperations([
++      ["list_things", "read"],
++      ["delete_thing", "destructive"],
++      ["mystery", undefined],
++    ]);
++
++    expect(countAllowedActions([provider], tokenLayers({ allowedActions: ["@read"] }))).toEqual({
++      allowed: 1,
++      total: 3,
++    });
++  });
++
++  it("C5: @read never matches a proxy", () => {
++    const allow = tokenLayers({ allowedProxies: ["@read"] });
++    for (const operationType of [undefined, "read"] as const) {
++      expect(evaluatePolicy("github", "proxy", allow, operationType), String(operationType)).toMatchObject({
++        allowed: false,
++        code: "proxy_not_allowed",
++      });
++    }
++
++    const block = policyLayers(
++      { deployment: emptyRules, runtime: { ...emptyRules, blockedProxies: ["@read"] } },
++      tokenSummary({ allowedProxies: ["github"] }),
++    );
++    expect(evaluatePolicy("github", "proxy", block, "read")).toMatchObject({ allowed: true });
++  });
++
++  it("treats @read as a known action rule and not a known proxy rule", () => {
++    const providers = [githubProvider()];
++
++    expect(isKnownPolicyRule("@read", "action", providers)).toBe(true);
++    expect(isKnownPolicyRule("@read", "proxy", providers)).toBe(false);
++    expect(isKnownPolicyRule("@write", "action", providers)).toBe(false);
++  });
++});
++
++function tokenSummary(rules: Partial<Omit<PolicyRules, "blockedProxies">>): RuntimeTokenSummary {
++  return {
++    id: "token-1",
++    name: "Reader",
++    allowedActions: rules.allowedActions ?? [],
++    blockedActions: rules.blockedActions ?? [],
++    allowedProxies: rules.allowedProxies ?? [],
++    allowedConnections: [],
++    createdAt: "2026-07-20T00:00:00.000Z",
++  };
++}
++
++function tokenLayers(rules: Partial<Omit<PolicyRules, "blockedProxies">>) {
++  return policyLayers({ deployment: emptyRules, runtime: emptyRules }, tokenSummary(rules));
++}
++
++function providerWithOperations(
++  operations: Array<[name: string, operationType: "read" | "write" | "destructive" | undefined]>,
++): ProviderDefinition {
++  const base = githubProvider();
++  return {
++    ...base,
++    service: "x",
++    displayName: "X",
++    actions: operations.map(([name, operationType]) => ({
++      ...base.actions[0],
++      id: `x.${name}`,
++      service: "x",
++      name,
++      description: name,
++      ...(operationType ? { operationType } : {}),
++    })),
++  };
++}
++
+ function githubProvider(): ProviderDefinition {
+   return {
+     service: "github",
+-- 
+2.34.1
+
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sam Feder <noreply@splitmind.invalid>
+Date: Tue, 24 Nov 2026 11:06:09 -0300
+Subject: [PATCH 2/2] 0031: Web Console understands the @read rule (#162)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0129g9KnEZjFYCq8zqEw7dz6
+---
+ web/src/access-page.tsx |  9 +++++++--
+ web/src/model.ts        |  3 +++
+ web/src/policy.ts       | 28 +++++++++++++++++++++++-----
+ 3 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/web/src/access-page.tsx b/web/src/access-page.tsx
+index dcbfb1df..1e6088f4 100644
+--- a/web/src/access-page.tsx
++++ b/web/src/access-page.tsx
+@@ -516,7 +516,7 @@ function PolicyTester(props: {
+   const candidates = useMemo(
+     () =>
+       policyRuleCandidates(props.providers, resource).filter(
+-        (candidate) => candidate !== "*" && !candidate.endsWith(".*"),
++        (candidate) => candidate !== "*" && !candidate.endsWith(".*") && !candidate.startsWith("@"),
+       ),
+     [props.providers, resource],
+   );
+@@ -528,7 +528,12 @@ function PolicyTester(props: {
+   );
+   const token = props.tokens.find((item) => item.id === tokenId);
+   const layers = policyLayers(props.policy, token);
+-  const result = testedValue ? evaluatePolicy(testedValue, resource, layers) : null;
++  const testedOperationType =
++    resource === "action"
++      ? props.providers.flatMap((provider) => provider.actions).find((action) => action.id === testedValue)
++          ?.operationType
++      : undefined;
++  const result = testedValue ? evaluatePolicy(testedValue, resource, layers, testedOperationType) : null;
+   const listId = `policy-tester-${props.compact ? "compact" : "default"}-${resource}`;
+ 
+   function changeResource(next: PolicyResource): void {
+diff --git a/web/src/model.ts b/web/src/model.ts
+index 9cb9e343..d788aaa2 100644
+--- a/web/src/model.ts
++++ b/web/src/model.ts
+@@ -60,12 +60,15 @@ export type JsonSchema = Record<string, unknown>;
+  * the catalog listing small. Use {@link FullActionDefinition} where schemas are
+  * required; load it from `/api/actions/:actionId`.
+  */
++export type OperationType = "read" | "write" | "destructive";
++
+ export interface ActionDefinition {
+   id: string;
+   service: string;
+   name: string;
+   description: string;
+   requiredScopes: string[];
++  operationType?: OperationType;
+   inputSchema?: JsonSchema;
+   outputSchema?: JsonSchema;
+   execution: {
+diff --git a/web/src/policy.ts b/web/src/policy.ts
+index 0d3718c8..42ee90a0 100644
+--- a/web/src/policy.ts
++++ b/web/src/policy.ts
+@@ -1,4 +1,6 @@
+-import type { PolicyRules, ProviderDefinition, RuntimePolicyState, RuntimeTokenSummary } from "./model";
++import type { OperationType, PolicyRules, ProviderDefinition, RuntimePolicyState, RuntimeTokenSummary } from "./model";
++
++const READ_RULE = "@read";
+ 
+ export type PolicySource = "deployment" | "runtime" | "token";
+ export type PolicyResource = "action" | "proxy";
+@@ -118,10 +120,16 @@ export function policyLayers(policy: RuntimePolicyState, token?: RuntimeTokenSum
+   return layers;
+ }
+ 
+-export function evaluatePolicy(value: string, resource: PolicyResource, layers: PolicyLayer[]): PolicyEvaluation {
++export function evaluatePolicy(
++  value: string,
++  resource: PolicyResource,
++  layers: PolicyLayer[],
++  operationType?: OperationType,
++): PolicyEvaluation {
+   const allowedField = resource === "action" ? "allowedActions" : "allowedProxies";
+   const blockedField = resource === "action" ? "blockedActions" : "blockedProxies";
+-  const matches = resource === "action" ? matchesActionRule : matchesProxyRule;
++  const matches =
++    resource === "action" ? (rule: string, id: string) => matchesActionRule(rule, id, operationType) : matchesProxyRule;
+   const trace = layers.map((layer): PolicyTrace => {
+     const blocked = layer.rules[blockedField].find((rule) => matches(rule, value));
+     if (blocked) {
+@@ -149,7 +157,8 @@ export function evaluatePolicy(value: string, resource: PolicyResource, layers:
+ export function countAllowedActions(providers: ProviderDefinition[], layers: PolicyLayer[]): PolicyCount {
+   const actions = providers.flatMap((provider) => provider.actions);
+   return {
+-    allowed: actions.filter((action) => evaluatePolicy(action.id, "action", layers).allowed).length,
++    allowed: actions.filter((action) => evaluatePolicy(action.id, "action", layers, action.operationType).allowed)
++      .length,
+     total: actions.length,
+   };
+ }
+@@ -210,6 +219,9 @@ export function isKnownPolicyRule(rule: string, resource: PolicyResource, provid
+   if (resource === "proxy") {
+     return providers.some((provider) => provider.service === rule);
+   }
++  if (rule === READ_RULE) {
++    return true;
++  }
+   if (rule.endsWith(".*")) {
+     const service = rule.slice(0, -2);
+     return providers.some((provider) => provider.service === service);
+@@ -237,6 +249,9 @@ export function policyRuleIssue(rule: string, resource: PolicyResource): "invali
+   if (rule === "*") {
+     return undefined;
+   }
++  if (rule.startsWith("@")) {
++    return resource === "action" && rule === READ_RULE ? undefined : "invalid";
++  }
+   if (resource === "proxy") {
+     return rule.includes("*") || /\s/.test(rule) ? "invalid" : undefined;
+   }
+@@ -249,10 +264,13 @@ export function policyRuleIssue(rule: string, resource: PolicyResource): "invali
+     : undefined;
+ }
+ 
+-function matchesActionRule(pattern: string, actionId: string): boolean {
++function matchesActionRule(pattern: string, actionId: string, operationType?: OperationType): boolean {
+   if (pattern === "*") {
+     return true;
+   }
++  if (pattern === READ_RULE) {
++    return operationType === "read";
++  }
+   return pattern.endsWith(".*") ? actionId.startsWith(pattern.slice(0, -1)) : actionId === pattern;
+ }
+ 
+-- 
+2.34.1
+
