@@ -248,6 +248,8 @@ function popupError(popup) {
 
 function pollUntilConnected(card, service, nickname, popup) {
   const started = Date.now();
+  // Reconnect polls a nickname that already exists: never offer Undo on an established connection.
+  const existedBefore = accountsOf(state.connections ?? [], service).some((c) => c.connectionName === nickname);
   const timer = setInterval(async () => {
     const failure = popupError(popup);
     if (failure) {
@@ -266,20 +268,24 @@ function pollUntilConnected(card, service, nickname, popup) {
         const target = $(`[data-service="${service}"]`);
         const shown = found.profile?.displayName ?? "";
         const label = shown ? ` (${shown})` : "";
-        const duplicateOf = sameAccountAs(connections, service, nickname);
-        const lookalike = duplicateOf ? undefined : nicknameMismatch(connections, service, nickname);
+        const duplicateOf = existedBefore ? undefined : sameAccountAs(connections, service, nickname);
+        const lookalike = existedBefore || duplicateOf ? undefined : nicknameMismatch(connections, service, nickname);
         const withUndoKeep = (text) =>
           el(
             "span",
             {},
             text,
             " ",
-            el("button", { type: "button", className: "secondary small", onclick: () => disconnect(target, service, nickname, { confirm: false }) }, "Undo"),
+            el("button", { type: "button", className: "secondary small", onclick: (event) => {
+                // No provider revoke: for the same account the new token can share the older connection's grant.
+                event.target.disabled = true;
+                disconnect(target, service, nickname, { confirm: false, revoke: false });
+              } }, "Undo"),
             " ",
             el("button", { type: "button", className: "secondary small", onclick: () => setStatus(target, `Kept ${nickname}.`, "ok") }, "Keep"),
           );
         if (duplicateOf) {
-          const name = service[0].toUpperCase() + service.slice(1);
+          const name = TITLES[service] ?? service;
           const text =
             service === "notion"
               ? `${nickname} signed in as the same Notion user as ${duplicateOf}. If you meant to connect a different workspace, that's fine: press Keep. If not, Undo removes ${nickname}.`
@@ -325,10 +331,10 @@ async function startOAuth(card, service, nickname, clientConfig, popup = openPop
   }
 }
 
-async function disconnect(card, service, nickname, { confirm = true } = {}) {
+async function disconnect(card, service, nickname, { confirm = true, revoke = true } = {}) {
   if (confirm && !window.confirm(`Disconnect ${nickname}? Claude loses access to it until you connect it again.`)) return;
   try {
-    await api("DELETE", `/api/connections/${service}`, { connectionName: nickname, revoke: true });
+    await api("DELETE", `/api/connections/${service}`, { connectionName: nickname, revoke });
     await refresh();
   } catch (error) {
     setStatus(card, errorContent(service, error), "error");
