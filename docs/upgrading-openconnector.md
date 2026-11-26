@@ -73,14 +73,20 @@ To move the OpenConnector pin itself, follow these steps.
    at the old and new tags and carry any new bindings, variables or
    compatibility settings into SplitMind's wrangler config template.
 
-6. **Run migrations before deploying.** New releases may add D1 migrations.
+6. **Audit new or changed `read` labels in the catalog.** Read-only grants
+   follow catalog labels at request time (patch 0030), so a new or mislabelled
+   `read` label widens every read-only grant. Diff the labels between the old
+   and new tags and check each addition or change against what the action does
+   (see `docs/guardrails.md`, section 5).
+
+7. **Run migrations before deploying.** New releases may add D1 migrations.
    Apply them before the new code goes live:
 
    ```sh
    npx wrangler d1 migrations apply <database-name> --remote
    ```
 
-7. **Open the pull request.** Title it `Upgrade OpenConnector to <new-tag>`,
+8. **Open the pull request.** Title it `Upgrade OpenConnector to <new-tag>`,
    list the upstream changes that matter, the patches dropped or refreshed,
    and any config changes. CI must pass before merge.
 
