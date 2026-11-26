@@ -1,6 +1,7 @@
 # Dependabot keeps the root toolchain and the SHA-pinned GitHub Actions current (#84).
 # vendor/open-connector is deliberately not tracked here: the upstream pin moves only through
 # docs/upgrading-openconnector.md, with the patch stack re-applied and re-reviewed.
+# Every update waits 14 days after release (cooldown): SplitMind only takes versions at least two weeks old.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -8,6 +9,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 14
+    ignore:
+      # @types/node follows the Node major the Worker toolchain runs (22); bump it with the runtime, not alone.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       minor-and-patch:
         update-types: [minor, patch]
@@ -15,6 +22,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 14
     groups:
       actions:
         patterns: ["*"]
