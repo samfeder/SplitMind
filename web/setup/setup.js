@@ -270,16 +270,17 @@ function pollUntilConnected(card, service, nickname, popup) {
         const label = shown ? ` (${shown})` : "";
         const duplicateOf = existedBefore ? undefined : sameAccountAs(connections, service, nickname);
         const lookalike = existedBefore || duplicateOf ? undefined : nicknameMismatch(connections, service, nickname);
-        const withUndoKeep = (text) =>
+        const withUndoKeep = (text, revoke) =>
           el(
             "span",
             {},
             text,
             " ",
             el("button", { type: "button", className: "secondary small", onclick: (event) => {
-                // No provider revoke: for the same account the new token can share the older connection's grant.
+                // A duplicate skips the provider revoke: for the same account the new token can share the older
+                // connection's grant. A different (lookalike) account is revoked as usual.
                 event.target.disabled = true;
-                disconnect(target, service, nickname, { confirm: false, revoke: false });
+                disconnect(target, service, nickname, { confirm: false, revoke });
               } }, "Undo"),
             " ",
             el("button", { type: "button", className: "secondary small", onclick: () => setStatus(target, `Kept ${nickname}.`, "ok") }, "Keep"),
@@ -290,10 +291,10 @@ function pollUntilConnected(card, service, nickname, popup) {
             service === "notion"
               ? `${nickname} signed in as the same Notion user as ${duplicateOf}. If you meant to connect a different workspace, that's fine: press Keep. If not, Undo removes ${nickname}.`
               : `${nickname} is the same ${name} account as ${duplicateOf}${label}. Undo removes ${nickname} so you can connect a different account.`;
-          setStatus(target, withUndoKeep(text), "warn");
+          setStatus(target, withUndoKeep(text, false), "warn");
         } else if (lookalike) {
           const text = `Connected ${nickname} as ${shown || "an unnamed account"}. That name looks like ${lookalike}'s account. Right?`;
-          setStatus(target, withUndoKeep(text), "warn");
+          setStatus(target, withUndoKeep(text, true), "warn");
         } else {
           setStatus(target, `Connected ${nickname}${label}.`, "ok");
         }
