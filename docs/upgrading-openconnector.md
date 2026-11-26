@@ -28,6 +28,12 @@ To pick up a SplitMind update, run `git pull`, then `scripts/bootstrap.sh`, then
 you skip it, deploy stops before it touches Cloudflare and says the vendor
 dependencies are out of date; run bootstrap and deploy again.
 
+After a deploy, `/version.json` on your origin shows what is running: the SplitMind commit, the OpenConnector version
+and pinned commit, and each patch's sha256. Check it after an upgrade to confirm the pin and patches you expect.
+
+Deploy also refuses to run on a dirty tree: if SplitMind has uncommitted changes (the submodule does not count), it
+names them and asks you to commit or stash them, or pass `--allow-dirty`. The file then records `"dirty": true`.
+
 To move the OpenConnector pin itself, follow these steps.
 
 1. **Pick the release.** Read the upstream

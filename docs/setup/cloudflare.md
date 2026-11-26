@@ -142,6 +142,15 @@ to cap runaway CPU.
 - `npm run deploy -- --dry-run` builds and bundles with placeholder ids. It needs no login and changes nothing;
   use it to check a change before deploying.
 
+Every deploy publishes `/version.json` at your origin: the SplitMind commit (and whether the tree was dirty), the
+OpenConnector version and pinned commit, and the name and sha256 of each patch, plus the build time. It holds no
+secrets, account ids or hostnames, and the setup page shows it as a line at the bottom.
+
+A real deploy refuses to run when the SplitMind tree has uncommitted changes, so `/version.json` always points at code
+you can find. The error names the first few paths: commit or stash them, or pass `--allow-dirty` (the file then says
+`"dirty": true`). `--dry-run` and `--render-only` never refuse. The `vendor/open-connector` submodule, `splitmind.local.json`
+and ignored files do not count.
+
 ## The registration budget and how to undo it
 
 Deploying patch 0017 adds a Durable Object that budgets client registrations (see

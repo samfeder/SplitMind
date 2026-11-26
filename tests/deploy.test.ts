@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { staleDependencies, staleDependenciesMessage } from "../scripts/deploy.ts";
+import { commitSuperproject, git, initFixtureRepo } from "./git-fixture.ts";
 
 // Runs the real scripts/deploy.ts in a throwaway checkout. Cloudflare is replaced by a stand-in `wrangler` that
 // keeps a fake account in a JSON file, and the engine by a stand-in whose build steps write a tiny catalog.
@@ -80,6 +82,8 @@ let checkout: string;
 let engine: string;
 let account: string;
 let wrangler: string;
+// The commit the fixture's superproject pins for the engine (#83).
+let engineGitlink: string;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "splitmind-deploy-"));
@@ -100,14 +104,19 @@ beforeEach(() => {
     "web/privacy/index.html",
     "web/_headers",
     "slack/app-manifest.json",
+    ".gitignore",
   ]) {
     copyFileSync(join(repo, file), join(checkout, file));
   }
   writeFileSync(join(engine, "scripts/copy-catalog-assets.ts"), FAKE_COPY_CATALOG);
   writeFileSync(
     join(engine, "package.json"),
-    JSON.stringify({ type: "module", scripts: { "generate:catalog": GENERATE, "build:web": "node -e \"\"" } }),
+    JSON.stringify({ type: "module", version: "1.9.2", scripts: { "generate:catalog": GENERATE, "build:web": "node -e \"\"" } }),
   );
+
+  // A real repo, as a checkout is: the engine is its own repo recorded as a gitlink, and everything else is committed.
+  // deploy.ts refuses to deploy a dirty tree (#83), so deployWith commits whatever a test wrote before it runs.
+  ({ gitlink: engineGitlink } = initFixtureRepo(checkout));
 
   wrangler = join(dir, "wrangler");
   writeFileSync(wrangler, FAKE_WRANGLER);
@@ -128,7 +137,7 @@ function readAccount(): FakeAccount {
   return JSON.parse(readFileSync(account, "utf8")) as FakeAccount;
 }
 
-function deployWith(env: NodeJS.ProcessEnv, ...args: string[]) {
+function runDeploy(env: NodeJS.ProcessEnv, args: string[]) {
   // Secrets in the outer environment (e.g. a cloud session set up to deploy) must not leak into these runs.
   const { SPLITMIND_ADMIN_TOKEN: _admin, SPLITMIND_ENCRYPTION_KEY: _key, ...outer } = process.env;
   return spawnSync(process.execPath, [join(checkout, "scripts/deploy.ts"), ...args], {
@@ -136,6 +145,18 @@ function deployWith(env: NodeJS.ProcessEnv, ...args: string[]) {
     encoding: "utf8",
     env: { ...outer, SPLITMIND_WRANGLER: wrangler, FAKE_CF_STATE: account, ...env },
   });
+}
+
+// Most tests are not about cleanliness: whatever they wrote into the checkout (patches, notes) is committed first, so
+// the tree is clean when the script runs. Changes inside vendor/open-connector never count, so those stay as written.
+function deployWith(env: NodeJS.ProcessEnv, ...args: string[]) {
+  if (existsSync(join(checkout, ".git"))) commitSuperproject(checkout, "test setup");
+  return runDeploy(env, args);
+}
+
+// Runs the script on the tree exactly as the test left it, dirty or not.
+function deployAsIs(env: NodeJS.ProcessEnv, ...args: string[]) {
+  return runDeploy(env, args);
 }
 
 function deploy(...args: string[]) {
@@ -1076,3 +1097,302 @@ function parseJsonc(text: string): Record<string, unknown> {
   }
   return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1")) as Record<string, unknown>;
 }
+
+// #83. What a deploy publishes at <origin>/version.json, and the refusal to deploy a tree that isn't committed.
+describe("version.json and the clean-tree check (#83)", { timeout: 30_000 }, () => {
+  const versionPath = () => join(engine, "dist/web/version.json");
+  const readVersion = () => JSON.parse(readFileSync(versionPath(), "utf8")) as {
+    splitmind: { commit: string; dirty: boolean };
+    openconnector: { version: string; commit: string };
+    patches: { name: string; sha256: string }[];
+    builtAt: string;
+  };
+  const edit = (file: string, from: string, to: string) =>
+    [`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`, "@@ -1 +1 @@", `-${from}`, `+${to}`, ""].join("\n");
+  const hint = "commit or stash them, or pass --allow-dirty";
+  const dirtyTree = () => writeFileSync(join(checkout, "notes.txt"), "scratch\n");
+  const settle = () => commitSuperproject(checkout, "settle");
+  const keys = (value: object) => Object.keys(value).sort();
+
+  describe("V3: the file is written into the web build output on every build path", () => {
+    it("--dry-run writes version.json next to the setup page, with the documented fields", () => {
+      writeFileSync(join(engine, "greeting.txt"), "hello\n");
+      // The engine sits past the commit the checkout pins, as it does after bootstrap.
+      git(engine, "add", "-A");
+      git(engine, "commit", "-q", "-m", "local baseline");
+      mkdirSync(join(checkout, "patches"));
+      writeFileSync(join(checkout, "patches/0002-second.patch"), edit("greeting.txt", "hello, patched", "hello, twice"));
+      writeFileSync(join(checkout, "patches/0001-first.patch"), edit("greeting.txt", "hello", "hello, patched"));
+      const before = Date.now();
+
+      const result = deploy("--dry-run");
+
+      expect(result.status).toBe(0);
+      expect(existsSync(join(engine, "dist/web/setup/index.html"))).toBe(true);
+      const info = readVersion();
+      expect(keys(info)).toEqual(["builtAt", "openconnector", "patches", "splitmind"]);
+      expect(keys(info.splitmind)).toEqual(["commit", "dirty"]);
+      expect(keys(info.openconnector)).toEqual(["commit", "version"]);
+      expect(info.splitmind).toEqual({ commit: git(checkout, "rev-parse", "HEAD"), dirty: false });
+      expect(info.openconnector).toEqual({ version: "1.9.2", commit: engineGitlink });
+      // The pin is reported, not the engine's own (later) HEAD.
+      expect(git(engine, "rev-parse", "HEAD")).not.toBe(engineGitlink);
+      expect(info.patches).toEqual(
+        ["0001-first.patch", "0002-second.patch"].map((name) => ({
+          name,
+          sha256: createHash("sha256").update(readFileSync(join(checkout, "patches", name))).digest("hex"),
+        })),
+      );
+      expect(info.builtAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+      expect(Date.parse(info.builtAt)).toBeGreaterThanOrEqual(before - 1000);
+      expect(Date.parse(info.builtAt)).toBeLessThanOrEqual(Date.now() + 1000);
+    });
+
+    it("--dry-run makes only the one `deploy --dry-run` wrangler call", () => {
+      const result = deploy("--dry-run");
+
+      expect(result.status).toBe(0);
+      const calls = readAccount().calls;
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toMatch(/^deploy .*--dry-run/);
+      expect(existsSync(versionPath())).toBe(true);
+    });
+
+    it("--dry-run on a dirty tree is not refused, and records dirty: true", () => {
+      dirtyTree();
+
+      const result = deployAsIs({}, "--dry-run");
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain("--allow-dirty");
+      expect(readVersion().splitmind.dirty).toBe(true);
+      expect(readVersion().splitmind.commit).toBe(git(checkout, "rev-parse", "HEAD"));
+      expect(readAccount().calls).toHaveLength(1);
+    });
+
+    it("a real deploy writes it too, and the second build pass keeps it", () => {
+      const result = deploy();
+
+      // Stops at the secrets prompt, after both builds and deploys.
+      expect(result.status).toBe(1);
+      expect(readAccount().calls.filter((call) => call.startsWith("deploy"))).toHaveLength(2);
+      const info = readVersion();
+      expect(info.splitmind).toEqual({ commit: git(checkout, "rev-parse", "HEAD"), dirty: false });
+      expect(info.openconnector.commit).toBe(engineGitlink);
+    });
+
+    it("version.json stays parseable and fresh across two dry runs", () => {
+      deploy("--dry-run");
+      const first = readVersion();
+
+      const second = deploy("--dry-run");
+
+      expect(second.status).toBe(0);
+      expect(readVersion().splitmind).toEqual(first.splitmind);
+      expect(Date.parse(readVersion().builtAt)).toBeGreaterThanOrEqual(Date.parse(first.builtAt));
+    });
+  });
+
+  describe("V4: a real deploy refuses a dirty tree", () => {
+    it("an untracked file: exit non-zero, names the file and the hint, and the account is never touched", () => {
+      dirtyTree();
+
+      const result = deployAsIs({});
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("notes.txt");
+      expect(result.stderr).toContain(hint);
+      expect(readAccount().calls).toEqual([]);
+      expect(existsSync(join(checkout, "splitmind.local.json"))).toBe(false);
+      expect(existsSync(join(engine, "wrangler.local.jsonc"))).toBe(false);
+      expect(result.stdout).not.toContain("==> Checking Cloudflare login");
+      expect(result.stdout).not.toContain("==> Cloudflare resources");
+    });
+
+    it("a modified tracked file: refused, naming it", () => {
+      writeFileSync(join(checkout, "wrangler.template.jsonc"), `${readFileSync(join(checkout, "wrangler.template.jsonc"), "utf8")}\n// local edit\n`);
+
+      const result = deployAsIs({});
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("wrangler.template.jsonc");
+      expect(result.stderr).toContain(hint);
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("a staged but uncommitted file: refused", () => {
+      dirtyTree();
+      git(checkout, "add", "notes.txt");
+
+      const result = deployAsIs({});
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(hint);
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("with many dirty files it names the first few, not all of them", () => {
+      for (let n = 1; n <= 20; n++) writeFileSync(join(checkout, `scratch-${String(n).padStart(2, "0")}.txt`), "x\n");
+
+      const result = deployAsIs({});
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("scratch-01.txt");
+      expect(result.stderr).not.toContain("scratch-20.txt");
+      expect(result.stderr).toContain(hint);
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("--allow-dirty goes ahead: wrangler is called, nothing is refused, and the file records dirty: true", () => {
+      dirtyTree();
+
+      const result = deployAsIs({}, "--allow-dirty");
+
+      expect(result.stderr).not.toContain(hint);
+      expect(result.stderr).not.toMatch(/unknown option|allow-dirty/i);
+      const calls = readAccount().calls;
+      expect(calls[0]).toBe("whoami");
+      expect(calls.some((call) => call.startsWith("deploy"))).toBe(true);
+      expect(readVersion().splitmind.dirty).toBe(true);
+      expect(readVersion().splitmind.commit).toBe(git(checkout, "rev-parse", "HEAD"));
+    });
+
+    it("--allow-dirty on a clean tree still records dirty: false", () => {
+      settle();
+
+      deployAsIs({}, "--allow-dirty");
+
+      expect(readVersion().splitmind.dirty).toBe(false);
+    });
+
+    it("--allow-dirty works with --dry-run too", () => {
+      dirtyTree();
+
+      const result = deployAsIs({}, "--dry-run", "--allow-dirty");
+
+      expect(result.status).toBe(0);
+      expect(readVersion().splitmind.dirty).toBe(true);
+    });
+
+    it("--render-only is not refused on a dirty tree", () => {
+      deploy();
+      dirtyTree();
+      setAccount({ ...readAccount(), calls: [] });
+
+      const result = deployAsIs({}, "--render-only");
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain(hint);
+    });
+
+    it("the engine being modified, patched or ahead of its pin does not count as dirty", () => {
+      settle();
+      writeFileSync(join(engine, "greeting.txt"), "hello\n");
+      writeFileSync(join(engine, "package.json"), `${readFileSync(join(engine, "package.json"), "utf8")}\n`);
+      git(engine, "add", "-A");
+      git(engine, "commit", "-q", "-m", "local baseline");
+      writeFileSync(join(engine, "package.json"), `${readFileSync(join(engine, "package.json"), "utf8")}\n`);
+      expect(git(checkout, "status", "--porcelain")).toBe(" M vendor/open-connector");
+
+      const result = deployAsIs({});
+
+      expect(result.stderr).not.toContain(hint);
+      expect(readAccount().calls[0]).toBe("whoami");
+      expect(readVersion().splitmind.dirty).toBe(false);
+      expect(readVersion().openconnector.commit).toBe(engineGitlink);
+    });
+
+    it("an untracked .spec-*.md does not count", () => {
+      settle();
+      writeFileSync(join(checkout, ".spec-83.md"), "spec\n");
+
+      const result = deployAsIs({});
+
+      expect(result.stderr).not.toContain(hint);
+      expect(readAccount().calls[0]).toBe("whoami");
+    });
+
+    it("a re-run is not refused for the saved state or rendered config its own first run left behind", () => {
+      deploy();
+      expect(existsSync(join(checkout, "splitmind.local.json"))).toBe(true);
+      setAccount({ ...readAccount(), calls: [] });
+
+      const result = deployAsIs({});
+
+      expect(result.stderr).not.toContain(hint);
+      expect(readAccount().calls[0]).toBe("whoami");
+    });
+
+    it("a folder that is not a git repo is treated as dirty: refused, and the account is never touched", () => {
+      rmSync(join(checkout, ".git"), { recursive: true, force: true });
+
+      const result = deployAsIs({});
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(hint);
+      expect(readAccount().calls).toEqual([]);
+    });
+
+    it("a folder that is not a git repo deploys with --allow-dirty, recording commit unknown and dirty: true", () => {
+      rmSync(join(checkout, ".git"), { recursive: true, force: true });
+
+      deployAsIs({}, "--allow-dirty");
+
+      expect(readAccount().calls[0]).toBe("whoami");
+      expect(readVersion().splitmind).toEqual({ commit: "unknown", dirty: true });
+    });
+
+    it("--help lists --allow-dirty", () => {
+      const result = deployAsIs({}, "--help");
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("--allow-dirty");
+    });
+  });
+
+  describe("V5: nothing private is published", () => {
+    it("holds no origin, worker name, resource id, account id, secret, token, user or host", () => {
+      const shortKey = Buffer.from("sixteen byte key").toString("base64");
+      const env = {
+        SPLITMIND_ADMIN_TOKEN: adminToken,
+        // Refused as too short, which stops the run after the build: version.json is written by then.
+        SPLITMIND_ENCRYPTION_KEY: shortKey,
+        CLOUDFLARE_API_TOKEN: "dummy-cloudflare-api-token-4c1e9a",
+        CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+        MY_SERVICE_SECRET: "dummy-service-secret-77d2f0",
+        GITHUB_TOKEN: "dummy-github-token-91ab33",
+        OAUTH_CLIENT_SECRET: "dummy-oauth-client-secret-5e5e5e",
+      };
+
+      const result = deployWith(env, "--name", "very-private-worker", "--origin", "https://connector.private-origin.test");
+
+      expect(result.stderr).toContain("SPLITMIND_ENCRYPTION_KEY must be exactly 32 bytes in base64");
+      const text = readFileSync(versionPath(), "utf8");
+      expect(keys(JSON.parse(text) as object)).toEqual(["builtAt", "openconnector", "patches", "splitmind"]);
+      const forbidden = [
+        "very-private-worker",
+        "private-origin.test",
+        "https://",
+        "d1-id-",
+        "kv-id-",
+        "fake-subdomain",
+        adminToken,
+        encryptionKey,
+        shortKey,
+        checkout,
+        dir,
+        tmpdir(),
+        ...Object.values(env),
+        // Every other value in the environment the script ran in.
+        ...Object.values(process.env).filter((value): value is string => typeof value === "string" && value.length >= 16),
+      ];
+      for (const value of forbidden) expect(text, `version.json must not contain ${value.slice(0, 12)}...`).not.toContain(value);
+      const person = userInfo().username;
+      if (person.length >= 5 && !/^[0-9a-f]+$/.test(person)) expect(text).not.toContain(person);
+      const host = hostname();
+      if (host.length >= 5 && !/^[0-9a-f]+$/.test(host)) expect(text).not.toContain(host);
+      expect(text).not.toContain("Version Fixture Person");
+      expect(text).not.toContain("person@fixture.example");
+    });
+  });
+});
