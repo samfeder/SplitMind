@@ -103,6 +103,27 @@ export function accountsOf(connections, service) {
   return connections.filter((c) => c.service === service && c.configured && !c.virtual && !c.marketplace);
 }
 
+/** Same rule as scripts/verify-deployment.ts: one account iff both have a non-empty profile.accountId and they are ===. */
+export function sameAccountAs(connections, service, nickname) {
+  const accounts = accountsOf(connections, service);
+  const mine = accounts.find((c) => c.connectionName === nickname)?.profile?.accountId;
+  if (!mine) return undefined;
+  return accounts.find((c) => c.connectionName !== nickname && c.profile?.accountId === mine)?.connectionName;
+}
+
+/** Heuristic: another connection whose account the new nickname names (email local part or display name). Warns only. */
+export function nicknameMismatch(connections, service, nickname) {
+  const wanted = nickname.trim().toLowerCase();
+  if (!wanted) return undefined;
+  const lower = (value) => (typeof value === "string" ? value.trim().toLowerCase() : "");
+  const localPart = (value) => lower(typeof value === "string" ? value.split("@")[0] : "");
+  return accountsOf(connections, service).find((c) => {
+    if (c.connectionName === nickname) return false;
+    const { accountId, displayName } = c.profile ?? {};
+    return wanted === localPart(accountId) || wanted === localPart(displayName) || wanted === lower(displayName);
+  })?.connectionName;
+}
+
 const GMAIL_WORKSPACE_DOC = "https://github.com/samfeder/SplitMind/blob/main/docs/providers/gmail.md#a-google-workspace-account";
 
 /** The Error the console API's failure payload describes; carries the API's code and the HTTP status. */
@@ -242,8 +263,34 @@ function pollUntilConnected(card, service, nickname, popup) {
         clearInterval(timer);
         state.connections = connections;
         render();
-        const label = found.profile?.displayName ? ` (${found.profile.displayName})` : "";
-        setStatus($(`[data-service="${service}"]`), `Connected ${nickname}${label}.`, "ok");
+        const target = $(`[data-service="${service}"]`);
+        const shown = found.profile?.displayName ?? "";
+        const label = shown ? ` (${shown})` : "";
+        const duplicateOf = sameAccountAs(connections, service, nickname);
+        const lookalike = duplicateOf ? undefined : nicknameMismatch(connections, service, nickname);
+        const withUndoKeep = (text) =>
+          el(
+            "span",
+            {},
+            text,
+            " ",
+            el("button", { type: "button", className: "secondary small", onclick: () => disconnect(target, service, nickname, { confirm: false }) }, "Undo"),
+            " ",
+            el("button", { type: "button", className: "secondary small", onclick: () => setStatus(target, `Kept ${nickname}.`, "ok") }, "Keep"),
+          );
+        if (duplicateOf) {
+          const name = service[0].toUpperCase() + service.slice(1);
+          const text =
+            service === "notion"
+              ? `${nickname} signed in as the same Notion user as ${duplicateOf}. If you meant to connect a different workspace, that's fine: press Keep. If not, Undo removes ${nickname}.`
+              : `${nickname} is the same ${name} account as ${duplicateOf}${label}. Undo removes ${nickname} so you can connect a different account.`;
+          setStatus(target, withUndoKeep(text), "warn");
+        } else if (lookalike) {
+          const text = `Connected ${nickname} as ${shown || "an unnamed account"}. That name looks like ${lookalike}'s account. Right?`;
+          setStatus(target, withUndoKeep(text), "warn");
+        } else {
+          setStatus(target, `Connected ${nickname}${label}.`, "ok");
+        }
       } else if (Date.now() - started > 10 * 60_000) {
         clearInterval(timer);
         setStatus(card, "Still not connected after 10 minutes. Try Connect again.", "error");
@@ -278,8 +325,8 @@ async function startOAuth(card, service, nickname, clientConfig, popup = openPop
   }
 }
 
-async function disconnect(card, service, nickname) {
-  if (!window.confirm(`Disconnect ${nickname}? Claude loses access to it until you connect it again.`)) return;
+async function disconnect(card, service, nickname, { confirm = true } = {}) {
+  if (confirm && !window.confirm(`Disconnect ${nickname}? Claude loses access to it until you connect it again.`)) return;
   try {
     await api("DELETE", `/api/connections/${service}`, { connectionName: nickname, revoke: true });
     await refresh();
